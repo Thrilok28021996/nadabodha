@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nadabodha</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Nadabodha</h1>
+      <p>Local speech-to-text for macOS</p>
+    </header>
+
+    <section class="controls">
+      <button id="recordBtn" type="button">Start Recording</button>
+      <button id="stopRecordBtn" type="button" disabled>Stop Recording</button>
+      <button id="importBtn" type="button">Import Audio</button>
+      <button id="cancelBtn" type="button" disabled>Cancel</button>
+    </section>
+
+    <section class="status">
+      <p id="statusText">Status: idle</p>
+      <progress id="progressBar" value="0" max="100" hidden></progress>
+      <p id="errorText" class="error" hidden></p>
+    </section>
+
+    <section class="transcript">
+      <label for="transcriptArea">Transcript</label>
+      <textarea id="transcriptArea" readonly rows="12" placeholder="Transcript will appear here…"></textarea>
+    </section>
+
+    <section class="actions">
+      <button id="copyBtn" type="button" disabled>Copy</button>
+      <button id="saveBtn" type="button" disabled>Save as Text</button>
+    </section>
+
+    <input type="file" id="fileInput" accept="audio/*" hidden>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>
