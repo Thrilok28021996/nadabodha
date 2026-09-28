@@ -45,6 +45,10 @@ function updateStatus(event: TranscriptionEvent): void {
   errorText.hidden = true;
 
   if (event.status === 'recording' || event.status === 'transcribing') {
+    // N-F3: a new capture or transcription replaces the transcript on
+    // screen as soon as it starts, not only when it completes.
+    currentText = '';
+    transcriptArea.value = '';
     recordBtn.disabled = true;
     stopRecordBtn.disabled = event.status === 'transcribing';
     importBtn.disabled = true;

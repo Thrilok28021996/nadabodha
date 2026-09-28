@@ -38,10 +38,14 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
 
   ipcMain.handle(IpcChannel.StopRecording, async () => {
     const outputPath = await recorder.stop();
-    if (outputPath) {
+    // N-F2: a null path, or one whose file never materialised, must never
+    // reach transcription, where it surfaces as "File not found".
+    const usable =
+      typeof outputPath === 'string' && outputPath.length > 0 && fs.existsSync(outputPath);
+    if (usable) {
       transcriptionService.startTranscription(outputPath);
     }
-    return { outputPath };
+    return { outputPath: usable ? outputPath : null };
   });
 
   ipcMain.handle(IpcChannel.ImportAudio, async (_event: unknown, filePath: string) => {

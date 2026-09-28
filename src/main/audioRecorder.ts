@@ -34,6 +34,12 @@ export class AudioRecorder extends EventEmitter {
   private outputPath: string | null = null;
   private tempDir: string | null = null;
   private stopping = false;
+  /**
+   * Bounded tail of ffmpeg's stderr. The stream is piped, so it must be
+   * read (an unread pipe can block the child) and it is the only place a
+   * failed capture explains itself (N-F2).
+   */
+  private stderrBuffer = '';
   private readonly options: AudioRecorderOptions;
   private _state: RecorderState;
 
@@ -70,6 +76,7 @@ export class AudioRecorder extends EventEmitter {
 
     this._state = { status: 'recording', outputPath: this.outputPath };
     this.stopping = false;
+    this.stderrBuffer = '';
 
     try {
       this.process = spawn(ffmpeg, args, {
@@ -85,6 +92,13 @@ export class AudioRecorder extends EventEmitter {
       this.cleanupTempDir();
       throw err;
     }
+
+    // Drain stderr into a bounded tail (N-F2): an unread pipe can stall
+    // ffmpeg, and this text is what surfaces on a failed capture.
+    this.process.stderr?.on('data', (chunk: Buffer | string) => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      this.stderrBuffer = `${this.stderrBuffer}${text}`.slice(-4000);
+    });
 
     this.process.on('error', (err) => {
       this._state = {
@@ -118,17 +132,25 @@ export class AudioRecorder extends EventEmitter {
   stop(): Promise<string | null> {
     const proc = this.process;
     if (!proc) {
-      // Nothing to wait for: either never spawned, or already exited.
       if (this._state.status === 'recording') {
-        this._state = { status: 'idle', outputPath: this.outputPath };
+        // ffmpeg already exited on its own (exit code 0 leaves the state
+        // untouched); finalise the same way a normal stop would.
+        const verified = this.verifyRecording();
+        if (verified) {
+          this._state = { status: 'idle', outputPath: verified };
+        }
+        return Promise.resolve(verified);
       }
-      return Promise.resolve(this._state.status === 'error' ? null : this.outputPath);
+      // Idle, errored, or already stopped: there is nothing to stop and a
+      // previous session's path must never be replayed (N-F4, N-F1).
+      return Promise.resolve(null);
     }
 
     this.stopping = true;
 
     return new Promise((resolve) => {
       let settled = false;
+      let stdioGrace: NodeJS.Timeout | undefined;
 
       const finish = (): void => {
         if (settled) {
@@ -137,17 +159,22 @@ export class AudioRecorder extends EventEmitter {
         settled = true;
         clearTimeout(escalateTerm);
         clearTimeout(escalateKill);
+        clearTimeout(stdioGrace);
         if (this.process === proc) {
           this.process = null;
         }
         this.stopping = false;
         if (this._state.status === 'error') {
-          // ffmpeg never produced a usable file (e.g. binary missing).
+          // ffmpeg never produced a usable file (e.g. binary missing);
+          // its failure was already reported through the error event.
           resolve(null);
           return;
         }
-        this._state = { status: 'idle', outputPath: this.outputPath };
-        resolve(this.outputPath);
+        const verified = this.verifyRecording();
+        if (verified) {
+          this._state = { status: 'idle', outputPath: verified };
+        }
+        resolve(verified);
       };
 
       // Graceful interrupt first so ffmpeg finalises the WAV header, then
@@ -159,7 +186,17 @@ export class AudioRecorder extends EventEmitter {
         this.killSignal(proc, 'SIGKILL');
       }, 4000);
 
-      proc.once('exit', finish);
+      // 'close' fires only after the stdio pipes are drained, which is what
+      // guarantees stderr is captured for verifyRecording()'s message.
+      // 'exit' alone can arrive first, so give 'close' a short grace period
+      // and settle anyway rather than wait on a stray process holding the
+      // pipe open.
+      proc.once('exit', () => {
+        if (!settled && !stdioGrace) {
+          stdioGrace = setTimeout(finish, 300);
+        }
+      });
+      proc.once('close', finish);
       // A process that failed to spawn emits 'error' and never 'exit';
       // without this the promise would hang forever (F5).
       proc.once('error', finish);
@@ -168,20 +205,71 @@ export class AudioRecorder extends EventEmitter {
     });
   }
 
+  /**
+   * Discard the current capture and forget its path (N-F1).
+   *
+   * Kills ffmpeg, removes the temp file and directory, and clears the
+   * stored outputPath so a later stop() cannot return a deleted path or
+   * start transcription on it. Always returns null: nothing is usable
+   * after a cancel.
+   */
   cancel(): string | null {
-    if (!this.process) {
-      const output = this.outputPath;
-      this.reset();
-      return output;
+    if (this.process) {
+      this.cleanup();
     }
     const output = this.outputPath;
-    this.cleanup();
     if (output && fs.existsSync(output)) {
-      fs.unlinkSync(output);
+      try {
+        fs.unlinkSync(output);
+      } catch {
+        // Best-effort cleanup.
+      }
     }
     this.cleanupTempDir();
     this.resetState();
+    this.outputPath = null;
     return null;
+  }
+
+  /**
+   * Confirm ffmpeg actually produced a usable recording: the WAV exists
+   * and is non-empty.
+   *
+   * A failed mic capture can end with no file or a zero-byte file; handing
+   * that path to transcription surfaces later as a confusing
+   * "File not found: .../recording-*.wav" (N-F2/F11). Fail here instead,
+   * quoting ffmpeg's own stderr so the UI shows a recording error.
+   */
+  private verifyRecording(): string | null {
+    const output = this.outputPath;
+    let size = -1;
+    if (output) {
+      try {
+        size = fs.statSync(output).size;
+      } catch {
+        size = -1;
+      }
+    }
+    if (output && size > 0) {
+      return output;
+    }
+    const detail = this.stderrTail();
+    const message = detail
+      ? `Recording failed: ${detail}`
+      : 'Recording failed: ffmpeg produced no recording file';
+    this._state = { status: 'error', error: message, outputPath: null };
+    this.emit('error', new Error(message));
+    return null;
+  }
+
+  /** Last few non-empty stderr lines, for the failure message. */
+  private stderrTail(maxLines = 3): string {
+    return this.stderrBuffer
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .slice(-maxLines)
+      .join(' | ');
   }
 
   /**
@@ -230,11 +318,5 @@ export class AudioRecorder extends EventEmitter {
 
   private resetState(): void {
     this._state = { status: 'idle', outputPath: null };
-  }
-
-  private reset(): void {
-    this.cleanup();
-    this.cleanupTempDir();
-    this.resetState();
   }
 }
