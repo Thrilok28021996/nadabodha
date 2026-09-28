@@ -92,6 +92,15 @@ npm run test:python
 - `npm run test:python` — run Python adapter tests
 - `npm run lint` — lint the TypeScript sources with ESLint
 
+## Troubleshooting
+
+- **Recording fails with "Microphone access denied"** — macOS only lets an app
+  capture audio after you grant it: open **System Settings > Privacy &
+  Security > Microphone** and enable the app (Nadabodha for packaged builds,
+  Electron when running from a dev build with `npm run start`), then start the
+  recording again. macOS may require restarting the app for the new permission
+  to take effect.
+
 ## Limitations
 
 - v1 is a local-only scaffold. No cloud transcription, accounts, or sync.

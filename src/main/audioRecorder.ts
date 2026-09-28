@@ -3,6 +3,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { EventEmitter } from 'events';
+import {
+  friendlyRecordingFailure,
+  isMicrophoneCaptureFailure,
+  MICROPHONE_DENIED_MESSAGE,
+} from './micPermission';
 
 export interface AudioRecorderOptions {
   sampleRate?: number;
@@ -111,17 +116,21 @@ export class AudioRecorder extends EventEmitter {
     });
 
     this.process.on('exit', (code, signal) => {
+      const proc = this.process;
       const exitedUnexpectedly = code !== 0 && code !== null;
       const wasRecording = this._state.status === 'recording';
       // A stop() we initiated is expected to end the process; never report
       // it as a failure (F6: no spurious error on finalisation).
       if (wasRecording && exitedUnexpectedly && !this.stopping) {
+        const exitSummary = `Recording process exited with code ${code} (signal ${signal})`;
         this._state = {
           status: 'error',
-          error: `Recording process exited with code ${code} (signal ${signal})`,
+          error: this.exitFailureMessage(exitSummary, code),
           outputPath: this.outputPath,
         };
-        this.emit('error', new Error(this._state.error || 'Recording failed'));
+        this.emit('error', new Error(this._state.error || exitSummary));
+        // stderr may still be draining; refine the message once it has closed.
+        this.refineExitFailure(proc, code);
       }
       this.process = null;
     });
@@ -254,12 +263,64 @@ export class AudioRecorder extends EventEmitter {
       return output;
     }
     const detail = this.stderrTail();
-    const message = detail
+    const base = detail
       ? `Recording failed: ${detail}`
       : 'Recording failed: ffmpeg produced no recording file';
+    const message = friendlyRecordingFailure(base, this.stderrBuffer);
     this._state = { status: 'error', error: message, outputPath: null };
     this.emit('error', new Error(message));
     return null;
+  }
+
+  /**
+   * Failure text for an ffmpeg that exited on its own. When stderr already
+   * shows a blocked capture device, lead with the microphone guidance and
+   * keep ffmpeg's own detail as the secondary `Recording failed:` text; any
+   * other exit keeps its original summary, unchanged.
+   */
+  private exitFailureMessage(exitSummary: string, code: number | null): string {
+    if (!isMicrophoneCaptureFailure(this.stderrBuffer)) {
+      return exitSummary;
+    }
+    const detail = this.stderrTail() || `ffmpeg exited with code ${code}`;
+    return friendlyRecordingFailure(`Recording failed: ${detail}`, this.stderrBuffer);
+  }
+
+  /**
+   * stderr is piped, so its last lines can still be draining when 'exit'
+   * fires — and that text is the only place a permission failure explains
+   * itself. Once the pipe has closed, republish the error with the microphone
+   * guidance if the drained text shows a blocked capture device. The guards
+   * make a second event impossible unless the first message lacked the
+   * guidance, and impossible after cancel() or a later recording session.
+   */
+  private refineExitFailure(proc: ChildProcess | null, code: number | null): void {
+    const stream = proc?.stderr;
+    if (!stream || stream.destroyed || stream.readableEnded) {
+      // All stderr lines were already delivered before 'exit'; the message
+      // composed there is final.
+      return;
+    }
+    const refine = (): void => {
+      if (this.process !== null) {
+        return; // a later session owns the recorder
+      }
+      if (this._state.status !== 'error') {
+        return; // cancelled or reset in the meantime
+      }
+      if (!isMicrophoneCaptureFailure(this.stderrBuffer)) {
+        return;
+      }
+      if ((this._state.error || '').startsWith(MICROPHONE_DENIED_MESSAGE)) {
+        return; // already guided; never publish twice
+      }
+      const detail = this.stderrTail() || `ffmpeg exited with code ${code}`;
+      const message = friendlyRecordingFailure(`Recording failed: ${detail}`, this.stderrBuffer);
+      this._state = { ...this._state, error: message };
+      this.emit('error', new Error(message));
+    };
+    stream.once('close', refine);
+    stream.once('end', refine);
   }
 
   /** Last few non-empty stderr lines, for the failure message. */

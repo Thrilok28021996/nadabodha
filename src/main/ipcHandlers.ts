@@ -8,6 +8,7 @@ import {
 } from '../shared/ipc';
 import { isSupportedAudioFile } from '../shared/audioFormats';
 import { AudioRecorder } from './audioRecorder';
+import { ensureMicrophonePermission, MICROPHONE_DENIED_MESSAGE } from './micPermission';
 import { TranscriptionService } from './transcriptionService';
 import { saveTranscript } from './exportText';
 
@@ -29,6 +30,20 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
   });
 
   ipcMain.handle(IpcChannel.StartRecording, async () => {
+    // Microphone permission first: a denial must never spawn ffmpeg (a
+    // blocked capture device fails with a cryptic avfoundation error or a
+    // hung device open). The guidance goes out on the same error-event route
+    // recorder failures use, so the renderer shows it unchanged.
+    const permission = await ensureMicrophonePermission();
+    if (!permission.granted) {
+      if (!mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IpcChannel.TranscriptionEvent, {
+          status: 'error',
+          error: MICROPHONE_DENIED_MESSAGE,
+        } as TranscriptionEvent);
+      }
+      return { outputPath: null };
+    }
     const outputPath = recorder.start();
     mainWindow.webContents.send(IpcChannel.TranscriptionEvent, {
       status: 'recording',

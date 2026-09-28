@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { AudioRecorder } from './audioRecorder';
+import { MICROPHONE_DENIED_MESSAGE } from './micPermission';
 
 jest.setTimeout(15000);
 
@@ -169,9 +170,80 @@ describe('AudioRecorder', () => {
       expect(recorder.getState().status).toBe('error');
       expect(fs.existsSync(outputPath)).toBe(false);
       const message = errors.map((err) => err.message).join('\n');
+      // Friendly microphone guidance leads; ffmpeg's own detail stays as the
+      // secondary "Recording failed:" text.
+      expect(message).toContain(MICROPHONE_DENIED_MESSAGE);
       expect(message).toContain('Recording failed:');
       expect(message).toContain('avfoundation: cannot use MacBook Air Microphone');
       expect(message).toContain('Error opening input: :default');
+    } finally {
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('exit-with-avfoundation-denial: leads with microphone guidance, keeps stderr detail', async () => {
+    const { binDir, ffmpegPath } = makeFakeFfmpegDir();
+    try {
+      // Denied capture: writes the avfoundation failure to stderr and exits
+      // non-zero without creating the output file.
+      writeFakeScript(
+        ffmpegPath,
+        [
+          'echo "[AVFoundation indev @ 0x7f] Failed to open device: Default" >&2',
+          'echo "avfoundation: cannot use MacBook Air Microphone" >&2',
+          'echo "Error opening input: :default" >&2',
+          'exit 1',
+          '',
+        ].join('\n')
+      );
+
+      const recorder = new AudioRecorder({ ffmpegPath });
+      const errors: Error[] = [];
+      recorder.on('error', (err: Error) => errors.push(err));
+
+      recorder.start();
+      await waitFor(() => errors.length > 0, 5000);
+      // stderr can still be draining when 'exit' fires; the guidance must
+      // land either on the first event or on the drained-stderr refine.
+      await waitFor(
+        () => errors[errors.length - 1].message.startsWith(MICROPHONE_DENIED_MESSAGE),
+        2000
+      );
+
+      expect(await recorder.stop()).toBeNull();
+      expect(recorder.getState().status).toBe('error');
+      const finalMessage = recorder.getState().error || '';
+      expect(finalMessage).toContain(MICROPHONE_DENIED_MESSAGE);
+      expect(finalMessage).toContain('Recording failed:');
+      expect(finalMessage).toContain('avfoundation: cannot use MacBook Air Microphone');
+      expect(finalMessage).toContain('Error opening input: :default');
+    } finally {
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it('exit-unrelated-failure: keeps the original exit message, no microphone guidance', async () => {
+    const { binDir, ffmpegPath } = makeFakeFfmpegDir();
+    try {
+      writeFakeScript(
+        ffmpegPath,
+        ['echo "Conversion failed!" >&2', 'exit 1', ''].join('\n')
+      );
+
+      const recorder = new AudioRecorder({ ffmpegPath });
+      const errors: Error[] = [];
+      recorder.on('error', (err: Error) => errors.push(err));
+
+      recorder.start();
+      await waitFor(() => errors.length > 0, 5000);
+      // Let any stderr-driven refinement run before asserting it does not.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const messages = errors.map((err) => err.message).join('\n');
+      expect(errors[0].message).toContain('Recording process exited with code 1');
+      expect(messages).not.toContain(MICROPHONE_DENIED_MESSAGE);
+      expect(await recorder.stop()).toBeNull();
+      expect(recorder.getState().status).toBe('error');
     } finally {
       fs.rmSync(binDir, { recursive: true, force: true });
     }
