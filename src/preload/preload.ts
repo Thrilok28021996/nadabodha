@@ -1,10 +1,46 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import {
-  IpcChannel,
-  TranscriptionEvent,
-  SaveTranscriptRequest,
-  SaveTranscriptResult,
-} from '../shared/ipc';
+
+/**
+ * IPC channel names and payload shapes, duplicated here so the preload
+ * script does not depend on shared modules (sandboxed preload cannot
+ * require files outside the preload script directory).
+ */
+enum IpcChannel {
+  StartRecording = 'start-recording',
+  StopRecording = 'stop-recording',
+  ImportAudio = 'import-audio',
+  CancelTranscription = 'cancel-transcription',
+  SaveTranscript = 'save-transcript',
+  CopyTranscript = 'copy-transcript',
+  TranscriptionEvent = 'transcription-event',
+  RequestStatus = 'request-status',
+}
+
+type TranscriptionStatus =
+  | 'idle'
+  | 'recording'
+  | 'transcribing'
+  | 'completed'
+  | 'cancelled'
+  | 'error';
+
+interface TranscriptionEvent {
+  status: TranscriptionStatus;
+  text?: string;
+  progress?: number;
+  error?: string;
+}
+
+interface SaveTranscriptRequest {
+  filePath: string;
+  text: string;
+}
+
+interface SaveTranscriptResult {
+  success: boolean;
+  filePath?: string;
+  error?: string;
+}
 
 export interface ElectronApi {
   startRecording: () => Promise<{ outputPath: string }>;

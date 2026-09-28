@@ -1,10 +1,29 @@
-import { ElectronApi } from '../preload/preload';
-import { TranscriptionEvent } from '../shared/ipc';
+// This file is loaded by index.html as a classic <script>, not as a module,
+// so it must contain no top-level import/export: TypeScript would emit the
+// CommonJS `Object.defineProperty(exports, ...)` prologue, and `exports` is
+// undefined in the page, which aborts the whole script (F4). An `import()`
+// type query is erased at compile time and does not make this a module.
+type TranscriptionEvent = import('../shared/ipc').TranscriptionEvent;
 
-declare global {
-  interface Window {
-    electronAPI: ElectronApi;
-  }
+// Preload API is injected at runtime; declare a minimal typed interface here
+// to avoid importing from the sandboxed preload bundle.
+interface ElectronApi {
+  startRecording: () => Promise<{ outputPath: string }>;
+  stopRecording: () => Promise<{ outputPath: string | null }>;
+  importAudio: (filePath: string) => Promise<{ filePath: string }>;
+  cancelTranscription: () => Promise<{ cancelled: boolean }>;
+  saveTranscript: (request: { filePath: string; text: string }) => Promise<{ success: boolean; error?: string }>;
+  copyTranscript: (text: string) => Promise<{ copied: boolean }>;
+  requestStatus: () => Promise<{ status: string; text: string; filePath: string | null }>;
+  requestSavePath?: () => Promise<string | undefined>;
+  onTranscriptionEvent: (callback: (event: TranscriptionEvent) => void) => void;
+  removeTranscriptionListener: () => void;
+}
+
+// Merged into the global Window declared by lib.dom; only read as a type.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+interface Window {
+  electronAPI: ElectronApi;
 }
 
 const recordBtn = document.getElementById('recordBtn') as HTMLButtonElement;

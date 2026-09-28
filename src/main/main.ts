@@ -14,10 +14,15 @@ function createWindow(): void {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
   });
 
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+
+  if (process.env.NADABODHA_DEV_TOOLS === '1') {
+    mainWindow.webContents.openDevTools();
+  }
 
   mainWindow.on('closed', () => {
     mainWindow = null;

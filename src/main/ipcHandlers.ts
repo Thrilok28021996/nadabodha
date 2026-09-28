@@ -37,7 +37,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
   });
 
   ipcMain.handle(IpcChannel.StopRecording, async () => {
-    const outputPath = recorder.stop();
+    const outputPath = await recorder.stop();
     if (outputPath) {
       transcriptionService.startTranscription(outputPath);
     }
@@ -79,6 +79,19 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
 
   transcriptionService.onEvent((event) => {
     mainWindow.webContents.send(IpcChannel.TranscriptionEvent, event);
+  });
+
+  // Forward recorder failures (e.g. ffmpeg missing or crashing) to the
+  // renderer. Without a listener, EventEmitter rethrows 'error' and Node
+  // reports an uncaught exception that takes the main process down (F5).
+  recorder.on('error', (err: Error) => {
+    if (mainWindow.isDestroyed()) {
+      return;
+    }
+    mainWindow.webContents.send(IpcChannel.TranscriptionEvent, {
+      status: 'error',
+      error: err.message,
+    } as TranscriptionEvent);
   });
 }
 

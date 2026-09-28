@@ -74,7 +74,7 @@ python3 -m pip install openai-whisper
 npm run start
 ```
 
-This compiles TypeScript and launches Electron. The main entry point is `dist/main.js`, the preload bundle is `dist/preload/preload.js`, and the renderer loads from `src/renderer/`.
+This compiles TypeScript, copies renderer assets, and launches Electron. The main entry point is `dist/main/main.js`, the preload bundle is `dist/preload/preload.js`, and the renderer loads from `dist/renderer/index.html`.
 
 ## Tests
 
@@ -90,6 +90,7 @@ npm run test:python
 - `npm run start` — build and run Electron
 - `npm test` — run TypeScript unit tests
 - `npm run test:python` — run Python adapter tests
+- `npm run lint` — lint the TypeScript sources with ESLint
 
 ## Limitations
 
