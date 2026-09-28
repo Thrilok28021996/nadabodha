@@ -117,7 +117,10 @@ export interface HfModelInfo {
 
 export interface HfModelListResult {
   models: HfModelInfo[];
+  /** Snapshots that are complete and safe to activate. */
   installed: string[];
+  /** Snapshots with files on disk whose download was interrupted. */
+  partial?: string[];
   activeModel: string;
   error?: string;
 }

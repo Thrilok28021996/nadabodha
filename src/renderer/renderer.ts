@@ -114,6 +114,7 @@ let currentText = '';
 let currentSettings: AppSettings | null = null;
 let selectedModelId: string | null = null;
 let installedModels: string[] = [];
+let partialModels: string[] = [];
 let activeModel = '';
 let hfLoaded = false;
 let hfSearchTimer: number | undefined;
@@ -289,11 +290,15 @@ function handleDownloadEvent(event: TranscriptionEvent): void {
     hfCancelDownloadBtn.hidden = true;
     hfDownloadBtn.disabled = !selectedModelId;
     setHint(downloadStatus, event.error || 'Model download failed', 'error');
+    void refreshModels();
   } else if (event.status === 'cancelled') {
     downloadProgress.hidden = true;
     hfCancelDownloadBtn.hidden = true;
     hfDownloadBtn.disabled = !selectedModelId;
     setHint(downloadStatus, `Download of ${event.repoId || 'model'} cancelled — partial files stay resumable`, 'ok');
+    // Re-list the cache so the interrupted snapshot shows up as incomplete
+    // (and can be downloaded again) instead of silently vanishing.
+    void refreshModels();
   }
 }
 
@@ -567,6 +572,34 @@ cacheDirBrowseBtn.addEventListener('click', async () => {
   }
 });
 
+/**
+ * The summarizer talks to /chat/completions, so embedding, reranker and
+ * other non-chat models are dead entries in the dropdown.
+ */
+function isChatCapableModel(modelId: string): boolean {
+  const id = (modelId || '').trim().toLowerCase();
+  if (!id) {
+    return false;
+  }
+  const nonChat = [
+    /(^|[-_./])embed/, // text-embedding-*, nomic-embed-*, *-embedding-*
+    /(^|[-_./])rerank/,
+    /(^|[-_./])retrieval/,
+    /(^|[-_./])bge[-_]/,
+    /(^|[-_./])e5[-_]/,
+    /(^|[-_./])gte[-_]/,
+    /(^|[-_./])minilm/,
+    /(^|[-_./])stella[-_]/,
+    /(^|[-_./])whisper/,
+    /(^|[-_./])tts([-_.]|$)/,
+    /(^|[-_./])asr([-_.]|$)/,
+    /(^|[-_./])clip([-_.]|$)/,
+    /(^|[-_./])stable-diffusion/,
+    /(^|[-_./])flux[-_.]/,
+  ];
+  return !nonChat.some((pattern) => pattern.test(id));
+}
+
 async function loadLlmModels(baseUrl: string, showStatus: boolean): Promise<void> {
   if (showStatus) {
     setHint(llmStatus, 'Loading models…', 'busy');
@@ -575,14 +608,19 @@ async function loadLlmModels(baseUrl: string, showStatus: boolean): Promise<void
     const result = await window.electronAPI.testLlmConnection(baseUrl);
     const previous = llmModelSelect.value || currentSettings?.llmModel || '';
     llmModelSelect.innerHTML = '<option value="">— none —</option>';
+    let listed = 0;
     for (const model of result.models) {
+      if (!isChatCapableModel(model)) {
+        continue;
+      }
       const option = document.createElement('option');
       option.value = model;
       option.textContent = model;
       llmModelSelect.appendChild(option);
+      listed += 1;
     }
     ensureModelOption(previous);
-    if (result.models.length > 0 && previous) {
+    if (listed > 0 && previous) {
       llmModelSelect.value = previous;
     }
     if (showStatus) {
@@ -621,7 +659,13 @@ function formatDownloads(downloads: number): string {
   return String(downloads);
 }
 
-function renderModelRow(model: HfModelInfo, container: HTMLElement, installed: boolean, active: boolean): HTMLElement {
+function renderModelRow(
+  model: HfModelInfo,
+  container: HTMLElement,
+  installed: boolean,
+  active: boolean,
+  partial = false
+): HTMLElement {
   const row = document.createElement('div');
   row.className = 'model-row';
   row.setAttribute('role', 'listitem');
@@ -637,11 +681,22 @@ function renderModelRow(model: HfModelInfo, container: HTMLElement, installed: b
   meta.textContent = `${formatDownloads(model.downloads)} downloads · ${model.format}`;
   row.appendChild(meta);
 
-  if (installed) {
+  if (installed || partial) {
     const badge = document.createElement('span');
-    badge.className = 'badge';
-    badge.textContent = active ? 'active' : 'installed';
+    badge.className = partial ? 'badge partial' : 'badge';
+    badge.textContent = partial
+      ? active
+        ? 'active · incomplete'
+        : 'incomplete'
+      : active
+        ? 'active'
+        : 'installed';
     row.appendChild(badge);
+  }
+
+  if (partial) {
+    row.classList.add('partial');
+    row.title = `${model.id} — download was interrupted; download it again to finish`;
   }
 
   if (model.kind === 'unsupported') {
@@ -666,10 +721,19 @@ function selectModel(repoId: string, fromInstalled: boolean): void {
     row.classList.toggle('selected', (row as HTMLElement).dataset.repoId === repoId);
   });
   const isInstalled = installedModels.includes(repoId);
-  hfDownloadBtn.disabled = !repoId || isInstalled;
-  hfUseBtn.disabled = !isInstalled || repoId === activeModel;
+  const isPartial = partialModels.includes(repoId);
+  // A partial snapshot can be downloaded again (and finished), but it is
+  // never "installed": it must not be offered as a working model.
+  hfDownloadBtn.disabled = !repoId || (isInstalled && !isPartial);
+  hfUseBtn.disabled = (!isInstalled && !isPartial) || repoId === activeModel;
   hfUseBtn.textContent = repoId === activeModel ? 'Active' : 'Set active';
-  if (fromInstalled) {
+  if (isPartial && !isInstalled) {
+    setHint(
+      hfStatus,
+      `${repoId} is incomplete — its download was interrupted. Download it again to finish before setting it active.`,
+      'error'
+    );
+  } else if (fromInstalled) {
     setHint(hfStatus, `Selected ${repoId}`, 'ok');
   }
 }
@@ -678,6 +742,7 @@ async function refreshModels(): Promise<void> {
   try {
     const result = await window.electronAPI.listHfModels(hfSearchInput.value.trim());
     installedModels = result.installed || [];
+    partialModels = result.partial || [];
     activeModel = result.activeModel || '';
     renderSearchResults(result);
     renderInstalled(result);
@@ -702,7 +767,13 @@ function renderSearchResults(result: HfModelListResult): void {
   }
   setHint(hfStatus, `${result.models.length} model(s) — click a row to select it`, 'ok');
   for (const model of result.models) {
-    const row = renderModelRow(model, hfResults, installedModels.includes(model.id), model.id === activeModel);
+    const row = renderModelRow(
+      model,
+      hfResults,
+      installedModels.includes(model.id),
+      model.id === activeModel,
+      partialModels.includes(model.id)
+    );
     if (model.id === activeModel) {
       row.classList.add('selected');
     }
@@ -711,15 +782,16 @@ function renderSearchResults(result: HfModelListResult): void {
 
 function renderInstalled(result: HfModelListResult): void {
   hfInstalled.innerHTML = '';
-  if (result.installed.length === 0) {
+  const installed = result.installed || [];
+  const partial = result.partial || [];
+  if (installed.length === 0 && partial.length === 0) {
     const empty = document.createElement('p');
     empty.className = 'hint';
     empty.textContent = `Nothing installed yet in ${currentSettings?.sttCacheDir || 'the cache directory'}`;
     hfInstalled.appendChild(empty);
     return;
   }
-  for (const repoId of result.installed) {
-    const active = repoId === result.activeModel;
+  for (const repoId of installed) {
     renderModelRow(
       {
         id: repoId,
@@ -731,7 +803,32 @@ function renderInstalled(result: HfModelListResult): void {
       },
       hfInstalled,
       true,
-      active
+      repoId === result.activeModel
+    );
+  }
+  // Interrupted downloads are listed apart from installed models: they can be
+  // downloaded again, but never activated or used for transcription.
+  for (const repoId of partial) {
+    renderModelRow(
+      {
+        id: repoId,
+        downloads: 0,
+        pipelineTag: 'automatic-speech-recognition',
+        tags: [],
+        kind: 'pytorch',
+        format: installedFormat(repoId),
+      },
+      hfInstalled,
+      false,
+      repoId === result.activeModel,
+      true
+    );
+  }
+  if (result.activeModel && partial.includes(result.activeModel)) {
+    setHint(
+      hfStatus,
+      `Active model ${result.activeModel} is incomplete — its download was interrupted. Download it again before transcribing.`,
+      'error'
     );
   }
 }
@@ -786,6 +883,14 @@ hfCancelDownloadBtn.addEventListener('click', async () => {
 
 hfUseBtn.addEventListener('click', async () => {
   if (!selectedModelId) return;
+  if (partialModels.includes(selectedModelId)) {
+    setHint(
+      hfStatus,
+      `Cannot set ${selectedModelId} active: its download is incomplete. Download it again to finish, then set it active.`,
+      'error'
+    );
+    return;
+  }
   try {
     const result = await window.electronAPI.updateSettings({ activeModel: selectedModelId });
     applySettingsToForm(result.settings);

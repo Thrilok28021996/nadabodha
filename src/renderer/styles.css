@@ -347,6 +347,15 @@ button.danger {
   text-transform: uppercase;
 }
 
+/* Interrupted download: present on disk, not usable yet. */
+.badge.partial {
+  background: #b54708;
+}
+
+.model-row.partial {
+  background: #fff8f0;
+}
+
 code {
   background: #ececf0;
   border-radius: 4px;

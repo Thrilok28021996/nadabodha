@@ -135,6 +135,9 @@ export function isAllowedHfHost(hostname: string): boolean {
   );
 }
 
+/** Caps how many rows a single search returns (HF's default is 1000). */
+export const MAX_MODEL_SEARCH_RESULTS = 50;
+
 /**
  * Builds the model search URL. An empty query yields the "top models"
  * listing (sorted by downloads, ASR pipeline only).
@@ -148,6 +151,7 @@ export function buildModelSearchUrl(query?: string, base: string = HF_API_BASE):
   }
   params.set('sort', 'downloads');
   params.set('direction', '-1');
+  params.set('limit', String(MAX_MODEL_SEARCH_RESULTS));
   return `${base}/api/models?${params.toString()}`;
 }
 
@@ -209,7 +213,8 @@ export function parseModelList(payload: unknown): HfModelInfo[] {
       format: classification.format,
     });
   }
-  return rows;
+  // Defensive cap: the URL already asks HF for at most MAX rows.
+  return rows.slice(0, MAX_MODEL_SEARCH_RESULTS);
 }
 
 export function formatDownloads(downloads: number): string {
@@ -228,6 +233,10 @@ export function formatDownloads(downloads: number): string {
 /**
  * Lists models already present in the cache directory
  * (<cacheDir>/models--org--name/snapshots/<rev>/...).
+ *
+ * This is the loose "something is on disk" check. Use
+ * {@link inspectInstalledModels} to tell complete snapshots from partial
+ * (interrupted) ones - only complete ones may be offered as installed.
  */
 export function listInstalledModels(cacheDir: string): string[] {
   if (!cacheDir || !cacheDir.trim()) {
@@ -270,6 +279,175 @@ export function listInstalledModels(cacheDir: string): string[] {
   return installed.sort();
 }
 
+export interface InstalledModelInspection {
+  /** Snapshots that can actually be loaded (safe to set active). */
+  installed: string[];
+  /** Repo folders with files, but incomplete (cancelled/failed download). */
+  partial: string[];
+}
+
+const WEIGHT_FILE_RE = /\.(bin|safetensors|pt|pth|ckpt|onnx)$/i;
+const WEIGHT_INDEX_FILES = ['model.safetensors.index.json', 'pytorch_model.bin.index.json'];
+
+function nonEmptyFile(filePath: string): boolean {
+  try {
+    return fs.statSync(filePath).isFile() && fs.statSync(filePath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Collects every file below `dir`; returns null when a link is dangling. */
+function collectFiles(dir: string, out: string[] = []): string[] | null {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    let isDirectory: boolean;
+    try {
+      isDirectory = fs.statSync(full).isDirectory(); // follows symlinks
+    } catch {
+      return null; // dangling symlink: the blob never landed
+    }
+    if (isDirectory) {
+      const nested = collectFiles(full, out);
+      if (!nested) {
+        return null;
+      }
+    } else {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+function revisionLoadable(revisionDir: string): boolean {
+  const files = collectFiles(revisionDir);
+  if (!files || files.length === 0) {
+    return false;
+  }
+  if (!nonEmptyFile(path.join(revisionDir, 'config.json'))) {
+    return false;
+  }
+  const weights = files.filter((file) => WEIGHT_FILE_RE.test(path.basename(file)));
+  if (weights.length === 0 || weights.some((file) => !nonEmptyFile(file))) {
+    return false;
+  }
+  // Sharded checkpoints: every shard named by the index must be present.
+  for (const indexName of WEIGHT_INDEX_FILES) {
+    const indexPath = path.join(revisionDir, indexName);
+    if (!fs.existsSync(indexPath)) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf8')) as {
+        weight_map?: Record<string, unknown>;
+      };
+      const weightMap = parsed.weight_map;
+      if (!weightMap || typeof weightMap !== 'object') {
+        return false;
+      }
+      for (const shard of new Set(Object.values(weightMap).map(String))) {
+        if (!nonEmptyFile(path.join(revisionDir, shard))) {
+          return false;
+        }
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasIncompleteBlob(dir: string): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      if (hasIncompleteBlob(path.join(dir, entry.name))) {
+        return true;
+      }
+    } else if (entry.name.endsWith('.incomplete')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** True only when the cache entry holds a snapshot that can be loaded. */
+export function isCacheEntryComplete(repoDir: string): boolean {
+  const snapshotsDir = path.join(repoDir, 'snapshots');
+  let revisions: string[];
+  try {
+    revisions = fs.readdirSync(snapshotsDir);
+  } catch {
+    return false; // folder exists but no snapshot landed yet
+  }
+  if (hasIncompleteBlob(repoDir)) {
+    return false; // interrupted transfer marker still on disk
+  }
+  const refsDir = path.join(repoDir, 'refs');
+  if (fs.existsSync(refsDir)) {
+    try {
+      for (const ref of fs.readdirSync(refsDir)) {
+        const target = fs.readFileSync(path.join(refsDir, ref), 'utf8').trim();
+        if (!target || !fs.existsSync(path.join(snapshotsDir, target))) {
+          return false;
+        }
+      }
+    } catch {
+      return false;
+    }
+  }
+  return revisions.some((revision) => revisionLoadable(path.join(snapshotsDir, revision)));
+}
+
+/**
+ * Splits every `models--*` folder in the cache into complete (installed)
+ * and partial (interrupted) entries. A partial snapshot is offered for
+ * re-download, never as an installed/usable model.
+ */
+export function inspectInstalledModels(cacheDir: string): InstalledModelInspection {
+  const result: InstalledModelInspection = { installed: [], partial: [] };
+  if (!cacheDir || !cacheDir.trim()) {
+    return result;
+  }
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(cacheDir, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('models--')) {
+      continue;
+    }
+    const remainder = entry.name.slice('models--'.length);
+    const separator = remainder.indexOf('--');
+    if (separator <= 0) {
+      continue;
+    }
+    const repoId = `${remainder.slice(0, separator)}/${remainder.slice(separator + 2)}`;
+    const repoDir = path.join(cacheDir, entry.name);
+    if (isCacheEntryComplete(repoDir)) {
+      result.installed.push(repoId);
+    } else {
+      result.partial.push(repoId);
+    }
+  }
+  result.installed.sort();
+  result.partial.sort();
+  return result;
+}
+
 export interface ModelSearchDeps {
   fetchImpl?: typeof fetch;
   baseUrl?: string;
@@ -285,16 +463,27 @@ export async function searchHfModels(
 ): Promise<HfModelListResult> {
   const fetchImpl = deps.fetchImpl || fetch;
   const url = buildModelSearchUrl(query, deps.baseUrl || HF_API_BASE);
+  // Local cache inspection never touches the network, so it runs first and
+  // is returned on every path (including failures): partial snapshots must
+  // stay visible even when search is offline.
+  const inspection = inspectInstalledModels(cacheDir);
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(url);
   } catch {
-    return { models: [], installed: [], activeModel, error: `Invalid URL: ${url}` };
+    return {
+      models: [],
+      installed: inspection.installed,
+      partial: inspection.partial,
+      activeModel,
+      error: `Invalid URL: ${url}`,
+    };
   }
   if (!isAllowedHfHost(parsedUrl.hostname)) {
     return {
       models: [],
-      installed: [],
+      installed: inspection.installed,
+      partial: inspection.partial,
       activeModel,
       error: `Blocked request to non-Hugging-Face host: ${parsedUrl.hostname}`,
     };
@@ -307,7 +496,8 @@ export async function searchHfModels(
     if (!response.ok) {
       return {
         models: [],
-        installed: listInstalledModels(cacheDir),
+        installed: inspection.installed,
+        partial: inspection.partial,
         activeModel,
         error: `Hugging Face search failed: HTTP ${response.status}`,
       };
@@ -315,13 +505,15 @@ export async function searchHfModels(
     const payload: unknown = await response.json();
     return {
       models: parseModelList(payload),
-      installed: listInstalledModels(cacheDir),
+      installed: inspection.installed,
+      partial: inspection.partial,
       activeModel,
     };
   } catch (err) {
     return {
       models: [],
-      installed: listInstalledModels(cacheDir),
+      installed: inspection.installed,
+      partial: inspection.partial,
       activeModel,
       error: `Hugging Face search failed: ${err instanceof Error ? err.message : String(err)}`,
     };

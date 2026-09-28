@@ -47,7 +47,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 
 def emit(event: dict) -> None:
@@ -103,6 +103,7 @@ def apply_cache_dir(cache_dir: str) -> None:
 
 
 def _snapshot_present(repo_id: str, cache_dir: str) -> bool:
+    """Loose check: a snapshot directory with at least one entry exists."""
     if not repo_id or not cache_dir:
         return False
     marker = "models--" + repo_id.replace("/", "--")
@@ -112,6 +113,82 @@ def _snapshot_present(repo_id: str, cache_dir: str) -> bool:
     try:
         for revision in snapshots.iterdir():
             if revision.is_dir() and any(revision.iterdir()):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+WEIGHT_FILE_RE = re.compile(r"\.(bin|safetensors|pt|pth|ckpt|onnx)$", re.IGNORECASE)
+WEIGHT_INDEX_FILES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+
+
+def _revision_loadable(revision: Path) -> bool:
+    """True when a snapshot revision holds every file a local loader needs."""
+    try:
+        files: list[Path] = []
+        for path in revision.rglob("*"):
+            if path.is_symlink() and not path.exists():
+                return False  # blob never landed -> dangling pointer
+            if path.is_file():
+                files.append(path)
+        if not files:
+            return False
+        config = revision / "config.json"
+        if not config.is_file() or config.stat().st_size <= 0:
+            return False
+        weights = [p for p in files if WEIGHT_FILE_RE.search(p.name)]
+        if not weights or any(p.stat().st_size <= 0 for p in weights):
+            return False
+        # Sharded checkpoints: every shard named by the index must be present.
+        for index_name in WEIGHT_INDEX_FILES:
+            index_path = revision / index_name
+            if not index_path.is_file():
+                continue
+            parsed = json.loads(index_path.read_text(encoding="utf-8"))
+            weight_map = parsed.get("weight_map") if isinstance(parsed, dict) else None
+            if not isinstance(weight_map, dict):
+                return False
+            for weight_name in sorted({str(v) for v in weight_map.values()}):
+                shard = revision / weight_name
+                if not shard.is_file() or shard.stat().st_size <= 0:
+                    return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _snapshot_complete(repo_id: str, cache_dir: str) -> bool:
+    """True only when the cached snapshot can actually be loaded.
+
+    A cancelled or interrupted download still leaves a snapshot directory
+    behind; treating that as installed makes the model unusable and
+    unrecoverable from the UI. Completeness therefore requires:
+      * no ``*.incomplete`` blob anywhere in the repo folder,
+      * every ``refs/*`` entry resolving to a revision on disk,
+      * at least one revision with a non-empty ``config.json``, a non-empty
+        weight file, no broken symlinks and all sharded weights present.
+    """
+    if not repo_id or not cache_dir:
+        return False
+    marker = "models--" + repo_id.replace("/", "--")
+    repo_dir = Path(cache_dir) / marker
+    snapshots = repo_dir / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    try:
+        if any(repo_dir.rglob("*.incomplete")):
+            return False
+        refs = repo_dir / "refs"
+        if refs.is_dir():
+            for ref in refs.iterdir():
+                if not ref.is_file():
+                    continue
+                target = ref.read_text(encoding="utf-8").strip()
+                if not target or not (snapshots / target).is_dir():
+                    return False
+        for revision in snapshots.iterdir():
+            if revision.is_dir() and _revision_loadable(revision):
                 return True
     except OSError:
         return False
@@ -202,6 +279,44 @@ class DownloadCancelled(Exception):
     """Raised inside progress callbacks to abort a snapshot download."""
 
 
+#: The UI must see exactly one of these statuses for every download.
+DOWNLOAD_TERMINAL_STATUSES = ("completed", "error", "cancelled")
+
+#: How long a cancelled snapshot download gets to unwind on its own before the
+#: terminal event is reported anyway. huggingface_hub's xet transport swallows
+#: exceptions raised from the progress callback, so waiting for the transfer
+#: itself would leave the UI stuck on "Downloading" indefinitely.
+CANCEL_UNWIND_SECONDS = 0.5
+
+#: A previously cancelled worker thread that is still unwinding delays a new
+#: download by at most this long before we report an error instead.
+STALE_WORKER_GRACE_SECONDS = 2.0
+
+#: Worker thread of the download currently owned by this process (if any).
+_ACTIVE_DOWNLOAD_WORKER: Optional[threading.Thread] = None
+
+
+class TerminalEmitter:
+    """Event sink wrapper that guarantees at most one terminal event.
+
+    A download can end from several places at once (cancelled worker, safety
+    timeout, broken pipe). Emitting two terminal events confuses the UI and
+    emitting none leaves it stuck in "Downloading", so every terminal status
+    is funnelled through this gate.
+    """
+
+    def __init__(self, on_event: Callable[[dict], None]) -> None:
+        self._on_event = on_event
+        self.sent = False
+
+    def __call__(self, event: dict) -> None:
+        if event.get("status") in DOWNLOAD_TERMINAL_STATUSES:
+            if self.sent:
+                return
+            self.sent = True
+        self._on_event(event)
+
+
 class ProgressReporter:
     """Aggregates tqdm bar updates into throttled JSON progress events."""
 
@@ -235,6 +350,10 @@ class ProgressReporter:
         if not force and now - self.last_emit < 0.25:
             return
         percent = self.percent()
+        if percent < self.last_percent:
+            # huggingface_hub grows the aggregate byte total as file metadata
+            # arrives, which would otherwise make the bar jump backwards.
+            percent = self.last_percent
         if percent == self.last_percent and not force:
             return
         self.last_emit = now
@@ -264,6 +383,20 @@ def _make_progress_tqdm(reporter: ProgressReporter):
         from tqdm import tqdm as hf_tqdm  # type: ignore
 
     class ProgressTqdm(hf_tqdm):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):  # noqa: ANN001
+            super().__init__(*args, **kwargs)
+            # tqdm returns early for disabled bars and never assigns several
+            # attributes (unit/desc/initial). snapshot_download builds its
+            # aggregate byte bar with disable=<non-tty>, so without restoring
+            # `unit` the byte counters stay at 0 and the percentage jumps per
+            # finished file instead of tracking bytes.
+            if not hasattr(self, "unit"):
+                self.unit = kwargs.get("unit") or "it"
+            if not hasattr(self, "desc"):
+                self.desc = kwargs.get("desc") or ""
+            if not hasattr(self, "initial"):
+                self.initial = kwargs.get("initial") or 0
+
         def update(self, n: int = 1):  # noqa: ANN001
             reporter.check_cancelled()
             if getattr(self, "disable", False):
@@ -283,12 +416,40 @@ def download_model(
     on_event: Callable[[dict], None],
     cancel_event: threading.Event,
 ) -> bool:
-    """snapshot_download with progress + cancellation. Returns True on success."""
+    """snapshot_download with progress + cancellation. Returns True on success.
+
+    Exactly one terminal event (completed / error / cancelled) is always
+    emitted - even when the hub cannot be interrupted mid-transfer.
+    """
+    emit = TerminalEmitter(on_event)
+    try:
+        return _download_model(repo_id, cache_dir, emit, cancel_event)
+    except BaseException as exc:  # noqa: BLE001 - the UI must always hear back
+        if not emit.sent:
+            if cancel_event.is_set():
+                emit({"status": "cancelled", "origin": "download", "repo_id": repo_id})
+            else:
+                emit({
+                    "status": "error",
+                    "origin": "download",
+                    "repo_id": repo_id,
+                    "error": f"Download failed: {exc}",
+                })
+        return False
+
+
+def _download_model(
+    repo_id: str,
+    cache_dir: str,
+    emit: TerminalEmitter,
+    cancel_event: threading.Event,
+) -> bool:
+    global _ACTIVE_DOWNLOAD_WORKER
     apply_cache_dir(cache_dir)
     try:
         from huggingface_hub import snapshot_download
     except Exception as exc:
-        on_event({
+        emit({
             "status": "error",
             "origin": "download",
             "repo_id": repo_id,
@@ -296,40 +457,79 @@ def download_model(
         })
         return False
 
-    reporter = ProgressReporter(on_event, repo_id, cancel_event)
+    # A cancelled download may still be unwinding inside the hub (xet keeps
+    # transferring until its current file ends). Never run two writers
+    # against the same cache directory.
+    stale = _ACTIVE_DOWNLOAD_WORKER
+    if stale is not None and stale.is_alive():
+        stale.join(STALE_WORKER_GRACE_SECONDS)
+        if stale.is_alive():
+            emit({
+                "status": "error",
+                "origin": "download",
+                "repo_id": repo_id,
+                "error": "Another model download is still shutting down - retry in a moment",
+            })
+            return False
+
+    reporter = ProgressReporter(emit, repo_id, cancel_event)
     progress_tqdm = _make_progress_tqdm(reporter)
     reporter.maybe_emit(force=True)
 
-    try:
-        folder = snapshot_download(
-            repo_id,
-            cache_dir=cache_dir or None,
-            tqdm_class=progress_tqdm,
-            max_workers=4,
-        )
-    except DownloadCancelled:
-        on_event({"status": "cancelled", "origin": "download", "repo_id": repo_id})
-        return False
-    except Exception as exc:
+    result: dict = {}
+
+    def _worker() -> None:
+        try:
+            result["folder"] = snapshot_download(
+                repo_id,
+                cache_dir=cache_dir or None,
+                tqdm_class=progress_tqdm,
+                max_workers=4,
+            )
+        except BaseException as exc:  # noqa: BLE001 - reported by the caller
+            result["exc"] = exc
+
+    worker = threading.Thread(target=_worker, name="nadabodha-hf-download", daemon=True)
+    _ACTIVE_DOWNLOAD_WORKER = worker
+    worker.start()
+
+    # Poll instead of blocking on snapshot_download: cancellation must be
+    # noticed within a few milliseconds, whatever the transport does with it.
+    while worker.is_alive():
+        worker.join(0.05)
         if cancel_event.is_set():
-            on_event({"status": "cancelled", "origin": "download", "repo_id": repo_id})
-            return False
-        on_event({
-            "status": "error",
-            "origin": "download",
-            "repo_id": repo_id,
-            "error": f"Download failed: {exc}",
-        })
+            break
+
+    if worker.is_alive() and cancel_event.is_set():
+        # Give the hub a short chance to unwind cleanly, then report anyway:
+        # the xet transport swallows the abort raised from its progress
+        # callback, so waiting for the transfer could take minutes.
+        worker.join(CANCEL_UNWIND_SECONDS)
+
+    if worker.is_alive():
+        emit({"status": "cancelled", "origin": "download", "repo_id": repo_id})
         return False
 
-    on_event({
-        "status": "completed",
+    exc = result.get("exc")
+    if exc is None:
+        emit({
+            "status": "completed",
+            "origin": "download",
+            "repo_id": repo_id,
+            "path": result.get("folder"),
+            "progress": 100,
+        })
+        return True
+    if isinstance(exc, DownloadCancelled) or cancel_event.is_set():
+        emit({"status": "cancelled", "origin": "download", "repo_id": repo_id})
+        return False
+    emit({
+        "status": "error",
         "origin": "download",
         "repo_id": repo_id,
-        "path": folder,
-        "progress": 100,
+        "error": f"Download failed: {exc}",
     })
-    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -351,15 +551,51 @@ class BaseTranscriber:
 
     def _ensure_model(self, repo_id: str, cache_dir: str) -> bool:
         """Download the HF snapshot on demand (with progress). False = stopped."""
-        if not cache_dir or _snapshot_present(repo_id, cache_dir):
+        if not cache_dir:
             return True
+        if _snapshot_complete(repo_id, cache_dir):
+            return True
+        # Partial/cancelled snapshots are re-fetched here: the hub resumes
+        # whatever already landed instead of offering a broken model.
         self.on_event({
             "status": "downloading",
             "origin": "download",
             "repo_id": repo_id,
             "progress": 0,
         })
-        return download_model(repo_id, cache_dir, self.on_event, self._cancel_event)
+        if not download_model(repo_id, cache_dir, self.on_event, self._cancel_event):
+            self._report_download_stop(
+                f"Model {repo_id} could not be downloaded - transcription stopped"
+            )
+            return False
+        if not _snapshot_complete(repo_id, cache_dir):
+            self.on_event({
+                "status": "error",
+                "origin": "download",
+                "repo_id": repo_id,
+                "error": (
+                    f"{repo_id} is still incomplete after downloading - "
+                    "required files are missing or truncated"
+                ),
+            })
+            self._report_download_stop(
+                f"Model {repo_id} is incomplete - transcription stopped"
+            )
+            return False
+        return True
+
+    def _report_download_stop(self, message: str) -> None:
+        """Emit the terminal event for the transcription itself.
+
+        Download events carry ``origin: download`` and must not advance the
+        transcription state machine, so a transcription that stops because of
+        the download still needs its own terminal event - otherwise the UI
+        stays on "Transcribing".
+        """
+        if self._cancelled:
+            self.on_event({"status": "cancelled"})
+        else:
+            self.on_event({"status": "error", "error": message})
 
 
 class MockTranscriber(BaseTranscriber):
@@ -468,6 +704,29 @@ class FasterWhisperTranscriber(BaseTranscriber):
             self.on_event({"status": "error", "error": f"faster-whisper error: {exc}"})
 
 
+def build_asr_pipeline(
+    repo_id: str,
+    cache_dir: str = "",
+    pipeline_fn: Optional[Callable[..., Any]] = None,
+) -> Callable[..., dict]:
+    """Construct the transformers ASR pipeline for a repo.
+
+    ``cache_dir`` is handed over as ``model_kwargs`` so it only reaches the
+    ``from_pretrained`` calls for the model/tokenizer/processor. It must never
+    be a bare ``pipeline(...)`` kwarg: the pipeline forwards unknown kwargs
+    into ``generate()`` and transformers rejects them with "The following
+    model_kwargs are not used by the model: [cache_dir]".
+    """
+    if pipeline_fn is None:
+        from transformers import pipeline as fn  # type: ignore
+    else:
+        fn = pipeline_fn
+    kwargs: dict = {"model": repo_id}
+    if cache_dir:
+        kwargs["model_kwargs"] = {"cache_dir": cache_dir}
+    return fn("automatic-speech-recognition", **kwargs)
+
+
 class TransformersWhisperTranscriber(BaseTranscriber):
     """PyTorch ASR repos (openai/whisper-*) via the transformers pipeline."""
 
@@ -493,8 +752,7 @@ class TransformersWhisperTranscriber(BaseTranscriber):
 
         self.on_event({"status": "transcribing", "progress": 20})
         try:
-            kwargs: dict = {"cache_dir": self.cache_dir or None}
-            pipe = pipeline("automatic-speech-recognition", model=self.repo_id, **kwargs)
+            pipe = build_asr_pipeline(self.repo_id, self.cache_dir)
             self.on_event({"status": "transcribing", "progress": 50})
             if "whisper" in self.repo_id.lower():
                 result = pipe(file_path, chunk_length_s=30, batch_size=8)

@@ -2,10 +2,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import {
+  MAX_MODEL_SEARCH_RESULTS,
   buildModelSearchUrl,
   classifyRepo,
   formatDownloads,
+  inspectInstalledModels,
   isAllowedHfHost,
+  isCacheEntryComplete,
   listInstalledModels,
   parseModelList,
   searchHfModels,
@@ -154,6 +157,122 @@ describe('listInstalledModels', () => {
   });
 });
 
+describe('inspectInstalledModels', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nadabodha-hf-state-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function repoDir(repoId: string): string {
+    return path.join(dir, `models--${repoId.replace('/', '--')}`);
+  }
+
+  function snapshot(repoId: string, revision = 'abc'): { revisionDir: string } {
+    const revisionDir = path.join(repoDir(repoId), 'snapshots', revision);
+    fs.mkdirSync(revisionDir, { recursive: true });
+    fs.writeFileSync(path.join(revisionDir, 'config.json'), '{"model_type":"whisper"}');
+    fs.writeFileSync(path.join(revisionDir, 'model.bin'), 'weights');
+    return { revisionDir };
+  }
+
+  it('separates loadable snapshots from interrupted ones', () => {
+    snapshot('Systran/faster-whisper-base');
+
+    // Partial: weights landed but the config never did.
+    const partialRev = path.join(repoDir('org/partial-model'), 'snapshots', 'abc');
+    fs.mkdirSync(partialRev, { recursive: true });
+    fs.writeFileSync(path.join(partialRev, 'model.bin'), 'weights');
+
+    // Partial: folder exists, nothing was written yet.
+    fs.mkdirSync(repoDir('org/no-snapshots'), { recursive: true });
+
+    // Not a model at all.
+    fs.mkdirSync(path.join(dir, 'unrelated-dir'), { recursive: true });
+
+    expect(inspectInstalledModels(dir)).toEqual({
+      installed: ['Systran/faster-whisper-base'],
+      partial: ['org/no-snapshots', 'org/partial-model'],
+    });
+  });
+
+  it('rejects empty weights, dangling symlinks and unresolved refs', () => {
+    const { revisionDir } = snapshot('org/model');
+
+    fs.writeFileSync(path.join(revisionDir, 'model.bin'), '');
+    expect(isCacheEntryComplete(repoDir('org/model'))).toBe(false);
+
+    fs.writeFileSync(path.join(revisionDir, 'model.bin'), 'weights');
+    fs.unlinkSync(path.join(revisionDir, 'model.bin'));
+    fs.symlinkSync(path.join(repoDir('org/model'), 'blobs', 'missing'), path.join(revisionDir, 'model.bin'));
+    expect(isCacheEntryComplete(repoDir('org/model'))).toBe(false);
+
+    fs.unlinkSync(path.join(revisionDir, 'model.bin'));
+    fs.writeFileSync(path.join(revisionDir, 'model.bin'), 'weights');
+    expect(isCacheEntryComplete(repoDir('org/model'))).toBe(true);
+
+    fs.mkdirSync(path.join(repoDir('org/model'), 'refs'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir('org/model'), 'refs', 'main'), 'gone');
+    expect(isCacheEntryComplete(repoDir('org/model'))).toBe(false);
+
+    fs.writeFileSync(path.join(repoDir('org/model'), 'refs', 'main'), 'abc');
+    expect(isCacheEntryComplete(repoDir('org/model'))).toBe(true);
+  });
+
+  it('rejects a cache entry carrying an interrupted transfer marker', () => {
+    snapshot('org/model');
+    const blobs = path.join(repoDir('org/model'), 'blobs');
+    fs.mkdirSync(blobs, { recursive: true });
+    fs.writeFileSync(path.join(blobs, 'model.bin.incomplete'), 'half');
+
+    expect(inspectInstalledModels(dir)).toEqual({ installed: [], partial: ['org/model'] });
+  });
+
+  it('requires every shard named by a weight index', () => {
+    const { revisionDir } = snapshot('org/sharded');
+    fs.unlinkSync(path.join(revisionDir, 'model.bin'));
+    fs.writeFileSync(path.join(revisionDir, 'model-00001-of-00002.safetensors'), 'a');
+    fs.writeFileSync(
+      path.join(revisionDir, 'model.safetensors.index.json'),
+      JSON.stringify({
+        weight_map: {
+          'layer.0': 'model-00001-of-00002.safetensors',
+          'layer.1': 'model-00002-of-00002.safetensors',
+        },
+      })
+    );
+    expect(isCacheEntryComplete(repoDir('org/sharded'))).toBe(false);
+
+    fs.writeFileSync(path.join(revisionDir, 'model-00002-of-00002.safetensors'), 'b');
+    expect(isCacheEntryComplete(repoDir('org/sharded'))).toBe(true);
+  });
+
+  it('returns nothing for a blank or missing cache directory', () => {
+    expect(inspectInstalledModels('')).toEqual({ installed: [], partial: [] });
+    expect(inspectInstalledModels('   ')).toEqual({ installed: [], partial: [] });
+    expect(inspectInstalledModels(path.join(dir, 'missing'))).toEqual({ installed: [], partial: [] });
+  });
+});
+
+describe('search limits', () => {
+  it('caps the number of rows requested from the API', () => {
+    const url = buildModelSearchUrl('whisper');
+    expect(url).toContain(`limit=${MAX_MODEL_SEARCH_RESULTS}`);
+  });
+
+  it('caps the parsed result even if the server ignores the limit', () => {
+    const rows = Array.from({ length: MAX_MODEL_SEARCH_RESULTS + 25 }, (_, index) => ({
+      id: `org/model-${index}`,
+      pipeline_tag: 'automatic-speech-recognition',
+    }));
+    expect(parseModelList(rows)).toHaveLength(MAX_MODEL_SEARCH_RESULTS);
+  });
+});
+
 describe('searchHfModels', () => {
   const cacheDir = '';
   const activeModel = '';
@@ -202,5 +321,25 @@ describe('searchHfModels', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     expect(result.error).toContain('ECONNREFUSED');
+  });
+
+  it('reports partial snapshots even when the search fails', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nadabodha-hf-partial-'));
+    try {
+      const partialRev = path.join(dir, 'models--org--interrupted', 'snapshots', 'abc');
+      fs.mkdirSync(partialRev, { recursive: true });
+      fs.writeFileSync(path.join(partialRev, 'model.bin'), 'weights');
+
+      const result = await searchHfModels('', dir, activeModel, {
+        fetchImpl: (async () => {
+          throw new Error('ECONNREFUSED');
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result.installed).toEqual([]);
+      expect(result.partial).toEqual(['org/interrupted']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

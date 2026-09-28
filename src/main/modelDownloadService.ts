@@ -6,6 +6,10 @@ import { TranscriptionEvent } from '../shared/ipc';
  * download with progress events forwarded on the existing event stream
  * (origin 'download'). Cancellable (a safety kill guarantees the child
  * process never outlives a cancel by more than a few seconds).
+ *
+ * Exactly one terminal event (completed / error / cancelled) is forwarded for
+ * every download: the adapter normally reports it, and the safety kill reports
+ * it when the adapter cannot (a wedged process, a swallowed cancellation).
  */
 
 export interface ModelDownloadOptions {
@@ -19,12 +23,18 @@ export type DownloadStartResult = { started: boolean; error?: string };
 
 const TERMINAL_STATUSES = new Set(['completed', 'error', 'cancelled']);
 
+/** Safety net: a cancel must never leave the UI "Downloading" for longer. */
+export const CANCEL_KILL_TIMEOUT_MS = 15000;
+
 export class ModelDownloadService {
   private adapter: TranscriptionAdapter | null = null;
   private repoId: string | null = null;
   private sawTerminal = false;
   private cancelling = false;
   private killTimer: NodeJS.Timeout | null = null;
+  /** Identifies the current download; stale callbacks are dropped. */
+  private runId = 0;
+  private runSeq = 0;
 
   constructor(private readonly options: ModelDownloadOptions) {}
 
@@ -53,40 +63,60 @@ export class ModelDownloadService {
     this.repoId = target;
     this.sawTerminal = false;
     this.cancelling = false;
+    const runId = ++this.runSeq;
+    this.runId = runId;
+    const isCurrent = (): boolean => this.runId === runId;
 
     const adapter = new TranscriptionAdapter({
       pythonExecutable,
       pythonScriptPath: this.options.pythonScriptPath,
       onEvent: (event) => {
+        if (!isCurrent()) return;
         const enriched: TranscriptionEvent = {
           ...event,
           origin: 'download',
           repoId: event.repoId || target,
         };
-        this.options.onEvent(enriched);
         if (TERMINAL_STATUSES.has(enriched.status)) {
-          this.sawTerminal = true;
+          this.emitTerminal(enriched);
           this.finish();
+          return;
         }
+        this.options.onEvent(enriched);
       },
       onError: (err) => {
-        if (!this.sawTerminal) {
-          this.options.onEvent({
-            status: 'error',
-            origin: 'download',
-            repoId: target,
-            error: `Model download failed: ${err.message}`,
-          });
-        }
+        if (!isCurrent()) return;
+        this.emitTerminal({
+          status: 'error',
+          origin: 'download',
+          repoId: target,
+          error: `Model download failed: ${err.message}`,
+        });
         this.finish();
       },
       onExit: (code) => {
-        if (!this.sawTerminal && !this.cancelling && code !== 0 && code !== null) {
-          this.options.onEvent({
+        if (!isCurrent()) return;
+        // The adapter died without a terminal event (killed, crashed, or a
+        // cancellation it could not report): surface one so the UI recovers.
+        if (this.cancelling) {
+          this.emitTerminal({
+            status: 'cancelled',
+            origin: 'download',
+            repoId: target,
+          });
+        } else if (code !== 0) {
+          this.emitTerminal({
             status: 'error',
             origin: 'download',
             repoId: target,
             error: `Model download process exited with code ${code}`,
+          });
+        } else {
+          this.emitTerminal({
+            status: 'error',
+            origin: 'download',
+            repoId: target,
+            error: 'Model download process ended before reporting a result',
           });
         }
         this.finish();
@@ -114,14 +144,46 @@ export class ModelDownloadService {
     } catch {
       // Process already gone; finish below.
     }
-    // Safety net: if the adapter never reports a terminal event, kill it.
-    this.scheduleKill(15000);
+    // Safety net: if the adapter never reports a terminal event, emit one
+    // here and kill the process.
+    this.scheduleKill(CANCEL_KILL_TIMEOUT_MS);
     return { cancelled: true };
+  }
+
+  /** Forwards a terminal event exactly once per download. */
+  private emitTerminal(event: TranscriptionEvent): void {
+    if (this.sawTerminal) {
+      return;
+    }
+    this.sawTerminal = true;
+    this.options.onEvent(event);
   }
 
   private scheduleKill(ms: number): void {
     this.clearKillTimer();
+    const repoId = this.repoId;
+    const runId = this.runId;
     this.killTimer = setTimeout(() => {
+      this.killTimer = null;
+      if (this.runId !== runId) {
+        return;
+      }
+      // The safety kill is itself a terminal transition: without this the
+      // failure was silent and the UI stayed on "Downloading" forever.
+      if (this.cancelling) {
+        this.emitTerminal({
+          status: 'cancelled',
+          origin: 'download',
+          repoId: repoId || undefined,
+        });
+      } else {
+        this.emitTerminal({
+          status: 'error',
+          origin: 'download',
+          repoId: repoId || undefined,
+          error: 'Model download did not finish in time and was stopped',
+        });
+      }
       this.finish();
     }, ms);
   }
