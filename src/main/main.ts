@@ -3,6 +3,7 @@ import path from 'path';
 import { setupIpcHandlers } from './ipcHandlers';
 import { AudioRecorder } from './audioRecorder';
 import { TranscriptionService } from './transcriptionService';
+import { SettingsStore, resolvePythonExecutable, settingsFilePath } from './settingsStore';
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -33,7 +34,14 @@ app.whenReady().then(() => {
   createWindow();
 
   const recorder = new AudioRecorder();
-  const transcriptionService = new TranscriptionService();
+  const settingsStore = new SettingsStore(settingsFilePath(app.getPath('userData')));
+  const transcriptionService = new TranscriptionService({
+    pythonExecutable: () => resolvePythonExecutable(settingsStore.get()),
+    getSttConfig: () => {
+      const settings = settingsStore.get();
+      return { modelRepo: settings.activeModel, cacheDir: settings.sttCacheDir };
+    },
+  });
 
   if (!mainWindow) {
     throw new Error('Main window not created');
@@ -43,6 +51,7 @@ app.whenReady().then(() => {
     mainWindow,
     transcriptionService,
     recorder,
+    settingsStore,
   });
 
   app.on('activate', () => {
