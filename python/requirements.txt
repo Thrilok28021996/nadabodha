@@ -1,0 +1,11 @@
+# Local transcription dependencies (optional)
+# Install only the adapter(s) you plan to use.
+
+# Best-quality local transcription (downloads models automatically)
+# openai-whisper
+
+# Lightweight alternative; requires a model directory set via VOSK_MODEL
+# vosk
+
+# Development/testing
+pytest>=7.0.0
