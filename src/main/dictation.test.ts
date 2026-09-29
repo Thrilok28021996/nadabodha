@@ -6,7 +6,6 @@ import {
   DictationHook,
   DictationKeyEvent,
   DictationTakeReason,
-  HOOK_SILENCE_TIMEOUT_MS,
   KEY_PRESSED,
   KEY_RELEASED,
   MIN_HOLD_MS,
@@ -53,21 +52,11 @@ interface RecordedCall {
   heldMs?: number;
 }
 
-/** A watchdog tick the controller scheduled (injected instead of a real timer). */
-interface PendingWatchdog {
-  callback: () => void;
-  ms: number;
-}
-
 interface Harness {
   hook: FakeHook;
   controller: DictationController;
   calls: RecordedCall[];
   clock: { value: number };
-  /** Watchdogs still pending (cancelled ones are removed). */
-  watchdogs: PendingWatchdog[];
-  /** Fire every pending watchdog tick; true when at least one fired. */
-  fireWatchdog(): boolean;
   options: {
     enabled: boolean;
     trusted: boolean;
@@ -81,7 +70,6 @@ function harness(overrides: Partial<{ enabled: boolean; trusted: boolean; canSta
   const hook = new FakeHook();
   const calls: RecordedCall[] = [];
   const clock = { value: 1_000 };
-  const watchdogs: PendingWatchdog[] = [];
   const options = {
     enabled: overrides.enabled ?? true,
     trusted: overrides.trusted ?? true,
@@ -119,26 +107,11 @@ function harness(overrides: Partial<{ enabled: boolean; trusted: boolean; canSta
     canStartTake: () => options.canStart,
     now: () => clock.value,
     minHoldMs: MIN_HOLD_MS,
-    scheduleWatchdog: (callback, ms) => {
-      const entry: PendingWatchdog = { callback, ms };
-      watchdogs.push(entry);
-      return entry as unknown as NodeJS.Timeout;
-    },
-    cancelWatchdog: (handle) => {
-      const entry = handle as unknown as PendingWatchdog;
-      const index = watchdogs.indexOf(entry);
-      if (index >= 0) watchdogs.splice(index, 1);
-    },
   });
 
-  const fireWatchdog = (): boolean => {
-    const pending = watchdogs.splice(0, watchdogs.length);
-    pending.forEach((entry) => entry.callback());
-    return pending.length > 0;
-  };
-
-  return { hook, controller, calls, clock, watchdogs, fireWatchdog, options };
+  return { hook, controller, calls, clock, options };
 }
+
 
 const actionsOf = (calls: RecordedCall[]) => calls.map((c) => c.action);
 
@@ -396,7 +369,6 @@ describe('DictationController: stop with a take open (MEDIUM-1)', () => {
     expect(h.controller.getState()).toBe('idle');
     expect(h.controller.isRunning()).toBe(false);
     expect(h.hook.stopCalls).toBe(1);
-    expect(h.watchdogs).toEqual([]); // no timer outlives the stop either
 
     // A released Option must not resurrect the aborted take.
     h.hook.release(OPTION_KEYCODE);
@@ -422,7 +394,7 @@ describe('DictationController: stop with a take open (MEDIUM-1)', () => {
   });
 });
 
-describe('DictationController: lost native events (MEDIUM-2)', () => {
+describe('DictationController: hook failure detection (MEDIUM-2)', () => {
   it('cancels the take and returns to idle when the hook reports an error', () => {
     const h = harness();
     h.controller.start();
@@ -437,7 +409,6 @@ describe('DictationController: lost native events (MEDIUM-2)', () => {
     expect(h.hook.stopCalls).toBe(1);
     expect(h.hook.listenerCountFor('keydown')).toBe(0);
     expect(h.hook.listenerCountFor('error')).toBe(0);
-    expect(h.watchdogs).toEqual([]);
   });
 
   it('cancels the take when the hook reports that it stopped', () => {
@@ -464,70 +435,48 @@ describe('DictationController: lost native events (MEDIUM-2)', () => {
     expect(h.controller.getLastOutcome()).toBe('hook-error');
   });
 
-  it('aborts a take when the hook goes silent (lost Option keyup)', () => {
+  /**
+   * F3-1 regression guard: a hold longer than 10 seconds must complete
+   * successfully. macOS modifier keys do NOT auto-repeat, so a long hold
+   * produces exactly one keydown at t=0 and one keyup when the user releases.
+   * The old HOOK_SILENCE_TIMEOUT_MS watchdog would have incorrectly aborted
+   * this take at 10 s by mistaking healthy modifier-key silence for a dead hook.
+   */
+  it('F3-1: completes a long hold (>10 s) without aborting (modifier keys never auto-repeat)', () => {
     const h = harness();
     h.controller.start();
-    h.hook.press(OPTION_KEYCODE);
+    h.hook.press(OPTION_KEYCODE);           // keydown at t=1000
 
-    // The only timer in the controller, armed solely for the open take.
-    expect(h.watchdogs).toHaveLength(1);
-    expect(h.watchdogs[0].ms).toBe(HOOK_SILENCE_TIMEOUT_MS);
-
-    expect(h.fireWatchdog()).toBe(true);
-
-    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
-    expect(h.calls[1].reason).toBe('hook-stopped');
-    expect(h.controller.getState()).toBe('idle');
-    // Nothing is left that could fire a second abort later.
-    expect(h.fireWatchdog()).toBe(false);
-  });
-
-  it('postpones the watchdog on every hook event while the take is open', () => {
-    const h = harness();
-    h.controller.start();
-    h.hook.press(OPTION_KEYCODE);
-    expect(h.watchdogs).toHaveLength(1);
-    const first = h.watchdogs[0];
-
-    h.hook.emit('input', { type: KEY_PRESSED, keycode: OPTION_KEYCODE });
-    expect(h.watchdogs).toHaveLength(1);
-    expect(h.watchdogs[0]).not.toBe(first); // re-armed, not merely left alone
-
-    h.clock.value += 2_000;
-    h.hook.press(OPTION_KEYCODE); // auto-repeat of the held key: activity only
-    expect(h.watchdogs).toHaveLength(1);
+    expect(h.controller.getState()).toBe('recording');
     expect(actionsOf(h.calls)).toEqual(['startTake']);
-    expect(h.controller.getState()).toBe('recording'); // still counting from re-arm
-  });
 
-  it('disarms the watchdog the moment the take ends', () => {
-    const h = harness();
-    h.controller.start();
-    h.hook.press(OPTION_KEYCODE);
-    h.clock.value += 500;
+    // Simulate 15 seconds of silence (no events at all — correct macOS behaviour
+    // for a held modifier key).  The controller must NOT abort the take.
+    h.clock.value += 15_000;
+
+    expect(h.controller.getState()).toBe('recording'); // still alive
+    expect(actionsOf(h.calls)).toEqual(['startTake']);  // no spurious abort
+
+    // Release after 15 s: the take finishes normally.
     h.hook.release(OPTION_KEYCODE);
 
     expect(actionsOf(h.calls)).toEqual(['startTake', 'finishTake']);
-    expect(h.watchdogs).toEqual([]);
-    expect(h.fireWatchdog()).toBe(false); // no late abort can hit a finished take
+    expect(h.calls[1].heldMs).toBeGreaterThanOrEqual(15_000);
     expect(h.controller.getState()).toBe('idle');
   });
 
-  it('returns an already-aborted take to idle without a second abort', () => {
+  it('F3-1: completes a 290ms boundary hold after long silence during take', () => {
     const h = harness();
     h.controller.start();
-    h.hook.press(OPTION_KEYCODE);
-    h.hook.press(0xe04b); // ArrowLeft: chord abort, recorder already cancelled
-    expect(h.controller.getState()).toBe('aborted');
-    expect(h.watchdogs).toHaveLength(1); // still waiting for the Option keyup
+    h.hook.press(OPTION_KEYCODE); // t=1000
+    h.clock.value += MIN_HOLD_MS; // exactly at threshold
+    h.hook.release(OPTION_KEYCODE);
 
-    expect(h.fireWatchdog()).toBe(true);
-
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'finishTake']);
     expect(h.controller.getState()).toBe('idle');
-    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
-    expect(h.calls[1].reason).toBe('chord');
   });
 });
+
 
 describe('DictationController: Accessibility trust transition (BLOCKING-1)', () => {
   it('runs the guarded start when trust flips false->true', () => {

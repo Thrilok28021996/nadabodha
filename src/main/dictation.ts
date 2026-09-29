@@ -12,14 +12,26 @@
  *   (c) Option keyup after >=300ms -> actions.finishTake(heldMs) -> transcription (append)
  *   (d) Option keydown while a take is open, or while the app is already
  *       recording/transcribing (canStartTake() === false) -> ignored
- *   (e) Option auto-repeat keydown -> ignored (state stays 'recording')
+ *   (e) Option auto-repeat keydown -> ignored (state stays 'recording');
+ *       NOTE: macOS modifier keys (Option/Shift/Ctrl/Cmd) do NOT auto-repeat.
+ *       This means after a bare Option keydown there are no further keydown
+ *       events until the user releases the key. A hold of any length produces
+ *       exactly ONE keydown and ONE keyup. A silence-based watchdog cannot
+ *       distinguish a long healthy hold from a dead hook, so it is not used
+ *       here (F3-1 fix: see Stage 0 of the v3 plan).
  *   (f) Option keyup before 300ms  -> actions.abortTake('too-short'), never transcribed
- *   (g) the hook stopping with a take open (app quit, dictationEnabled off,
- *       hook error/stop, or native silence beyond HOOK_SILENCE_TIMEOUT_MS)
+ *   (g) the hook reporting an error or stop event with a take open
  *       -> actions.abortTake('hook-stopped') so the recorder is cancelled
  *       and the state machine returns to 'idle' (MEDIUM-1 / MEDIUM-2)
  *   (h) Accessibility trust flipping false->true -> reconcileAccessibility()
  *       runs the guarded start (BLOCKING-1)
+ *
+ * Stage 0 / F3-1 change: the HOOK_SILENCE_TIMEOUT_MS silence watchdog was
+ * removed. macOS modifier keys never auto-repeat, so a healthy long hold
+ * produces no events between keydown and keyup — exactly the same pattern as
+ * a dead hook. The heuristic was therefore always wrong for holds > 10 s and
+ * would abort a legitimate dictation take. Hook failure detection relies
+ * exclusively on the 'error' and 'stop' events emitted by uiohook-napi.
  */
 
 /** uiohook-napi key event subset this state machine relies on. */
@@ -54,39 +66,20 @@ export const TOO_SHORT_NOTICE = 'Too short - hold the Option key to dictate';
 /** Inline hint shown when another key interrupts a take. */
 export const CHORD_NOTICE = 'Dictation cancelled - another key was pressed';
 
-/**
- * Lost-event watchdog for an open take (review finding MEDIUM-2).
- *
- * uiohook-napi 1.5.5 never surfaces the native hook's own disable event to
- * JavaScript (EVENT_HOOK_DISABLED is consumed inside
- * node_modules/uiohook-napi/src/lib/uiohook_worker.c), so a hook that dies
- * silently — or an Option keyup that never arrives — leaves the state machine
- * in 'recording' with a live recorder and no event that will ever call it
- * back. While a take is open, a healthy hook keeps delivering the auto-repeat
- * keydown of the held Option key (and an 'input' event for any other native
- * event), so native silence for this long means the event stream is gone.
- *
- * The threshold sits well above the slowest configurable macOS key-repeat
- * delay (sub-second in System Settings, a few seconds even at the extreme
- * `InitialKeyRepeat` value), so a healthy hold never trips it, while an
- * orphaned capture is bounded to this many milliseconds. It is the only
- * timer in this file, and it is armed only while a take is open.
- */
-export const HOOK_SILENCE_TIMEOUT_MS = 10_000;
-
 /** Minimal surface of the uiohook-napi singleton (`uIOhook`). */
 export interface DictationHook {
   start(): void;
   stop(): void;
   on(event: 'keydown', listener: (e: DictationKeyEvent) => void): unknown;
   on(event: 'keyup', listener: (e: DictationKeyEvent) => void): unknown;
-  /** Every native event the hook sees: used as a liveness signal only. */
+  /** Every native event the hook sees: kept for API surface compatibility. */
   on(event: 'input', listener: () => void): unknown;
   /**
    * Hook-level failure signals. uiohook-napi 1.5.5 never emits them today,
    * but subscribing is what keeps a future 'error' emit from crashing the
    * main process (EventEmitter rethrows an unhandled 'error') and it is the
    * hook's own way of saying "events are being lost" (MEDIUM-2).
+   * These are the ONLY hook-death signals the controller relies on (F3-1).
    */
   on(event: 'error', listener: () => void): unknown;
   on(event: 'stop', listener: () => void): unknown;
@@ -97,10 +90,9 @@ export interface DictationHook {
 /**
  * Why a take was dropped without transcribing. 'hook-stopped' is the take the
  * controller itself discards when the input hook goes away with a take open
- * (app quit, dictationEnabled switched off, a hook error/stop event, or a
- * native event stream that went silent): the recorder must be cancelled, but
- * neither approved inline hint ('another key was pressed' / 'too short')
- * applies, so it carries no notice.
+ * (app quit, dictationEnabled switched off, a hook error/stop event): the
+ * recorder must be cancelled, but neither approved inline hint ('another key
+ * was pressed' / 'too short') applies, so it carries no notice.
  */
 export type DictationTakeReason = 'chord' | 'too-short' | 'hook-stopped';
 
@@ -144,12 +136,6 @@ export interface DictationControllerOptions {
   canStartTake(): boolean;
   now?(): number;
   minHoldMs?: number;
-  /**
-   * Timer scheduling for the lost-event watchdog, injected so tests can drive
-   * it deterministically. Defaults to setTimeout (unref'd) / clearTimeout.
-   */
-  scheduleWatchdog?: (callback: () => void, ms: number) => NodeJS.Timeout;
-  cancelWatchdog?: (handle: NodeJS.Timeout) => void;
 }
 
 export function describeDictationFailure(err: unknown): string {
@@ -164,8 +150,6 @@ export class DictationController {
   private readonly canStartTakeFn: () => boolean;
   private readonly now: () => number;
   private readonly minHoldMs: number;
-  private readonly scheduleWatchdog: (callback: () => void, ms: number) => NodeJS.Timeout;
-  private readonly cancelWatchdog: (handle: NodeJS.Timeout) => void;
 
   private state: DictationState = 'idle';
   private holdStartedAt = 0;
@@ -177,7 +161,6 @@ export class DictationController {
   private keyUpListener: ((e: DictationKeyEvent) => void) | null = null;
   private hookInputListener: (() => void) | null = null;
   private hookFailureListener: (() => void) | null = null;
-  private watchdogHandle: NodeJS.Timeout | null = null;
 
   constructor(options: DictationControllerOptions) {
     this.hook = options.hook;
@@ -187,15 +170,6 @@ export class DictationController {
     this.canStartTakeFn = options.canStartTake;
     this.now = options.now ?? Date.now;
     this.minHoldMs = options.minHoldMs ?? MIN_HOLD_MS;
-    this.scheduleWatchdog =
-      options.scheduleWatchdog ??
-      ((callback: () => void, ms: number): NodeJS.Timeout => {
-        const handle = setTimeout(callback, ms);
-        // A pending watchdog must never be what keeps the process alive.
-        handle.unref();
-        return handle;
-      });
-    this.cancelWatchdog = options.cancelWatchdog ?? ((handle: NodeJS.Timeout) => clearTimeout(handle));
   }
 
   /**
@@ -218,7 +192,10 @@ export class DictationController {
 
     this.keyDownListener = (e) => this.handleKeyDown(e);
     this.keyUpListener = (e) => this.handleKeyUp(e);
-    this.hookInputListener = () => this.syncWatchdog();
+    // The 'input' listener is kept for API surface (uiohook-napi emits it for
+    // every native event). We no longer use it as a watchdog liveness signal
+    // (F3-1 fix), but subscribing keeps symmetry with detachListeners().
+    this.hookInputListener = () => { /* liveness signal: no action needed (F3-1) */ };
     this.hookFailureListener = () => this.handleHookFailure();
     this.hook.on('keydown', this.keyDownListener);
     this.hook.on('keyup', this.keyUpListener);
@@ -254,7 +231,6 @@ export class DictationController {
     this.running = true;
     this.state = 'idle';
     this.holdStartedAt = 0;
-    this.clearWatchdog();
     this.lastOutcome = 'started';
     return { started: true, outcome: 'started' };
   }
@@ -296,7 +272,6 @@ export class DictationController {
     this.running = false;
     this.state = 'idle';
     this.holdStartedAt = 0;
-    this.clearWatchdog();
     this.detachListeners();
     if (wasRunning) {
       try {
@@ -324,12 +299,10 @@ export class DictationController {
 
   handleKeyDown(event: DictationKeyEvent): void {
     this.processKeyDown(event);
-    this.syncWatchdog();
   }
 
   handleKeyUp(event: DictationKeyEvent): void {
     this.processKeyUp(event);
-    this.syncWatchdog();
   }
 
   private processKeyDown(event: DictationKeyEvent): void {
@@ -339,6 +312,8 @@ export class DictationController {
       // (d) + (e): an Option press is only meaningful from a clean idle state.
       // Any repeat while the take is open, and any press while the app is
       // already busy, is dropped.
+      // NOTE: macOS modifier keys never auto-repeat, so in practice this branch
+      // only fires once (on the initial keydown).
       if (this.state !== 'idle') return;
       if (!this.canStartTakeFn()) return;
       this.state = 'recording';
@@ -386,50 +361,15 @@ export class DictationController {
   }
 
   /**
-   * Re-arm the lost-event watchdog after every native event (MEDIUM-2).
-   *
-   * Armed only while a take is open; any hook activity postpones it, so it
-   * fires exclusively on native silence — the signature of a hook that died
-   * (or an Option keyup that was lost) without telling anyone.
-   */
-  private syncWatchdog(): void {
-    this.clearWatchdog();
-    if (!this.running || this.state === 'idle') {
-      return;
-    }
-    this.watchdogHandle = this.scheduleWatchdog(() => {
-      this.watchdogHandle = null;
-      this.handleHookSilence();
-    }, HOOK_SILENCE_TIMEOUT_MS);
-  }
-
-  private clearWatchdog(): void {
-    if (this.watchdogHandle !== null) {
-      this.cancelWatchdog(this.watchdogHandle);
-      this.watchdogHandle = null;
-    }
-  }
-
-  /** Native silence with a take open: cancel the take, back to idle. */
-  private handleHookSilence(): void {
-    if (this.state === 'idle') {
-      return;
-    }
-    const wasRecording = this.state === 'recording';
-    this.state = 'idle';
-    this.holdStartedAt = 0;
-    if (wasRecording) {
-      this.actions.abortTake('hook-stopped');
-    }
-  }
-
-  /**
    * The hook itself reported an error/stopped emitting (MEDIUM-2).
    *
    * Fail closed: whatever it was reporting, events are no longer trustworthy,
    * so the open take is cancelled, the state machine returns to idle and the
    * controller stops tracking a hook it can no longer hear. The next guarded
    * start (settings re-enable, app restart) brings it back.
+   *
+   * This is now the ONLY hook-death detection path (F3-1 fix: silence watchdog
+   * removed because macOS modifier keys do not auto-repeat).
    */
   private handleHookFailure(): void {
     const wasRunning = this.running;
@@ -437,7 +377,6 @@ export class DictationController {
     this.running = false;
     this.state = 'idle';
     this.holdStartedAt = 0;
-    this.clearWatchdog();
     this.detachListeners();
     if (wasRunning) {
       try {
