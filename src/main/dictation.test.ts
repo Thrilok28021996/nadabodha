@@ -6,6 +6,7 @@ import {
   DictationHook,
   DictationKeyEvent,
   DictationTakeReason,
+  HOOK_SILENCE_TIMEOUT_MS,
   KEY_PRESSED,
   KEY_RELEASED,
   MIN_HOLD_MS,
@@ -18,9 +19,12 @@ class FakeHook extends EventEmitter implements DictationHook {
   startCalls = 0;
   stopCalls = 0;
   failOnStart = false;
+  /** Shared with the harness so call order across objects can be asserted. */
+  order: string[] = [];
 
   start(): void {
     this.startCalls += 1;
+    this.order.push('hook.start');
     if (this.failOnStart) {
       throw new Error('hook refused to start');
     }
@@ -38,7 +42,7 @@ class FakeHook extends EventEmitter implements DictationHook {
     this.emit('keyup', { type: KEY_RELEASED, keycode, time: at } as DictationKeyEvent);
   }
 
-  listenerCountFor(event: 'keydown' | 'keyup'): number {
+  listenerCountFor(event: 'keydown' | 'keyup' | 'input' | 'error' | 'stop'): number {
     return this.listenerCount(event);
   }
 }
@@ -49,11 +53,21 @@ interface RecordedCall {
   heldMs?: number;
 }
 
+/** A watchdog tick the controller scheduled (injected instead of a real timer). */
+interface PendingWatchdog {
+  callback: () => void;
+  ms: number;
+}
+
 interface Harness {
   hook: FakeHook;
   controller: DictationController;
   calls: RecordedCall[];
   clock: { value: number };
+  /** Watchdogs still pending (cancelled ones are removed). */
+  watchdogs: PendingWatchdog[];
+  /** Fire every pending watchdog tick; true when at least one fired. */
+  fireWatchdog(): boolean;
   options: {
     enabled: boolean;
     trusted: boolean;
@@ -67,6 +81,7 @@ function harness(overrides: Partial<{ enabled: boolean; trusted: boolean; canSta
   const hook = new FakeHook();
   const calls: RecordedCall[] = [];
   const clock = { value: 1_000 };
+  const watchdogs: PendingWatchdog[] = [];
   const options = {
     enabled: overrides.enabled ?? true,
     trusted: overrides.trusted ?? true,
@@ -74,6 +89,7 @@ function harness(overrides: Partial<{ enabled: boolean; trusted: boolean; canSta
     trustChecks: [] as boolean[],
     hookStartOrder: [] as string[],
   };
+  hook.order = options.hookStartOrder;
 
   const actions: DictationActions = {
     startTake: () => {
@@ -103,9 +119,25 @@ function harness(overrides: Partial<{ enabled: boolean; trusted: boolean; canSta
     canStartTake: () => options.canStart,
     now: () => clock.value,
     minHoldMs: MIN_HOLD_MS,
+    scheduleWatchdog: (callback, ms) => {
+      const entry: PendingWatchdog = { callback, ms };
+      watchdogs.push(entry);
+      return entry as unknown as NodeJS.Timeout;
+    },
+    cancelWatchdog: (handle) => {
+      const entry = handle as unknown as PendingWatchdog;
+      const index = watchdogs.indexOf(entry);
+      if (index >= 0) watchdogs.splice(index, 1);
+    },
   });
 
-  return { hook, controller, calls, clock, options };
+  const fireWatchdog = (): boolean => {
+    const pending = watchdogs.splice(0, watchdogs.length);
+    pending.forEach((entry) => entry.callback());
+    return pending.length > 0;
+  };
+
+  return { hook, controller, calls, clock, watchdogs, fireWatchdog, options };
 }
 
 const actionsOf = (calls: RecordedCall[]) => calls.map((c) => c.action);
@@ -344,6 +376,229 @@ describe('DictationController: start guards', () => {
     expect(h.hook.startCalls).toBe(1);
     // A duplicated listener would double every take: guard against it.
     expect(h.hook.listenerCountFor('keydown')).toBe(1);
+  });
+});
+
+describe('DictationController: stop with a take open (MEDIUM-1)', () => {
+  it('aborts the open take when the hook stops, so no recorder outlives it', () => {
+    const h = harness();
+    h.controller.start();
+
+    h.hook.press(OPTION_KEYCODE);
+    expect(h.controller.getState()).toBe('recording');
+
+    h.controller.stop();
+
+    // abortTake is what makes the app cancel the AudioRecorder; without it
+    // ffmpeg kept capturing after the hook was gone.
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+    expect(h.calls[1].reason).toBe('hook-stopped');
+    expect(h.controller.getState()).toBe('idle');
+    expect(h.controller.isRunning()).toBe(false);
+    expect(h.hook.stopCalls).toBe(1);
+    expect(h.watchdogs).toEqual([]); // no timer outlives the stop either
+
+    // A released Option must not resurrect the aborted take.
+    h.hook.release(OPTION_KEYCODE);
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+  });
+
+  it('does not abort anything when the hook stops without an open take', () => {
+    const h = harness();
+    h.controller.start();
+    h.controller.stop();
+    expect(h.calls).toEqual([]);
+    expect(h.hook.stopCalls).toBe(1);
+  });
+
+  it('aborts once when stop() is called twice (will-quit + settings off)', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+    h.controller.stop();
+    h.controller.stop();
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+    expect(h.hook.stopCalls).toBe(1);
+  });
+});
+
+describe('DictationController: lost native events (MEDIUM-2)', () => {
+  it('cancels the take and returns to idle when the hook reports an error', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+
+    h.hook.emit('error', new Error('event tap died'));
+
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+    expect(h.calls[1].reason).toBe('hook-stopped');
+    expect(h.controller.getState()).toBe('idle');
+    expect(h.controller.isRunning()).toBe(false);
+    expect(h.hook.stopCalls).toBe(1);
+    expect(h.hook.listenerCountFor('keydown')).toBe(0);
+    expect(h.hook.listenerCountFor('error')).toBe(0);
+    expect(h.watchdogs).toEqual([]);
+  });
+
+  it('cancels the take when the hook reports that it stopped', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+
+    h.hook.emit('stop');
+
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+    expect(h.calls[1].reason).toBe('hook-stopped');
+    expect(h.controller.getState()).toBe('idle');
+    expect(h.controller.isRunning()).toBe(false);
+  });
+
+  it('stops tracking a hook that fails with no take open', () => {
+    const h = harness();
+    h.controller.start();
+
+    h.hook.emit('error', new Error('boom'));
+
+    expect(h.calls).toEqual([]);
+    expect(h.controller.isRunning()).toBe(false);
+    expect(h.controller.getLastOutcome()).toBe('hook-error');
+  });
+
+  it('aborts a take when the hook goes silent (lost Option keyup)', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+
+    // The only timer in the controller, armed solely for the open take.
+    expect(h.watchdogs).toHaveLength(1);
+    expect(h.watchdogs[0].ms).toBe(HOOK_SILENCE_TIMEOUT_MS);
+
+    expect(h.fireWatchdog()).toBe(true);
+
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+    expect(h.calls[1].reason).toBe('hook-stopped');
+    expect(h.controller.getState()).toBe('idle');
+    // Nothing is left that could fire a second abort later.
+    expect(h.fireWatchdog()).toBe(false);
+  });
+
+  it('postpones the watchdog on every hook event while the take is open', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+    expect(h.watchdogs).toHaveLength(1);
+    const first = h.watchdogs[0];
+
+    h.hook.emit('input', { type: KEY_PRESSED, keycode: OPTION_KEYCODE });
+    expect(h.watchdogs).toHaveLength(1);
+    expect(h.watchdogs[0]).not.toBe(first); // re-armed, not merely left alone
+
+    h.clock.value += 2_000;
+    h.hook.press(OPTION_KEYCODE); // auto-repeat of the held key: activity only
+    expect(h.watchdogs).toHaveLength(1);
+    expect(actionsOf(h.calls)).toEqual(['startTake']);
+    expect(h.controller.getState()).toBe('recording'); // still counting from re-arm
+  });
+
+  it('disarms the watchdog the moment the take ends', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+    h.clock.value += 500;
+    h.hook.release(OPTION_KEYCODE);
+
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'finishTake']);
+    expect(h.watchdogs).toEqual([]);
+    expect(h.fireWatchdog()).toBe(false); // no late abort can hit a finished take
+    expect(h.controller.getState()).toBe('idle');
+  });
+
+  it('returns an already-aborted take to idle without a second abort', () => {
+    const h = harness();
+    h.controller.start();
+    h.hook.press(OPTION_KEYCODE);
+    h.hook.press(0xe04b); // ArrowLeft: chord abort, recorder already cancelled
+    expect(h.controller.getState()).toBe('aborted');
+    expect(h.watchdogs).toHaveLength(1); // still waiting for the Option keyup
+
+    expect(h.fireWatchdog()).toBe(true);
+
+    expect(h.controller.getState()).toBe('idle');
+    expect(actionsOf(h.calls)).toEqual(['startTake', 'abortTake']);
+    expect(h.calls[1].reason).toBe('chord');
+  });
+});
+
+describe('DictationController: Accessibility trust transition (BLOCKING-1)', () => {
+  it('runs the guarded start when trust flips false->true', () => {
+    const h = harness({ trusted: false });
+    expect(h.controller.start().outcome).toBe('no-accessibility');
+    expect(h.hook.startCalls).toBe(0);
+
+    h.options.trusted = true; // the user clicked Allow on the system prompt
+    h.controller.reconcileAccessibility(); // the next status read
+
+    expect(h.hook.startCalls).toBe(1);
+    expect(h.controller.isRunning()).toBe(true);
+    // The guard is the last thing evaluated before hook.start().
+    expect(h.options.hookStartOrder[0]).toBe('trust-check');
+    expect(h.options.hookStartOrder.slice(-2)).toEqual(['trust-check', 'hook.start']);
+    // Every trust check asked without prompting (ask === false).
+    expect(h.options.trustChecks.length).toBeGreaterThan(1);
+    expect(h.options.trustChecks.every((ask) => ask === false)).toBe(true);
+  });
+
+  it('starts on a later poll of an async grant, exactly once', () => {
+    const h = harness({ trusted: false });
+    h.controller.start();
+
+    // The renderer polls the status every 1.5s while the grant is pending.
+    const running: boolean[] = [];
+    for (let poll = 0; poll < 4; poll += 1) {
+      if (poll === 2) h.options.trusted = true; // grant lands on the 3rd poll
+      h.controller.reconcileAccessibility();
+      running.push(h.controller.isRunning());
+    }
+
+    expect(running).toEqual([false, false, true, true]);
+    expect(h.hook.startCalls).toBe(1);
+    // Exactly one hook.start(), with the guard immediately before it (a later
+    // status read appends its own trust check afterwards).
+    const order = h.options.hookStartOrder;
+    const startAt = order.lastIndexOf('hook.start');
+    expect(order.filter((entry) => entry === 'hook.start')).toHaveLength(1);
+    expect(order[startAt - 1]).toBe('trust-check');
+  });
+
+  it('keeps the hook stopped while trust never becomes true', () => {
+    const h = harness({ trusted: false });
+    h.controller.reconcileAccessibility();
+    h.controller.reconcileAccessibility();
+    expect(h.hook.startCalls).toBe(0);
+    expect(h.controller.isRunning()).toBe(false);
+  });
+
+  it('does not restart an already-running hook when trust is re-confirmed', () => {
+    const h = harness();
+    expect(h.controller.start().started).toBe(true);
+    h.controller.reconcileAccessibility();
+    h.controller.reconcileAccessibility();
+    expect(h.hook.startCalls).toBe(1);
+    expect(h.hook.listenerCountFor('keydown')).toBe(1);
+  });
+
+  it('guards again on every later start path (settings re-enable)', () => {
+    const h = harness();
+    h.controller.start();
+    h.controller.stop();
+    expect(h.controller.start().started).toBe(true);
+    // One guard immediately before each of the two hook.start() calls.
+    expect(h.options.hookStartOrder).toEqual([
+      'trust-check',
+      'hook.start',
+      'trust-check',
+      'hook.start',
+    ]);
   });
 });
 

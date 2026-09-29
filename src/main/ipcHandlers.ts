@@ -212,7 +212,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     emit({
       status: 'idle',
       origin: 'dictation',
-      dictationNotice: reason === 'too-short' ? TOO_SHORT_NOTICE : CHORD_NOTICE,
+      // 'hook-stopped' (hook went away with the take open) carries no inline
+      // notice: neither approved hint string applies to it.
+      dictationNotice:
+        reason === 'too-short' ? TOO_SHORT_NOTICE : reason === 'chord' ? CHORD_NOTICE : undefined,
     });
   };
 
@@ -276,6 +279,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   };
 
   const dictationStatus = (): DictationStatusInfo => {
+    // BLOCKING-1: every status read (the renderer's post-grant polling loop
+    // included) re-confirms Accessibility trust, and the first read that sees
+    // it flip false->true runs the guarded start before the status is built.
+    dictation?.reconcileAccessibility();
     const enabled = settingsStore.get().dictationEnabled !== false;
     const accessibilityTrusted = isAccessibilityTrusted(false);
     let reason: string | undefined;
