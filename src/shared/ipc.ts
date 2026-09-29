@@ -24,7 +24,18 @@ export enum IpcChannel {
   CancelSummary = 'cancel-summary',
   DictationStatus = 'dictation-status',
   DictationRequestAccess = 'dictation-request-access',
+  // Stage 1: Note store
+  ListNotes = 'list-notes',
+  GetNote = 'get-note',
+  CreateNote = 'create-note',
+  UpdateNote = 'update-note',
+  DeleteNote = 'delete-note',
+  ReadNoteContent = 'read-note-content',
+  ListFolders = 'list-folders',
+  SearchNotes = 'search-notes',
+  ReTranscribe = 're-transcribe',
 }
+
 
 export type TranscriptionStatus =
   | 'idle'
@@ -158,4 +169,75 @@ export interface SettingsUpdateResult {
   errors: Partial<Record<SettingsFieldError, string>>;
   /** Inline, non-blocking messages (e.g. Python probe result). */
   messages?: Partial<Record<SettingsFieldError, string>>;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: Note store IPC types
+// ---------------------------------------------------------------------------
+
+export type NoteSource = 'recording' | 'import' | 'dictation-log' | 'unknown';
+
+/** Serializable snapshot of a NoteRecord (dates as ISO strings). */
+export interface NoteInfo {
+  id: string;
+  title: string;
+  created: string; // ISO 8601
+  source: NoteSource;
+  folder: string;
+  duration: number;
+  model: string;
+  transcribed_at?: string;
+  hasAudio: boolean;
+  summaryStale?: boolean;
+}
+
+export interface NoteContent {
+  transcript: string;
+  summary: string;
+}
+
+export interface NoteListResult {
+  notes: NoteInfo[];
+  folders: string[];
+  folderCounts: Record<string, number>;
+  error?: string;
+}
+
+export interface NoteGetResult {
+  note?: NoteInfo;
+  content?: NoteContent;
+  error?: string;
+}
+
+export interface NoteCreateRequest {
+  title?: string;
+  source: NoteSource;
+  folder?: string;
+  transcript?: string;
+}
+
+export interface NoteUpdateRequest {
+  id: string;
+  title?: string;
+  folder?: string;
+  transcript?: string;
+  summary?: string;
+  model?: string;
+  markSummaryStale?: boolean;
+  clearSummaryStale?: boolean;
+}
+
+export interface NoteActionResult {
+  success: boolean;
+  note?: NoteInfo;
+  error?: string;
+}
+
+export interface ReTranscribeRequest {
+  noteId: string;
+}
+
+export interface ReTranscribeResult {
+  started: boolean;
+  error?: string;
 }

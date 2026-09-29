@@ -27,7 +27,18 @@ enum IpcChannel {
   CancelSummary = 'cancel-summary',
   DictationStatus = 'dictation-status',
   DictationRequestAccess = 'dictation-request-access',
+  // Stage 1: Note store
+  ListNotes = 'list-notes',
+  GetNote = 'get-note',
+  CreateNote = 'create-note',
+  UpdateNote = 'update-note',
+  DeleteNote = 'delete-note',
+  ReadNoteContent = 'read-note-content',
+  ListFolders = 'list-folders',
+  SearchNotes = 'search-notes',
+  ReTranscribe = 're-transcribe',
 }
+
 
 type TranscriptionStatus =
   | 'idle'
@@ -125,6 +136,64 @@ interface HfModelListResult {
   error?: string;
 }
 
+// Stage 1: Note store types (mirrored from shared/ipc.ts)
+type NoteSource = 'recording' | 'import' | 'dictation-log' | 'unknown';
+
+interface NoteInfo {
+  id: string;
+  title: string;
+  created: string;
+  source: NoteSource;
+  folder: string;
+  duration: number;
+  model: string;
+  transcribed_at?: string;
+  hasAudio: boolean;
+  summaryStale?: boolean;
+}
+
+interface NoteContent {
+  transcript: string;
+  summary: string;
+}
+
+interface NoteListResult {
+  notes: NoteInfo[];
+  folders: string[];
+  folderCounts: Record<string, number>;
+  error?: string;
+}
+
+interface NoteGetResult {
+  note?: NoteInfo;
+  content?: NoteContent;
+  error?: string;
+}
+
+interface NoteCreateRequest {
+  title?: string;
+  source: NoteSource;
+  folder?: string;
+  transcript?: string;
+}
+
+interface NoteUpdateRequest {
+  id: string;
+  title?: string;
+  folder?: string;
+  transcript?: string;
+  summary?: string;
+  model?: string;
+  markSummaryStale?: boolean;
+  clearSummaryStale?: boolean;
+}
+
+interface NoteActionResult {
+  success: boolean;
+  note?: NoteInfo;
+  error?: string;
+}
+
 export interface ElectronApi {
   startRecording: () => Promise<{ outputPath: string }>;
   stopRecording: () => Promise<{ outputPath: string | null }>;
@@ -156,6 +225,16 @@ export interface ElectronApi {
   // Dictation (hold Option)
   getDictationStatus: () => Promise<DictationStatusInfo>;
   requestDictationAccess: () => Promise<DictationStatusInfo>;
+  // Stage 1: Note store
+  listNotes: () => Promise<NoteListResult>;
+  getNote: (id: string) => Promise<NoteGetResult>;
+  createNote: (req: NoteCreateRequest) => Promise<NoteActionResult>;
+  updateNote: (req: NoteUpdateRequest) => Promise<NoteActionResult>;
+  deleteNote: (id: string) => Promise<NoteActionResult>;
+  readNoteContent: (id: string) => Promise<NoteGetResult>;
+  listFolders: () => Promise<{ folders: string[]; counts: Record<string, number> }>;
+  searchNotes: (query: string) => Promise<NoteListResult>;
+  reTranscribe: (noteId: string) => Promise<{ started: boolean; error?: string }>;
 }
 
 const api: ElectronApi = {
@@ -197,6 +276,17 @@ const api: ElectronApi = {
   cancelSummary: () => ipcRenderer.invoke(IpcChannel.CancelSummary),
   getDictationStatus: () => ipcRenderer.invoke(IpcChannel.DictationStatus),
   requestDictationAccess: () => ipcRenderer.invoke(IpcChannel.DictationRequestAccess),
+  // Stage 1: Note store
+  listNotes: () => ipcRenderer.invoke(IpcChannel.ListNotes),
+  getNote: (id) => ipcRenderer.invoke(IpcChannel.GetNote, id),
+  createNote: (req) => ipcRenderer.invoke(IpcChannel.CreateNote, req),
+  updateNote: (req) => ipcRenderer.invoke(IpcChannel.UpdateNote, req),
+  deleteNote: (id) => ipcRenderer.invoke(IpcChannel.DeleteNote, id),
+  readNoteContent: (id) => ipcRenderer.invoke(IpcChannel.ReadNoteContent, id),
+  listFolders: () => ipcRenderer.invoke(IpcChannel.ListFolders),
+  searchNotes: (query) => ipcRenderer.invoke(IpcChannel.SearchNotes, query),
+  reTranscribe: (noteId) => ipcRenderer.invoke(IpcChannel.ReTranscribe, { noteId }),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', api);
+

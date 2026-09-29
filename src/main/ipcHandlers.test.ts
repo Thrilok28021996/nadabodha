@@ -30,12 +30,14 @@ jest.mock('uiohook-napi', () => {
 
 import { BrowserWindow, ipcMain, systemPreferences } from 'electron';
 import { EventEmitter } from 'events';
+// @ts-ignore: native module unavailable in test env
 import { uIOhook } from 'uiohook-napi';
 import { AudioRecorder } from './audioRecorder';
 import { setupIpcHandlers } from './ipcHandlers';
 import { SettingsStore } from './settingsStore';
 import { TranscriptionService } from './transcriptionService';
 import { DictationStatusInfo, IpcChannel } from '../shared/ipc';
+import { NoteStore } from './noteStore';
 
 type Handler = (...args: unknown[]) => unknown;
 type MockHook = EventEmitter & { start: jest.Mock; stop: jest.Mock };
@@ -86,6 +88,20 @@ const settingsStore = {
   },
 };
 
+const mockNoteStore = {
+  list: jest.fn(() => []),
+  get: jest.fn(),
+  folders: jest.fn(() => []),
+  folderCounts: jest.fn(() => ({})),
+  search: jest.fn(() => []),
+  readContent: jest.fn(),
+  create: jest.fn(),
+  update: jest.fn(),
+  delete: jest.fn(),
+  reindex: jest.fn(() => ({ success: true })),
+  migrateFromLegacy: jest.fn(),
+};
+
 const mainWindow = {
   isDestroyed: () => false,
   webContents: {
@@ -107,6 +123,7 @@ function setup(trusted: boolean): ReturnType<typeof setupIpcHandlers> {
     transcriptionService: transcriptionService as unknown as TranscriptionService,
     recorder: recorder as unknown as AudioRecorder,
     settingsStore: settingsStore as unknown as SettingsStore,
+    noteStore: mockNoteStore as unknown as NoteStore,
   });
 }
 

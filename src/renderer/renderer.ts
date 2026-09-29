@@ -1,146 +1,255 @@
-// This file is loaded by index.html as a classic <script>, not as a module,
-// so it must contain no top-level import/export: TypeScript would emit the
-// CommonJS `Object.defineProperty(exports, ...)` prologue, and `exports` is
-// undefined in the page, which aborts the whole script (F4). An `import()`
-// type query is erased at compile time and does not make this a module.
-type TranscriptionEvent = import('../shared/ipc').TranscriptionEvent;
-type AppSettings = import('../shared/ipc').AppSettings;
-type PythonValidation = import('../shared/ipc').PythonValidation;
-type SettingsUpdateResult = import('../shared/ipc').SettingsUpdateResult;
-type LlmConnectionResult = import('../shared/ipc').LlmConnectionResult;
-type HfModelInfo = import('../shared/ipc').HfModelInfo;
-type HfModelListResult = import('../shared/ipc').HfModelListResult;
-type DictationStatusInfo = import('../shared/ipc').DictationStatusInfo;
+/**
+ * Nadabodha v3 renderer — Steno-style UI
+ *
+ * Architecture:
+ *   - Left sidebar: search, primary actions, dictation strip, folder nav,
+ *     recent-notes list
+ *   - Right main: note-detail (title, tabs, recording pill, settings slide-over)
+ *
+ * All existing element IDs are preserved or explicitly updated together with
+ * the harness (check-ids.js).  Vendored libraries (DOMPurify, marked) are
+ * loaded via the copy-assets script and accessed through window globals.
+ */
 
-// Vendored UMD globals loaded by <script> tags before this file: there is no
-// bundler in this sandboxed renderer, so they cannot be imported.
-declare const marked: { parse(src: string): string };
+export {};
+
+// ---------------------------------------------------------------------------
+// Vendored library types (set by copy-assets.js, loaded before this script)
+// ---------------------------------------------------------------------------
+
 declare const DOMPurify: {
-  sanitize(dirty: string): string;
-  addHook(hook: string, callback: (node: Node) => void): void;
+  sanitize(input: string, config?: Record<string, unknown>): string;
+  addHook(name: string, fn: (node: Element) => void): void;
 };
+declare const marked: { parse(src: string): string | Promise<string> };
 
-// Preload API is injected at runtime; declare a minimal typed interface here
-// to avoid importing from the sandboxed preload bundle.
-interface ElectronApi {
-  startRecording: () => Promise<{ outputPath: string }>;
-  stopRecording: () => Promise<{ outputPath: string | null }>;
-  importAudio: (filePath: string) => Promise<{ filePath: string }>;
-  cancelTranscription: () => Promise<{ cancelled: boolean }>;
-  saveTranscript: (request: { filePath: string; text: string }) => Promise<{ success: boolean; error?: string }>;
-  copyTranscript: (text: string) => Promise<{ copied: boolean }>;
-  requestStatus: () => Promise<{ status: string; text: string; filePath: string | null }>;
-  requestSavePath?: () => Promise<string | undefined>;
-  onTranscriptionEvent: (callback: (event: TranscriptionEvent) => void) => void;
-  removeTranscriptionListener: () => void;
-  getSettings: () => Promise<AppSettings>;
-  updateSettings: (patch: Partial<AppSettings>) => Promise<SettingsUpdateResult>;
-  validatePython: (pythonPath: string) => Promise<PythonValidation>;
-  pickDirectory: (title?: string) => Promise<string | null>;
-  pickPythonFile: () => Promise<string | null>;
-  getPathForFile?: (file: File) => string;
-  testLlmConnection: (baseUrl?: string) => Promise<LlmConnectionResult>;
-  listHfModels: (query?: string) => Promise<HfModelListResult>;
-  downloadModel: (repoId: string) => Promise<{ started: boolean; error?: string }>;
-  cancelDownload: () => Promise<{ cancelled: boolean }>;
-  summarize: (text?: string) => Promise<{ started: boolean; error?: string }>;
-  cancelSummary: () => Promise<{ cancelled: boolean }>;
-  // Dictation (hold Option, system-wide)
-  getDictationStatus: () => Promise<DictationStatusInfo>;
-  requestDictationAccess: () => Promise<DictationStatusInfo>;
+// ---------------------------------------------------------------------------
+// Electron API
+// ---------------------------------------------------------------------------
+
+interface NoteInfo {
+  id: string;
+  title: string;
+  created: string;
+  source: 'recording' | 'import' | 'dictation-log' | 'unknown';
+  folder: string;
+  duration: number;
+  model: string;
+  transcribed_at?: string;
+  hasAudio: boolean;
+  summaryStale?: boolean;
 }
 
-// Merged into the global Window declared by lib.dom; only read as a type.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-interface Window {
-  electronAPI: ElectronApi;
+interface NoteContent { transcript: string; summary: string; }
+interface NoteListResult { notes: NoteInfo[]; folders: string[]; folderCounts: Record<string, number>; error?: string; }
+interface TranscriptionEvent {
+  status: string;
+  text?: string;
+  progress?: number;
+  error?: string;
+  origin?: string;
+  dictationNotice?: string;
+  savedTranscriptPath?: string;
+  savedSummaryPath?: string;
+  saveError?: string;
+  file?: string;
+  bytesDone?: number;
+  bytesTotal?: number;
+}
+interface AppSettings {
+  pythonPath: string;
+  llmBaseUrl: string;
+  llmModel: string;
+  llmApiKey: string;
+  dataDir: string;
+  sttCacheDir: string;
+  summarizationEnabled: boolean;
+  autoSummarize: boolean;
+  activeModel: string;
+  dictationEnabled: boolean;
+}
+interface DictationStatusInfo { supported: boolean; enabled: boolean; accessibilityTrusted: boolean; running: boolean; reason?: string; }
+interface HfModelInfo { id: string; downloads: number; pipelineTag: string | null; tags: string[]; kind: string; reason?: string; format: string; }
+interface HfModelListResult { models: HfModelInfo[]; installed: string[]; partial?: string[]; activeModel: string; error?: string; }
+interface LlmConnectionResult { ok: boolean; models: string[]; message: string; }
+interface PythonValidation { ok: boolean; blocking: boolean; message: string; }
+interface SettingsUpdateResult { settings: AppSettings; errors: Partial<Record<string, string>>; messages?: Partial<Record<string, string>>; }
+
+interface ElectronAPI {
+  startRecording(): Promise<{ outputPath: string }>;
+  stopRecording(): Promise<{ outputPath: string | null }>;
+  importAudio(fp: string): Promise<{ filePath: string }>;
+  cancelTranscription(): Promise<{ cancelled: boolean }>;
+  saveTranscript(req: { filePath: string; text: string }): Promise<{ success: boolean; filePath?: string; error?: string }>;
+  copyTranscript(text: string): Promise<{ copied: boolean }>;
+  requestStatus(): Promise<{ status: string; text: string; filePath: string | null }>;
+  requestSavePath(): Promise<string | undefined>;
+  onTranscriptionEvent(cb: (e: TranscriptionEvent) => void): void;
+  removeTranscriptionListener(): void;
+  getSettings(): Promise<AppSettings>;
+  updateSettings(patch: Partial<AppSettings>): Promise<SettingsUpdateResult>;
+  validatePython(path: string): Promise<PythonValidation>;
+  pickDirectory(title?: string): Promise<string | null>;
+  pickPythonFile(): Promise<string | null>;
+  getPathForFile?(file: File): string;
+  testLlmConnection(url?: string): Promise<LlmConnectionResult>;
+  listHfModels(q?: string): Promise<HfModelListResult>;
+  downloadModel(id: string): Promise<{ started: boolean; error?: string }>;
+  cancelDownload(): Promise<{ cancelled: boolean }>;
+  summarize(text?: string): Promise<{ started: boolean; error?: string }>;
+  cancelSummary(): Promise<{ cancelled: boolean }>;
+  getDictationStatus(): Promise<DictationStatusInfo>;
+  requestDictationAccess(): Promise<DictationStatusInfo>;
+  listNotes(): Promise<NoteListResult>;
+  getNote(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
+  createNote(req: { title?: string; source: string; folder?: string; transcript?: string }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
+  updateNote(req: { id: string; title?: string; folder?: string; transcript?: string; summary?: string; model?: string; markSummaryStale?: boolean; clearSummaryStale?: boolean }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
+  deleteNote(id: string): Promise<{ success: boolean; error?: string }>;
+  readNoteContent(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
+  listFolders(): Promise<{ folders: string[]; counts: Record<string, number> }>;
+  searchNotes(q: string): Promise<NoteListResult>;
+  reTranscribe(noteId: string): Promise<{ started: boolean; error?: string }>;
 }
 
-type HintState = 'ok' | 'error' | 'busy' | '';
+declare global {
+  interface Window { electronAPI: ElectronAPI; }
+}
 
-const recordBtn = document.getElementById('recordBtn') as HTMLButtonElement;
-const stopRecordBtn = document.getElementById('stopRecordBtn') as HTMLButtonElement;
-const importBtn = document.getElementById('importBtn') as HTMLButtonElement;
-const cancelBtn = document.getElementById('cancelBtn') as HTMLButtonElement;
-const copyBtn = document.getElementById('copyBtn') as HTMLButtonElement;
-const saveBtn = document.getElementById('saveBtn') as HTMLButtonElement;
-const statusText = document.getElementById('statusText') as HTMLParagraphElement;
-const progressBar = document.getElementById('progressBar') as HTMLProgressElement;
-const errorText = document.getElementById('errorText') as HTMLParagraphElement;
-const transcriptArea = document.getElementById('transcriptArea') as HTMLTextAreaElement;
-const fileInput = document.getElementById('fileInput') as HTMLInputElement;
+const api = window.electronAPI;
 
-// Tabs + summary
-const tabTranscript = document.getElementById('tabTranscript') as HTMLButtonElement;
-const tabSummary = document.getElementById('tabSummary') as HTMLButtonElement;
-const transcriptPanel = document.getElementById('transcriptPanel') as HTMLElement;
-const summaryPanel = document.getElementById('summaryPanel') as HTMLElement;
-const summarizeBtn = document.getElementById('summarizeBtn') as HTMLButtonElement;
-const cancelSummaryBtn = document.getElementById('cancelSummaryBtn') as HTMLButtonElement;
-const summaryArea = document.getElementById('summaryArea') as HTMLTextAreaElement;
-const summaryStatus = document.getElementById('summaryStatus') as HTMLParagraphElement;
-const summaryError = document.getElementById('summaryError') as HTMLParagraphElement;
+// ---------------------------------------------------------------------------
+// DOM references
+// ---------------------------------------------------------------------------
 
-// Saved files
-const savedPanel = document.getElementById('savedPanel') as HTMLElement;
-const savedTranscriptPath = document.getElementById('savedTranscriptPath') as HTMLParagraphElement;
-const savedSummaryPath = document.getElementById('savedSummaryPath') as HTMLParagraphElement;
-const saveErrorText = document.getElementById('saveErrorText') as HTMLParagraphElement;
+// Sidebar
+const searchInput       = document.getElementById('searchInput') as HTMLInputElement;
+const searchClearBtn    = document.getElementById('searchClearBtn') as HTMLButtonElement;
+const recordBtn         = document.getElementById('recordBtn') as HTMLButtonElement;
+const importBtn         = document.getElementById('importBtn') as HTMLButtonElement;
+const navHome           = document.getElementById('navHome') as HTMLButtonElement;
+const navAll            = document.getElementById('navAll') as HTMLButtonElement;
+const navDictation      = document.getElementById('navDictation') as HTMLButtonElement;
+const allCount          = document.getElementById('allCount') as HTMLSpanElement;
+const folderList        = document.getElementById('folderList') as HTMLUListElement;
+const addFolderBtn      = document.getElementById('addFolderBtn') as HTMLButtonElement;
+const noteList          = document.getElementById('noteList') as HTMLUListElement;
+const noteListEmpty     = document.getElementById('noteListEmpty') as HTMLParagraphElement;
+const notesListLabel    = document.getElementById('notesListLabel') as HTMLSpanElement;
+const settingsBtn       = document.getElementById('settingsBtn') as HTMLButtonElement;
 
-// Summary view (Raw / Preview) + rendered markdown
-const summaryPreview = document.getElementById('summaryPreview') as HTMLElement;
-const summaryRawBtn = document.getElementById('summaryRawBtn') as HTMLButtonElement;
-const summaryPreviewBtn = document.getElementById('summaryPreviewBtn') as HTMLButtonElement;
-const copySummaryBtn = document.getElementById('copySummaryBtn') as HTMLButtonElement;
-
-// Dictation (hold Option)
-const dictationBadge = document.getElementById('dictationBadge') as HTMLParagraphElement;
-const dictationNotice = document.getElementById('dictationNotice') as HTMLParagraphElement;
-const dictationBanner = document.getElementById('dictationBanner') as HTMLElement;
+// Dictation strip (IDs preserved from cycle 2)
+const dictationHint     = document.getElementById('dictationHint') as HTMLParagraphElement;
+const dictationBadge    = document.getElementById('dictationBadge') as HTMLParagraphElement;
+const dictationNotice   = document.getElementById('dictationNotice') as HTMLParagraphElement;
+const dictationBanner   = document.getElementById('dictationBanner') as HTMLElement;
 const dictationGrantBtn = document.getElementById('dictationGrantBtn') as HTMLButtonElement;
 const dictationEnabledChk = document.getElementById('dictationEnabledChk') as HTMLInputElement;
 const dictationStatusHint = document.getElementById('dictationStatus') as HTMLParagraphElement;
 
-/** Exact hint string required by the approved plan. */
-const DICTATION_HINT = 'Hold the Option key anywhere to dictate';
+// Main content
+const emptyState        = document.getElementById('emptyState') as HTMLElement;
+const emptyRecordBtn    = document.getElementById('emptyRecordBtn') as HTMLButtonElement;
+const emptyImportBtn    = document.getElementById('emptyImportBtn') as HTMLButtonElement;
+const noteDetail        = document.getElementById('noteDetail') as HTMLElement;
+const noteTitle         = document.getElementById('noteTitle') as HTMLInputElement;
+const noteDate          = document.getElementById('noteDate') as HTMLSpanElement;
+const noteDuration      = document.getElementById('noteDuration') as HTMLSpanElement;
+const noteSource        = document.getElementById('noteSource') as HTMLSpanElement;
+const noteFolderSelect  = document.getElementById('noteFolderSelect') as HTMLSelectElement;
+const reTranscribeBtn   = document.getElementById('reTranscribeBtn') as HTMLButtonElement;
+const deleteNoteBtn     = document.getElementById('deleteNoteBtn') as HTMLButtonElement;
 
-// Settings
-const settingsBtn = document.getElementById('settingsBtn') as HTMLButtonElement;
-const settingsPanel = document.getElementById('settingsPanel') as HTMLElement;
-const settingsSaveBtn = document.getElementById('settingsSaveBtn') as HTMLButtonElement;
-const settingsStatus = document.getElementById('settingsStatus') as HTMLParagraphElement;
-const pythonPathInput = document.getElementById('pythonPathInput') as HTMLInputElement;
-const pythonBrowseBtn = document.getElementById('pythonBrowseBtn') as HTMLButtonElement;
+// Recording pill
+const recordingPill     = document.getElementById('recordingPill') as HTMLElement;
+const pillLabel         = document.getElementById('pillLabel') as HTMLSpanElement;
+const pillTimer         = document.getElementById('pillTimer') as HTMLSpanElement;
+const stopRecordBtn     = document.getElementById('stopRecordBtn') as HTMLButtonElement;
+const cancelBtn         = document.getElementById('cancelBtn') as HTMLButtonElement;
+
+// Status bar
+const statusBar         = document.getElementById('statusBar') as HTMLElement;
+const statusText        = document.getElementById('statusText') as HTMLParagraphElement;
+const progressBar       = document.getElementById('progressBar') as HTMLProgressElement;
+const errorText         = document.getElementById('errorText') as HTMLParagraphElement;
+
+// Tabs + panels
+const tabTranscript     = document.getElementById('tabTranscript') as HTMLButtonElement;
+const tabSummary        = document.getElementById('tabSummary') as HTMLButtonElement;
+const transcriptPanel   = document.getElementById('transcriptPanel') as HTMLElement;
+const summaryPanel      = document.getElementById('summaryPanel') as HTMLElement;
+const transcriptArea    = document.getElementById('transcriptArea') as HTMLTextAreaElement;
+const copyBtn           = document.getElementById('copyBtn') as HTMLButtonElement;
+const saveBtn           = document.getElementById('saveBtn') as HTMLButtonElement;
+const summarizeBtn      = document.getElementById('summarizeBtn') as HTMLButtonElement;
+const cancelSummaryBtn  = document.getElementById('cancelSummaryBtn') as HTMLButtonElement;
+const summaryRawBtn     = document.getElementById('summaryRawBtn') as HTMLButtonElement;
+const summaryPreviewBtn = document.getElementById('summaryPreviewBtn') as HTMLButtonElement;
+const copySummaryBtn    = document.getElementById('copySummaryBtn') as HTMLButtonElement;
+const summaryStaleHint  = document.getElementById('summaryStaleHint') as HTMLSpanElement;
+const summaryStatus     = document.getElementById('summaryStatus') as HTMLParagraphElement;
+const summaryError      = document.getElementById('summaryError') as HTMLParagraphElement;
+const summaryPreview    = document.getElementById('summaryPreview') as HTMLElement;
+const summaryArea       = document.getElementById('summaryArea') as HTMLTextAreaElement;
+
+// Saved paths
+const savedPanel        = document.getElementById('savedPanel') as HTMLElement;
+const savedTranscriptPath = document.getElementById('savedTranscriptPath') as HTMLParagraphElement;
+const savedSummaryPath  = document.getElementById('savedSummaryPath') as HTMLParagraphElement;
+const saveErrorText     = document.getElementById('saveErrorText') as HTMLParagraphElement;
+
+// Settings slide-over
+const settingsPanel     = document.getElementById('settingsPanel') as HTMLElement;
+const settingsCloseBtn  = document.getElementById('settingsCloseBtn') as HTMLButtonElement;
+const settingsSaveBtn   = document.getElementById('settingsSaveBtn') as HTMLButtonElement;
+const settingsStatus    = document.getElementById('settingsStatus') as HTMLParagraphElement;
+const pythonPathInput   = document.getElementById('pythonPathInput') as HTMLInputElement;
+const pythonBrowseBtn   = document.getElementById('pythonBrowseBtn') as HTMLButtonElement;
 const pythonValidateBtn = document.getElementById('pythonValidateBtn') as HTMLButtonElement;
-const pythonStatus = document.getElementById('pythonStatus') as HTMLParagraphElement;
-const llmBaseUrlInput = document.getElementById('llmBaseUrlInput') as HTMLInputElement;
-const llmModelSelect = document.getElementById('llmModelSelect') as HTMLSelectElement;
-const llmApiKeyInput = document.getElementById('llmApiKeyInput') as HTMLInputElement;
-const llmRefreshBtn = document.getElementById('llmRefreshBtn') as HTMLButtonElement;
-const llmTestBtn = document.getElementById('llmTestBtn') as HTMLButtonElement;
-const llmStatus = document.getElementById('llmStatus') as HTMLParagraphElement;
-const dataDirInput = document.getElementById('dataDirInput') as HTMLInputElement;
-const dataDirBrowseBtn = document.getElementById('dataDirBrowseBtn') as HTMLButtonElement;
-const dataDirStatus = document.getElementById('dataDirStatus') as HTMLParagraphElement;
-const cacheDirInput = document.getElementById('cacheDirInput') as HTMLInputElement;
+const pythonStatus      = document.getElementById('pythonStatus') as HTMLParagraphElement;
+const llmBaseUrlInput   = document.getElementById('llmBaseUrlInput') as HTMLInputElement;
+const llmModelSelect    = document.getElementById('llmModelSelect') as HTMLSelectElement;
+const llmApiKeyInput    = document.getElementById('llmApiKeyInput') as HTMLInputElement;
+const llmRefreshBtn     = document.getElementById('llmRefreshBtn') as HTMLButtonElement;
+const llmTestBtn        = document.getElementById('llmTestBtn') as HTMLButtonElement;
+const llmStatus         = document.getElementById('llmStatus') as HTMLParagraphElement;
+const dataDirInput      = document.getElementById('dataDirInput') as HTMLInputElement;
+const dataDirBrowseBtn  = document.getElementById('dataDirBrowseBtn') as HTMLButtonElement;
+const dataDirStatus     = document.getElementById('dataDirStatus') as HTMLParagraphElement;
+const cacheDirInput     = document.getElementById('cacheDirInput') as HTMLInputElement;
 const cacheDirBrowseBtn = document.getElementById('cacheDirBrowseBtn') as HTMLButtonElement;
-const cacheDirStatus = document.getElementById('cacheDirStatus') as HTMLParagraphElement;
+const cacheDirStatus    = document.getElementById('cacheDirStatus') as HTMLParagraphElement;
 const summarizeEnabledChk = document.getElementById('summarizeEnabledChk') as HTMLInputElement;
-const autoSummarizeChk = document.getElementById('autoSummarizeChk') as HTMLInputElement;
-const promptPathStatus = document.getElementById('promptPathStatus') as HTMLParagraphElement;
-const hfSearchInput = document.getElementById('hfSearchInput') as HTMLInputElement;
-const hfSearchBtn = document.getElementById('hfSearchBtn') as HTMLButtonElement;
-const hfStatus = document.getElementById('hfStatus') as HTMLParagraphElement;
-const hfResults = document.getElementById('hfResults') as HTMLElement;
-const hfInstalled = document.getElementById('hfInstalled') as HTMLElement;
-const hfDownloadBtn = document.getElementById('hfDownloadBtn') as HTMLButtonElement;
-const hfUseBtn = document.getElementById('hfUseBtn') as HTMLButtonElement;
+const autoSummarizeChk  = document.getElementById('autoSummarizeChk') as HTMLInputElement;
+const promptPathStatus  = document.getElementById('promptPathStatus') as HTMLParagraphElement;
+const hfSearchInput     = document.getElementById('hfSearchInput') as HTMLInputElement;
+const hfSearchBtn       = document.getElementById('hfSearchBtn') as HTMLButtonElement;
+const hfStatus          = document.getElementById('hfStatus') as HTMLParagraphElement;
+const hfResults         = document.getElementById('hfResults') as HTMLElement;
+const hfInstalled       = document.getElementById('hfInstalled') as HTMLElement;
+const hfDownloadBtn     = document.getElementById('hfDownloadBtn') as HTMLButtonElement;
+const hfUseBtn          = document.getElementById('hfUseBtn') as HTMLButtonElement;
 const hfCancelDownloadBtn = document.getElementById('hfCancelDownloadBtn') as HTMLButtonElement;
-const downloadProgress = document.getElementById('downloadProgress') as HTMLProgressElement;
-const downloadStatus = document.getElementById('downloadStatus') as HTMLParagraphElement;
+const downloadProgress  = document.getElementById('downloadProgress') as HTMLProgressElement;
+const downloadStatus    = document.getElementById('downloadStatus') as HTMLParagraphElement;
+const fileInput         = document.getElementById('fileInput') as HTMLInputElement;
 
-let currentText = '';
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
+
+type AppView = 'home' | 'all' | 'dictation' | 'folder';
+type SummaryView = 'raw' | 'preview';
+type HintState = '' | 'ok' | 'error' | 'info';
+
+let currentView: AppView = 'home';
+let currentFolder: string = '';
+let selectedNoteId: string | null = null;
+let notes: NoteInfo[] = [];
+let folders: string[] = [];
+let folderCounts: Record<string, number> = {};
+let currentNoteContent: NoteContent = { transcript: '', summary: '' };
 let currentSettings: AppSettings | null = null;
+let summaryView: SummaryView = 'preview';
 let selectedModelId: string | null = null;
 let installedModels: string[] = [];
 let partialModels: string[] = [];
@@ -148,8 +257,17 @@ let activeModel = '';
 let hfLoaded = false;
 let hfSearchTimer: number | undefined;
 let llmLoadTimer: number | undefined;
-/** Summary view mode. Default is the rendered preview (approved plan). */
-let summaryView: 'raw' | 'preview' = 'preview';
+let isRecording = false;
+let recordingInterval: number | undefined;
+let recordingStartTime = 0;
+let pendingTranscriptNoteId: string | null = null; // note to update after re-transcribe
+
+/** Exact hint string required by the approved plan. */
+const DICTATION_HINT = 'Hold the Option key anywhere to dictate';
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 function setHint(element: HTMLElement, text: string, state: HintState = ''): void {
   element.textContent = text;
@@ -157,964 +275,1047 @@ function setHint(element: HTMLElement, text: string, state: HintState = ''): voi
   element.setAttribute('data-state', state);
 }
 
-// ---- Summary rendering (workstream 2) -------------------------------------
-
-/** Empty-state copy for the preview panel. */
-function emptyState(text: string): HTMLElement {
-  const element = document.createElement('p');
-  element.className = 'empty';
-  element.textContent = text;
-  return element;
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) +
+    ' ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
 }
 
-/**
- * Extra sanitization pass for untrusted LLM output: only absolute http(s)/data
- * `src` values survive. A relative source (e.g. `src=x`) would resolve against
- * the app's own file:// origin, which both leaks local paths to the renderer
- * and logs a 404 for every hostile payload.
- */
+function formatDuration(seconds: number): string {
+  if (!seconds) return '';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatElapsed(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function sourceLabel(source: string): string {
+  switch (source) {
+    case 'recording': return 'Recording';
+    case 'import': return 'Import';
+    case 'dictation-log': return 'Dictation';
+    default: return 'Note';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DOMPurify + marked (Markdown preview, same pattern as cycle 2)
+// ---------------------------------------------------------------------------
+
 let sanitizeHooksInstalled = false;
 function ensureSanitizeHooks(): void {
-  if (sanitizeHooksInstalled) {
-    return;
-  }
+  if (sanitizeHooksInstalled) return;
   sanitizeHooksInstalled = true;
   const SRC_ELEMENTS = ['IMG', 'VIDEO', 'AUDIO', 'SOURCE', 'TRACK', 'EMBED'];
   DOMPurify.addHook('afterSanitizeAttributes', (node) => {
-    const element = node as Element;
-    if (!SRC_ELEMENTS.includes(element.tagName)) {
-      return;
-    }
-    const src = element.getAttribute('src') || '';
-    if (!/^(https?:|data:)/i.test(src)) {
-      element.removeAttribute('src');
-    }
+    const el = node as Element;
+    if (!SRC_ELEMENTS.includes(el.tagName)) return;
+    const src = el.getAttribute('src') || '';
+    if (!/^(https?:|data:)/i.test(src)) el.removeAttribute('src');
   });
 }
 
-/**
- * Renders the raw Markdown source of the summary into the preview panel.
- *
- * LLM output is untrusted: DOMPurify.sanitize runs on EVERY render, before
- * anything reaches innerHTML. If either vendored library failed to load the
- * preview refuses to render rather than inject unsanitized markup.
- */
-function renderSummaryPreview(): void {
-  const raw = summaryArea.value;
-  if (!raw.trim()) {
-    summaryPreview.replaceChildren(emptyState('Summary will appear here…'));
+function emptyStateEl(text: string): HTMLElement {
+  const p = document.createElement('p');
+  p.className = 'empty';
+  p.textContent = text;
+  return p;
+}
+
+function renderMarkdown(md: string): void {
+  if (!md.trim()) {
+    summaryPreview.innerHTML = '';
+    summaryPreview.appendChild(emptyStateEl('No summary yet.'));
     return;
   }
   try {
-    if (typeof marked === 'undefined' || typeof marked.parse !== 'function') {
-      throw new Error('marked is not loaded');
-    }
-    if (typeof DOMPurify === 'undefined' || typeof DOMPurify.sanitize !== 'function') {
-      throw new Error('DOMPurify is not loaded');
+    if (typeof DOMPurify === 'undefined' || typeof marked === 'undefined') {
+      summaryPreview.innerHTML = '';
+      summaryPreview.appendChild(emptyStateEl('Preview unavailable (library not loaded).'));
+      return;
     }
     ensureSanitizeHooks();
-    const html = marked.parse(raw);
-    summaryPreview.innerHTML = DOMPurify.sanitize(html);
+    const rawHtml = marked.parse(md);
+    const htmlStr = typeof rawHtml === 'string' ? rawHtml : '';
+    summaryPreview.innerHTML = DOMPurify.sanitize(htmlStr, { USE_PROFILES: { html: true } });
+  } catch {
+    summaryPreview.innerHTML = '';
+    summaryPreview.appendChild(emptyStateEl('Preview render error.'));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Notes: loading and rendering
+// ---------------------------------------------------------------------------
+
+async function loadNotes(searchQuery = ''): Promise<void> {
+  try {
+    let result: NoteListResult;
+    if (searchQuery.trim()) {
+      result = await api.searchNotes(searchQuery);
+    } else {
+      result = await api.listNotes();
+    }
+    notes = result.notes || [];
+    folders = result.folders || [];
+    folderCounts = result.folderCounts || {};
+
+    allCount.textContent = String(notes.length);
+    renderFolderList();
+    renderNoteList();
   } catch (err) {
-    summaryPreview.replaceChildren(emptyState(`Preview unavailable: ${String(err)}`));
+    console.error('[renderer] loadNotes error:', err);
   }
 }
 
-/** Applies the Raw / Preview toggle. The raw source never changes. */
-function applySummaryView(): void {
-  const raw = summaryView === 'raw';
-  summaryRawBtn.classList.toggle('active', raw);
-  summaryPreviewBtn.classList.toggle('active', !raw);
-  summaryRawBtn.setAttribute('aria-pressed', String(raw));
-  summaryPreviewBtn.setAttribute('aria-pressed', String(!raw));
-  summaryArea.hidden = !raw;
-  summaryPreview.hidden = raw;
-  if (!raw) {
-    renderSummaryPreview();
+function renderFolderList(): void {
+  folderList.innerHTML = '';
+  for (const folder of folders) {
+    const li = document.createElement('li');
+    li.className = 'folder-item' + (currentView === 'folder' && currentFolder === folder ? ' active' : '');
+    li.textContent = `${folder}`;
+    const countSpan = document.createElement('span');
+    countSpan.className = 'folder-count';
+    countSpan.textContent = String(folderCounts[folder] || 0);
+    li.appendChild(countSpan);
+    li.addEventListener('click', () => {
+      currentView = 'folder';
+      currentFolder = folder;
+      notesListLabel.textContent = folder;
+      setActiveNav(null);
+      renderFolderList();
+      renderNoteList();
+    });
+    folderList.appendChild(li);
   }
 }
 
-function showTab(which: 'transcript' | 'summary'): void {
-  const showSummary = which === 'summary';
-  transcriptPanel.hidden = showSummary;
-  summaryPanel.hidden = !showSummary;
-  tabTranscript.classList.toggle('active', !showSummary);
-  tabSummary.classList.toggle('active', showSummary);
-  tabTranscript.setAttribute('aria-selected', String(!showSummary));
-  tabSummary.setAttribute('aria-selected', String(showSummary));
-}
-
-function clearSavedPaths(): void {
-  savedTranscriptPath.hidden = true;
-  savedSummaryPath.hidden = true;
-  saveErrorText.hidden = true;
-  savedPanel.hidden = savedTranscriptPath.hidden && savedSummaryPath.hidden && saveErrorText.hidden;
-}
-
-function showSavedTranscriptPath(filePath: string): void {
-  savedTranscriptPath.textContent = `Transcript: ${filePath}`;
-  savedTranscriptPath.hidden = false;
-  savedPanel.hidden = false;
-}
-
-function showSavedSummaryPath(filePath: string): void {
-  savedSummaryPath.textContent = `Summary: ${filePath}`;
-  savedSummaryPath.hidden = false;
-  savedPanel.hidden = false;
-}
-
-function showSaveError(message: string): void {
-  saveErrorText.textContent = message;
-  saveErrorText.hidden = false;
-  savedPanel.hidden = false;
-}
-
-function updateStatus(event: TranscriptionEvent, options: { preserveText?: boolean } = {}): void {
-  const fromDictation = event.origin === 'dictation';
-  // Dictation appends to the transcript that is already on screen; plain
-  // record/import keep their replace semantics.
-  const preserveText = options.preserveText ?? fromDictation;
-
-  statusText.textContent = `Status: ${event.status}`;
-  errorText.hidden = true;
-  dictationBadge.hidden = !(fromDictation && event.status === 'recording');
-  if (event.dictationNotice) {
-    setHint(dictationNotice, event.dictationNotice);
+function filteredNotes(): NoteInfo[] {
+  switch (currentView) {
+    case 'all': return notes;
+    case 'dictation': return notes.filter(n => n.source === 'dictation-log');
+    case 'folder': return notes.filter(n => n.folder === currentFolder);
+    default: return notes.slice(0, 20); // home: recent 20
   }
+}
 
-  if (event.status === 'recording' || event.status === 'transcribing') {
-    // A new take starts with a clean slate for its own notices.
-    setHint(dictationNotice, '');
-    if (!preserveText) {
-      // N-F3: a new capture or transcription replaces the transcript on
-      // screen as soon as it starts, not only when it completes.
-      currentText = '';
-      transcriptArea.value = '';
-      summaryArea.value = '';
-      copySummaryBtn.disabled = true;
-      renderSummaryPreview();
-      setHint(summaryStatus, '');
-      summaryError.hidden = true;
-      clearSavedPaths();
-    }
-    recordBtn.disabled = true;
-    stopRecordBtn.disabled = event.status === 'transcribing';
-    importBtn.disabled = true;
-    cancelBtn.disabled = false;
-    copyBtn.disabled = true;
-    saveBtn.disabled = true;
-    summarizeBtn.disabled = true;
-  } else if (event.status === 'completed') {
-    recordBtn.disabled = false;
-    stopRecordBtn.disabled = true;
-    importBtn.disabled = false;
-    cancelBtn.disabled = true;
-    copyBtn.disabled = false;
-    saveBtn.disabled = false;
-    currentText = event.text || '';
-    transcriptArea.value = currentText;
-    summarizeBtn.disabled = !currentText.trim();
-    if (event.savedTranscriptPath) {
-      showSavedTranscriptPath(event.savedTranscriptPath);
-    }
-    if (event.saveError) {
-      showSaveError(event.saveError);
-    }
-  } else if (event.status === 'error') {
-    recordBtn.disabled = false;
-    stopRecordBtn.disabled = true;
-    importBtn.disabled = false;
-    cancelBtn.disabled = true;
-    copyBtn.disabled = !currentText;
-    saveBtn.disabled = !currentText;
-    summarizeBtn.disabled = !currentText.trim();
-    errorText.textContent = event.error || 'Unknown error';
-    errorText.hidden = false;
-    if (event.saveError) {
-      showSaveError(event.saveError);
-    }
-  } else {
-    // idle / cancelled
-    recordBtn.disabled = false;
-    stopRecordBtn.disabled = true;
-    importBtn.disabled = false;
-    cancelBtn.disabled = true;
-    copyBtn.disabled = !currentText;
-    saveBtn.disabled = !currentText;
-    summarizeBtn.disabled = !currentText.trim();
+function renderNoteList(): void {
+  noteList.innerHTML = '';
+  const visible = filteredNotes();
+  noteListEmpty.hidden = visible.length > 0;
+
+  for (const note of visible) {
+    const li = document.createElement('li');
+    li.className = 'note-item' + (note.id === selectedNoteId ? ' active' : '');
+    li.setAttribute('role', 'listitem');
+    li.dataset.id = note.id;
+
+    const title = document.createElement('p');
+    title.className = 'note-item-title';
+    title.textContent = note.title;
+
+    const meta = document.createElement('div');
+    meta.className = 'note-item-meta';
+
+    const date = document.createElement('span');
+    date.className = 'note-item-date';
+    date.textContent = new Date(note.created).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+
+    const badge = document.createElement('span');
+    badge.className = `source-badge ${note.source}`;
+    badge.textContent = sourceLabel(note.source);
+
+    meta.appendChild(date);
+    meta.appendChild(badge);
+    li.appendChild(title);
+    li.appendChild(meta);
+
+    li.addEventListener('click', () => openNote(note.id));
+    noteList.appendChild(li);
   }
+}
 
-  if (event.status === 'transcribing' && typeof event.progress === 'number') {
-    progressBar.value = event.progress;
-    progressBar.hidden = false;
-  } else {
-    progressBar.value = 0;
+// ---------------------------------------------------------------------------
+// Note detail
+// ---------------------------------------------------------------------------
+
+async function openNote(id: string): Promise<void> {
+  selectedNoteId = id;
+  renderNoteList(); // highlight
+
+  try {
+    const result = await api.getNote(id);
+    if (!result.note) {
+      showError(result.error || 'Note not found');
+      return;
+    }
+    const note = result.note;
+    currentNoteContent = result.content || { transcript: '', summary: '' };
+
+    // Show note detail, hide empty state
+    emptyState.hidden = true;
+    noteDetail.hidden = false;
+
+    // Populate header
+    noteTitle.value = note.title;
+    noteDate.textContent = formatDate(note.created);
+    noteDuration.textContent = note.duration ? formatDuration(note.duration) : '';
+    noteSource.textContent = sourceLabel(note.source);
+    noteSource.className = `note-source-badge ${note.source}`;
+
+    // Folder select
+    refreshFolderSelect(note.folder);
+    noteFolderSelect.value = note.folder || '';
+
+    // Re-transcribe button
+    reTranscribeBtn.disabled = !note.hasAudio;
+    reTranscribeBtn.title = note.hasAudio
+      ? 'Re-transcribe using the current model'
+      : 'No audio stored — re-transcribe is not available for this note';
+
+    // Transcript
+    transcriptArea.value = currentNoteContent.transcript;
+    copyBtn.disabled = !currentNoteContent.transcript;
+    saveBtn.disabled = !currentNoteContent.transcript;
+
+    // Summary
+    summaryArea.value = currentNoteContent.summary;
+    copySummaryBtn.disabled = !currentNoteContent.summary;
+    summaryStaleHint.hidden = !note.summaryStale;
+
+    if (summaryView === 'preview') {
+      renderMarkdown(currentNoteContent.summary);
+    }
+
+    // Summarize button: enable if there's a transcript
+    summarizeBtn.disabled = !currentNoteContent.transcript;
+
+    // Status bar: show transcription status if relevant
+    updateStatusBar({ status: 'idle' });
+  } catch (err) {
+    showError(String(err));
+  }
+}
+
+function refreshFolderSelect(currentFolder: string): void {
+  noteFolderSelect.innerHTML = '<option value="">Unfiled</option>';
+  for (const f of folders) {
+    const opt = document.createElement('option');
+    opt.value = f;
+    opt.textContent = f;
+    noteFolderSelect.appendChild(opt);
+  }
+  // Add current folder if not in list
+  if (currentFolder && !folders.includes(currentFolder)) {
+    const opt = document.createElement('option');
+    opt.value = currentFolder;
+    opt.textContent = currentFolder;
+    noteFolderSelect.appendChild(opt);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+interface StatusState { status: string; text?: string; progress?: number; error?: string; }
+
+function updateStatusBar(state: StatusState): void {
+  const { status, text, progress, error } = state;
+
+  if (status === 'idle') {
+    statusBar.hidden = true;
     progressBar.hidden = true;
+    errorText.hidden = true;
+    return;
+  }
+
+  statusBar.hidden = false;
+
+  if (error) {
+    statusText.textContent = error;
+    errorText.textContent = error;
+    errorText.hidden = false;
+    progressBar.hidden = true;
+    return;
+  }
+
+  errorText.hidden = true;
+
+  switch (status) {
+    case 'recording':
+      statusText.textContent = 'Recording…';
+      progressBar.hidden = true;
+      break;
+    case 'transcribing':
+      statusText.textContent = `Transcribing… ${progress != null ? `${progress}%` : ''}`;
+      if (progress != null) {
+        progressBar.value = progress;
+        progressBar.hidden = false;
+      }
+      break;
+    case 'summarizing':
+      statusText.textContent = `Summarizing… ${progress != null ? `${progress}%` : ''}`;
+      if (progress != null) {
+        progressBar.value = progress;
+        progressBar.hidden = false;
+      }
+      break;
+    case 'completed':
+      statusText.textContent = text ? `Done: ${text.slice(0, 50)}…` : 'Done';
+      progressBar.hidden = true;
+      break;
+    case 'cancelled':
+      statusText.textContent = 'Cancelled.';
+      progressBar.hidden = true;
+      break;
+    case 'error':
+      statusText.textContent = error || 'An error occurred';
+      progressBar.hidden = true;
+      break;
+    default:
+      statusText.textContent = `Status: ${status}`;
   }
 }
 
-function handleSummaryEvent(event: TranscriptionEvent): void {
-  showTab('summary');
-  if (event.status === 'summarizing') {
-    setHint(summaryStatus, `Summarizing…${typeof event.progress === 'number' ? ` ${event.progress}%` : ''}`, 'busy');
-    summaryError.hidden = true;
-    summarizeBtn.disabled = true;
-    copySummaryBtn.disabled = true;
-    cancelSummaryBtn.hidden = false;
-  } else if (event.status === 'completed') {
-    setHint(summaryStatus, 'Summary ready', 'ok');
-    summaryError.hidden = true;
-    if (typeof event.text === 'string') {
-      // The raw Markdown source stays in #summaryArea; the preview shows the
-      // sanitized, rendered version of exactly this text.
-      summaryArea.value = event.text;
-    }
-    renderSummaryPreview();
-    copySummaryBtn.disabled = !summaryArea.value.trim();
-    summarizeBtn.disabled = !currentText.trim();
-    cancelSummaryBtn.hidden = true;
-    if (event.savedSummaryPath) {
-      showSavedSummaryPath(event.savedSummaryPath);
-    }
-    if (event.saveError) {
-      showSaveError(event.saveError);
-    }
-  } else if (event.status === 'error') {
-    setHint(summaryStatus, '');
-    summaryError.textContent = event.error || 'Summarization failed';
-    summaryError.hidden = false;
-    summarizeBtn.disabled = !currentText.trim();
-    cancelSummaryBtn.hidden = true;
-    if (event.saveError) {
-      showSaveError(event.saveError);
-    }
-  } else if (event.status === 'cancelled') {
-    setHint(summaryStatus, 'Summary cancelled');
-    cancelSummaryBtn.hidden = true;
-    summarizeBtn.disabled = !currentText.trim();
-  }
+function showError(msg: string): void {
+  statusBar.hidden = false;
+  errorText.textContent = msg;
+  errorText.hidden = false;
+  statusText.textContent = '';
 }
 
-function handleDownloadEvent(event: TranscriptionEvent): void {
-  if (event.status === 'downloading') {
-    downloadProgress.hidden = false;
-    hfCancelDownloadBtn.hidden = false;
-    hfDownloadBtn.disabled = true;
-    if (typeof event.progress === 'number') {
-      downloadProgress.value = event.progress;
-    }
-    const percent = typeof event.progress === 'number' ? ` ${event.progress}%` : '';
-    const filePart = event.file ? ` — ${event.file}` : '';
-    setHint(downloadStatus, `Downloading ${event.repoId || 'model'}…${percent}${filePart}`, 'busy');
-  } else if (event.status === 'completed') {
-    downloadProgress.hidden = true;
-    hfCancelDownloadBtn.hidden = true;
-    hfDownloadBtn.disabled = !selectedModelId;
-    downloadProgress.value = 0;
-    setHint(downloadStatus, `Downloaded ${event.repoId || 'model'} to ${event.path || 'cache'}`, 'ok');
-    void refreshModels();
-  } else if (event.status === 'error') {
-    downloadProgress.hidden = true;
-    hfCancelDownloadBtn.hidden = true;
-    hfDownloadBtn.disabled = !selectedModelId;
-    setHint(downloadStatus, event.error || 'Model download failed', 'error');
-    void refreshModels();
-  } else if (event.status === 'cancelled') {
-    downloadProgress.hidden = true;
-    hfCancelDownloadBtn.hidden = true;
-    hfDownloadBtn.disabled = !selectedModelId;
-    setHint(downloadStatus, `Download of ${event.repoId || 'model'} cancelled — partial files stay resumable`, 'ok');
-    // Re-list the cache so the interrupted snapshot shows up as incomplete
-    // (and can be downloaded again) instead of silently vanishing.
-    void refreshModels();
-  }
+// ---------------------------------------------------------------------------
+// Recording pill
+// ---------------------------------------------------------------------------
+
+function startRecordingUI(): void {
+  isRecording = true;
+  recordingStartTime = Date.now();
+  recordingPill.hidden = false;
+  pillLabel.textContent = 'Recording';
+
+  if (recordingInterval) clearInterval(recordingInterval);
+  recordingInterval = window.setInterval(() => {
+    pillTimer.textContent = formatElapsed(Date.now() - recordingStartTime);
+  }, 1000);
+
+  recordBtn.classList.add('recording');
+  recordBtn.querySelector('.action-icon')!.textContent = '⏸';
+  updateStatusBar({ status: 'recording' });
 }
 
-function handleEvent(event: TranscriptionEvent): void {
-  if (event.origin === 'summary') {
+function stopRecordingUI(): void {
+  isRecording = false;
+  if (recordingInterval) {
+    clearInterval(recordingInterval);
+    recordingInterval = undefined;
+  }
+  recordingPill.hidden = true;
+  recordBtn.classList.remove('recording');
+  recordBtn.querySelector('.action-icon')!.textContent = '⏺';
+}
+
+// ---------------------------------------------------------------------------
+// Dictation UI
+// ---------------------------------------------------------------------------
+
+function applyDictationStatus(info: DictationStatusInfo): void {
+  const supported = info.supported;
+  const enabled = info.enabled;
+  const trusted = info.accessibilityTrusted;
+
+  // Banner: show when supported + enabled but not trusted
+  dictationBanner.hidden = !(supported && enabled && !trusted);
+  // Hint: the standard hint when idle and trusted
+  dictationHint.hidden = !supported || !enabled || !trusted || !info.running;
+  dictationHint.textContent = DICTATION_HINT;
+  // Checkbox kept for backward compatibility
+  dictationEnabledChk.checked = enabled;
+}
+
+let dictationStatusInterval: number | undefined;
+function startDictationPolling(): void {
+  if (dictationStatusInterval) return;
+  dictationStatusInterval = window.setInterval(async () => {
+    try {
+      const status = await api.getDictationStatus();
+      applyDictationStatus(status);
+    } catch { /* ignore */ }
+  }, 1500);
+}
+
+// ---------------------------------------------------------------------------
+// Nav helpers
+// ---------------------------------------------------------------------------
+
+function setActiveNav(btn: HTMLButtonElement | null): void {
+  [navHome, navAll, navDictation].forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+}
+
+// ---------------------------------------------------------------------------
+// Transcription event handler
+// ---------------------------------------------------------------------------
+
+function handleTranscriptionEvent(event: TranscriptionEvent): void {
+  const { status, text, progress, error, origin, dictationNotice: notice } = event;
+
+  if (origin === 'dictation') {
+    // Dictation-specific UI updates
+    dictationBadge.hidden = status !== 'recording';
+    if (notice) {
+      setHint(dictationNotice, notice, 'info');
+      dictationNotice.hidden = false;
+      dictationNotice.textContent = notice;
+    }
+    if (status === 'completed' && text) {
+      // Append to existing transcript or create a dictation-log note
+      appendDictationText(text);
+    }
+    return;
+  }
+
+  if (origin === 'download') {
+    // Pass through to download status
+    updateDownloadStatus(event);
+    return;
+  }
+
+  if (origin === 'summary') {
     handleSummaryEvent(event);
     return;
   }
-  if (event.origin === 'download') {
-    handleDownloadEvent(event);
+
+  // Transcription events
+  updateStatusBar({ status, text, progress, error });
+
+  if (status === 'recording') {
+    startRecordingUI();
+  } else if (status === 'transcribing') {
+    stopRecordingUI();
+  } else if (status === 'completed' && text) {
+    stopRecordingUI();
+    handleTranscriptionCompleted(text, event);
+  } else if (status === 'cancelled' || status === 'error') {
+    stopRecordingUI();
+    if (status === 'error' && error) showError(error);
+    setTimeout(() => updateStatusBar({ status: 'idle' }), 3000);
+  }
+}
+
+async function handleTranscriptionCompleted(text: string, event: TranscriptionEvent): Promise<void> {
+  // If we have a pending note to update (from re-transcribe or recording)
+  if (pendingTranscriptNoteId) {
+    const noteId = pendingTranscriptNoteId;
+    pendingTranscriptNoteId = null;
+    await api.updateNote({ id: noteId, transcript: text, markSummaryStale: true });
+    await loadNotes();
+    if (selectedNoteId === noteId) {
+      openNote(noteId);
+    }
     return;
   }
-  updateStatus(event);
+
+  // Create a new note for this transcription
+  const source = 'recording'; // default; import sets this differently
+  const result = await api.createNote({ source, transcript: text });
+  if (result.success && result.note) {
+    await loadNotes();
+    openNote(result.note.id);
+  }
+
+  // Auto-save notification
+  if (event.savedTranscriptPath) {
+    savedTranscriptPath.textContent = `Saved: ${event.savedTranscriptPath}`;
+    savedTranscriptPath.hidden = false;
+    savedPanel.hidden = false;
+  }
+  if (event.savedSummaryPath) {
+    savedSummaryPath.textContent = `Summary: ${event.savedSummaryPath}`;
+    savedSummaryPath.hidden = false;
+    savedPanel.hidden = false;
+  }
+  if (event.saveError) {
+    saveErrorText.textContent = event.saveError;
+    saveErrorText.hidden = false;
+    savedPanel.hidden = false;
+  }
+
+  // Re-enable transcript actions
+  transcriptArea.value = text;
+  copyBtn.disabled = !text;
+  saveBtn.disabled = !text;
+  summarizeBtn.disabled = !text;
+
+  // Scroll back to idle after a brief moment
+  setTimeout(() => updateStatusBar({ status: 'idle' }), 2000);
 }
 
-recordBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.startRecording();
-  } catch (err) {
-    updateStatus({ status: 'error', error: String(err) });
-  }
-});
-
-stopRecordBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.stopRecording();
-  } catch (err) {
-    updateStatus({ status: 'error', error: String(err) });
-  }
-});
-
-importBtn.addEventListener('click', () => {
-  fileInput.click();
-});
-
-fileInput.addEventListener('change', async () => {
-  const file = fileInput.files?.[0];
-  if (!file) return;
-  try {
-    const resolved = window.electronAPI.getPathForFile?.(file) ||
-      (file as unknown as { path?: string }).path ||
-      '';
-    if (!resolved) {
-      throw new Error('Could not resolve the selected file path');
+async function appendDictationText(text: string): Promise<void> {
+  // Append to the selected note if it's a dictation-log note,
+  // otherwise update transcript display inline
+  if (selectedNoteId) {
+    const note = notes.find(n => n.id === selectedNoteId);
+    if (note) {
+      const updated = currentNoteContent.transcript
+        ? currentNoteContent.transcript + '\n\n' + text
+        : text;
+      await api.updateNote({ id: selectedNoteId, transcript: updated });
+      currentNoteContent.transcript = updated;
+      transcriptArea.value = updated;
+      copyBtn.disabled = false;
+      saveBtn.disabled = false;
+      return;
     }
-    await window.electronAPI.importAudio(resolved);
-  } catch (err) {
-    updateStatus({ status: 'error', error: String(err) });
   }
-  fileInput.value = '';
-});
-
-cancelBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.cancelTranscription();
-  } catch (err) {
-    updateStatus({ status: 'error', error: String(err) });
-  }
-});
-
-copyBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.copyTranscript(transcriptArea.value);
-    copyBtn.textContent = 'Copied!';
-    setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
-  } catch (err) {
-    updateStatus({ status: 'error', error: String(err) });
-  }
-});
-
-saveBtn.addEventListener('click', async () => {
-  try {
-    const filePath = await window.electronAPI.requestSavePath?.();
-    if (!filePath) return;
-    const result = await window.electronAPI.saveTranscript({
-      filePath,
-      text: transcriptArea.value,
-    });
-    if (!result.success) {
-      updateStatus({ status: 'error', error: result.error || 'Save failed' });
-    }
-  } catch (err) {
-    updateStatus({ status: 'error', error: String(err) });
-  }
-});
-
-// ---- Tabs -------------------------------------------------------------------
-
-tabTranscript.addEventListener('click', () => showTab('transcript'));
-tabSummary.addEventListener('click', () => showTab('summary'));
-
-// ---- Summary view: Raw / Preview -------------------------------------------
-
-summaryRawBtn.addEventListener('click', () => {
-  summaryView = 'raw';
-  applySummaryView();
-});
-
-summaryPreviewBtn.addEventListener('click', () => {
-  summaryView = 'preview';
-  applySummaryView();
-});
-
-// Copies the RAW Markdown source — never the rendered HTML.
-copySummaryBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.copyTranscript(summaryArea.value);
-    copySummaryBtn.textContent = 'Copied!';
-    setTimeout(() => (copySummaryBtn.textContent = 'Copy Markdown'), 1500);
-  } catch (err) {
-    summaryError.textContent = String(err);
-    summaryError.hidden = false;
-  }
-});
-
-summarizeBtn.addEventListener('click', async () => {
-  try {
-    const result = await window.electronAPI.summarize(transcriptArea.value);
-    if (!result.started) {
-      showTab('summary');
-      summaryError.textContent = result.error || 'Cannot start summarization';
-      summaryError.hidden = false;
-    }
-  } catch (err) {
-    showTab('summary');
-    summaryError.textContent = String(err);
-    summaryError.hidden = false;
-  }
-});
-
-cancelSummaryBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.cancelSummary();
-  } catch (err) {
-    summaryError.textContent = String(err);
-    summaryError.hidden = false;
-  }
-});
-
-// ---- Settings ---------------------------------------------------------------
-
-function openSettings(open: boolean): void {
-  settingsPanel.hidden = !open;
-  settingsBtn.setAttribute('aria-expanded', String(open));
-  if (open && !hfLoaded) {
-    void refreshModels();
-  }
-}
-
-settingsBtn.addEventListener('click', () => {
-  openSettings(settingsPanel.hidden);
-});
-
-function ensureModelOption(model: string): void {
-  if (!model) return;
-  const exists = Array.from(llmModelSelect.options).some((option) => option.value === model);
-  if (!exists) {
-    const option = document.createElement('option');
-    option.value = model;
-    option.textContent = model;
-    llmModelSelect.appendChild(option);
-  }
-  llmModelSelect.value = model;
-}
-
-function updatePromptPathStatus(dataDir: string): void {
-  if (dataDir) {
-    setHint(promptPathStatus, `Prompt template: ${dataDir}/scripts/summarize-prompt.md`);
+  // Fallback: show in transcript area
+  if (transcriptArea.value) {
+    transcriptArea.value += '\n\n' + text;
   } else {
-    setHint(promptPathStatus, 'Using the built-in prompt (choose a data directory for an editable copy)');
+    transcriptArea.value = text;
+  }
+  copyBtn.disabled = false;
+  saveBtn.disabled = false;
+}
+
+function handleSummaryEvent(event: TranscriptionEvent): void {
+  const { status, text, progress, error } = event;
+
+  if (status === 'summarizing') {
+    setHint(summaryStatus, progress != null ? `Summarizing… ${progress}%` : 'Summarizing…');
+    cancelSummaryBtn.hidden = false;
+    summarizeBtn.hidden = true;
+  } else if (status === 'completed' && text) {
+    setHint(summaryStatus, '');
+    cancelSummaryBtn.hidden = true;
+    summarizeBtn.hidden = false;
+    currentNoteContent.summary = text;
+    summaryArea.value = text;
+    copySummaryBtn.disabled = false;
+    if (summaryView === 'preview') renderMarkdown(text);
+    summaryStaleHint.hidden = true;
+
+    // Persist summary to the current note
+    if (selectedNoteId) {
+      api.updateNote({ id: selectedNoteId, summary: text, clearSummaryStale: true }).catch(console.error);
+    }
+    if (event.savedSummaryPath) {
+      savedSummaryPath.textContent = `Summary saved: ${event.savedSummaryPath}`;
+      savedSummaryPath.hidden = false;
+      savedPanel.hidden = false;
+    }
+  } else if (status === 'cancelled') {
+    setHint(summaryStatus, 'Summary cancelled.');
+    cancelSummaryBtn.hidden = true;
+    summarizeBtn.hidden = false;
+  } else if (status === 'error') {
+    setHint(summaryError, error || 'Summary failed');
+    summaryError.hidden = false;
+    cancelSummaryBtn.hidden = true;
+    summarizeBtn.hidden = false;
   }
 }
 
-function applySettingsToForm(settings: AppSettings): void {
-  currentSettings = settings;
-  pythonPathInput.value = settings.pythonPath;
-  llmBaseUrlInput.value = settings.llmBaseUrl;
-  ensureModelOption(settings.llmModel);
-  llmApiKeyInput.value = settings.llmApiKey;
-  dataDirInput.value = settings.dataDir;
-  cacheDirInput.value = settings.sttCacheDir;
-  summarizeEnabledChk.checked = settings.summarizationEnabled;
-  autoSummarizeChk.checked = settings.autoSummarize;
-  dictationEnabledChk.checked = settings.dictationEnabled !== false;
-  activeModel = settings.activeModel;
-  updatePromptPathStatus(settings.dataDir);
-  if (settings.dataDir) {
-    setHint(dataDirStatus, `Ready: ${settings.dataDir}/transcripts, /summaries, /scripts`, 'ok');
-  } else {
-    setHint(dataDirStatus, '');
+function updateDownloadStatus(event: TranscriptionEvent): void {
+  const { status, progress, file, bytesDone, bytesTotal, error } = event;
+  if (status === 'downloading') {
+    const pct = progress != null ? `${Math.round(progress)}%` : '';
+    const bytes = bytesTotal ? ` (${Math.round((bytesDone || 0) / 1024 / 1024)}/${Math.round(bytesTotal / 1024 / 1024)} MB)` : '';
+    setHint(downloadStatus, `Downloading ${file || ''}… ${pct}${bytes}`);
+    if (progress != null) {
+      downloadProgress.value = progress;
+      downloadProgress.hidden = false;
+    }
+    hfCancelDownloadBtn.hidden = false;
+  } else if (status === 'completed') {
+    setHint(downloadStatus, 'Download complete!', 'ok');
+    downloadProgress.hidden = true;
+    hfCancelDownloadBtn.hidden = true;
+    loadHfModels(); // refresh installed list
+  } else if (status === 'error') {
+    setHint(downloadStatus, error || 'Download failed', 'error');
+    downloadProgress.hidden = true;
+    hfCancelDownloadBtn.hidden = true;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Tab switching
+// ---------------------------------------------------------------------------
+
+function switchTab(which: 'transcript' | 'summary'): void {
+  const showTranscript = which === 'transcript';
+  tabTranscript.classList.toggle('active', showTranscript);
+  tabTranscript.setAttribute('aria-selected', String(showTranscript));
+  tabSummary.classList.toggle('active', !showTranscript);
+  tabSummary.setAttribute('aria-selected', String(!showTranscript));
+  transcriptPanel.hidden = !showTranscript;
+  summaryPanel.hidden = showTranscript;
+}
+
+function switchSummaryView(view: SummaryView): void {
+  summaryView = view;
+  const isRaw = view === 'raw';
+  summaryRawBtn.classList.toggle('active', isRaw);
+  summaryRawBtn.setAttribute('aria-pressed', String(isRaw));
+  summaryPreviewBtn.classList.toggle('active', !isRaw);
+  summaryPreviewBtn.setAttribute('aria-pressed', String(!isRaw));
+  summaryArea.hidden = !isRaw;
+  summaryPreview.hidden = isRaw;
+  if (!isRaw) renderMarkdown(currentNoteContent.summary);
+}
+
+// ---------------------------------------------------------------------------
+// Settings panel
+// ---------------------------------------------------------------------------
+
+function openSettings(): void {
+  settingsPanel.hidden = false;
+  settingsBtn.setAttribute('aria-expanded', 'true');
+  loadSettings();
+}
+
+function closeSettings(): void {
+  settingsPanel.hidden = true;
+  settingsBtn.setAttribute('aria-expanded', 'false');
 }
 
 async function loadSettings(): Promise<void> {
   try {
-    const settings = await window.electronAPI.getSettings();
-    applySettingsToForm(settings);
+    currentSettings = await api.getSettings();
+    if (!currentSettings) return;
+    pythonPathInput.value = currentSettings.pythonPath || '';
+    llmBaseUrlInput.value = currentSettings.llmBaseUrl || '';
+    llmApiKeyInput.value = currentSettings.llmApiKey || '';
+    dataDirInput.value = currentSettings.dataDir || '';
+    cacheDirInput.value = currentSettings.sttCacheDir || '';
+    summarizeEnabledChk.checked = currentSettings.summarizationEnabled;
+    autoSummarizeChk.checked = currentSettings.autoSummarize;
+    (document.getElementById('settingsDictationChk') as HTMLInputElement).checked = currentSettings.dictationEnabled;
+    activeModel = currentSettings.activeModel || '';
+    setHint(promptPathStatus, activeModel ? `Active model: ${activeModel}` : 'No STT model selected');
   } catch (err) {
-    setHint(settingsStatus, `Cannot load settings: ${String(err)}`, 'error');
+    setHint(settingsStatus, String(err), 'error');
   }
 }
 
-settingsSaveBtn.addEventListener('click', async () => {
-  setHint(settingsStatus, 'Saving…', 'busy');
+async function saveSettings(): Promise<void> {
+  const patch: Partial<AppSettings> = {
+    pythonPath: pythonPathInput.value.trim(),
+    llmBaseUrl: llmBaseUrlInput.value.trim(),
+    llmModel: llmModelSelect.value,
+    llmApiKey: llmApiKeyInput.value.trim(),
+    dataDir: dataDirInput.value.trim(),
+    sttCacheDir: cacheDirInput.value.trim(),
+    summarizationEnabled: summarizeEnabledChk.checked,
+    autoSummarize: autoSummarizeChk.checked,
+    dictationEnabled: (document.getElementById('settingsDictationChk') as HTMLInputElement).checked,
+  };
+  if (activeModel) patch.activeModel = activeModel;
+
   try {
-    const result = await window.electronAPI.updateSettings({
-      pythonPath: pythonPathInput.value.trim(),
-      llmBaseUrl: llmBaseUrlInput.value.trim(),
-      llmModel: llmModelSelect.value,
-      llmApiKey: llmApiKeyInput.value,
-      dataDir: dataDirInput.value.trim(),
-      sttCacheDir: cacheDirInput.value.trim(),
-      summarizationEnabled: summarizeEnabledChk.checked,
-      autoSummarize: autoSummarizeChk.checked,
-      dictationEnabled: dictationEnabledChk.checked,
-    });
-
-    applySettingsToForm(result.settings);
-    void refreshDictationStatus();
-
-    const messages = result.messages || {};
+    const result = await api.updateSettings(patch);
+    currentSettings = result.settings;
     const errors = result.errors || {};
-
-    if (errors.pythonPath) {
-      setHint(pythonStatus, errors.pythonPath, 'error');
+    const hasErrors = Object.keys(errors).length > 0;
+    if (hasErrors) {
+      setHint(settingsStatus, Object.values(errors).join('; '), 'error');
     } else {
-      setHint(pythonStatus, messages.pythonPath || '', messages.pythonPath ? 'ok' : '');
+      setHint(settingsStatus, 'Settings saved.', 'ok');
     }
-
-    if (errors.dataDir) {
-      setHint(dataDirStatus, errors.dataDir, 'error');
-    } else if (result.settings.dataDir) {
-      setHint(dataDirStatus, `Ready: ${result.settings.dataDir}/transcripts, /summaries, /scripts`, 'ok');
-    } else {
-      setHint(dataDirStatus, '');
-    }
-
-    if (errors.sttCacheDir) {
-      setHint(cacheDirStatus, errors.sttCacheDir, 'error');
-    } else if (result.settings.sttCacheDir) {
-      setHint(cacheDirStatus, `Model cache: ${result.settings.sttCacheDir}`, 'ok');
-    } else {
-      setHint(cacheDirStatus, '');
-    }
-
-    const errorList = Object.values(errors).filter(Boolean);
-    if (errorList.length > 0) {
-      setHint(settingsStatus, `Saved with issues: ${errorList.join(' | ')}`, 'error');
-    } else {
-      setHint(settingsStatus, 'Settings saved', 'ok');
-    }
-    void refreshModels();
+    if (errors.pythonPath) setHint(pythonStatus, errors.pythonPath, 'error');
+    if (errors.dataDir) setHint(dataDirStatus, errors.dataDir, 'error');
+    if (errors.sttCacheDir) setHint(cacheDirStatus, errors.sttCacheDir, 'error');
+    const messages = result.messages || {};
+    if (messages.pythonPath) setHint(pythonStatus, messages.pythonPath, errors.pythonPath ? 'error' : 'ok');
+    setTimeout(() => setHint(settingsStatus, ''), 3000);
   } catch (err) {
-    setHint(settingsStatus, `Cannot save settings: ${String(err)}`, 'error');
-  }
-});
-
-pythonValidateBtn.addEventListener('click', async () => {
-  setHint(pythonStatus, 'Validating…', 'busy');
-  try {
-    const validation = await window.electronAPI.validatePython(pythonPathInput.value.trim());
-    setHint(pythonStatus, validation.message, validation.ok ? 'ok' : 'error');
-  } catch (err) {
-    setHint(pythonStatus, String(err), 'error');
-  }
-});
-
-pythonBrowseBtn.addEventListener('click', async () => {
-  try {
-    const filePath = await window.electronAPI.pickPythonFile();
-    if (filePath) {
-      pythonPathInput.value = filePath;
-    }
-  } catch (err) {
-    setHint(pythonStatus, String(err), 'error');
-  }
-});
-
-dataDirBrowseBtn.addEventListener('click', async () => {
-  try {
-    const dir = await window.electronAPI.pickDirectory('Choose the data directory');
-    if (dir) {
-      dataDirInput.value = dir;
-    }
-  } catch (err) {
-    setHint(dataDirStatus, String(err), 'error');
-  }
-});
-
-cacheDirBrowseBtn.addEventListener('click', async () => {
-  try {
-    const dir = await window.electronAPI.pickDirectory('Choose the model cache directory');
-    if (dir) {
-      cacheDirInput.value = dir;
-    }
-  } catch (err) {
-    setHint(cacheDirStatus, String(err), 'error');
-  }
-});
-
-/**
- * The summarizer talks to /chat/completions, so embedding, reranker and
- * other non-chat models are dead entries in the dropdown.
- */
-function isChatCapableModel(modelId: string): boolean {
-  const id = (modelId || '').trim().toLowerCase();
-  if (!id) {
-    return false;
-  }
-  const nonChat = [
-    /(^|[-_./])embed/, // text-embedding-*, nomic-embed-*, *-embedding-*
-    /(^|[-_./])rerank/,
-    /(^|[-_./])retrieval/,
-    /(^|[-_./])bge[-_]/,
-    /(^|[-_./])e5[-_]/,
-    /(^|[-_./])gte[-_]/,
-    /(^|[-_./])minilm/,
-    /(^|[-_./])stella[-_]/,
-    /(^|[-_./])whisper/,
-    /(^|[-_./])tts([-_.]|$)/,
-    /(^|[-_./])asr([-_.]|$)/,
-    /(^|[-_./])clip([-_.]|$)/,
-    /(^|[-_./])stable-diffusion/,
-    /(^|[-_./])flux[-_.]/,
-  ];
-  return !nonChat.some((pattern) => pattern.test(id));
-}
-
-async function loadLlmModels(baseUrl: string, showStatus: boolean): Promise<void> {
-  if (showStatus) {
-    setHint(llmStatus, 'Loading models…', 'busy');
-  }
-  try {
-    const result = await window.electronAPI.testLlmConnection(baseUrl);
-    const previous = llmModelSelect.value || currentSettings?.llmModel || '';
-    llmModelSelect.innerHTML = '<option value="">— none —</option>';
-    let listed = 0;
-    for (const model of result.models) {
-      if (!isChatCapableModel(model)) {
-        continue;
-      }
-      const option = document.createElement('option');
-      option.value = model;
-      option.textContent = model;
-      llmModelSelect.appendChild(option);
-      listed += 1;
-    }
-    ensureModelOption(previous);
-    if (listed > 0 && previous) {
-      llmModelSelect.value = previous;
-    }
-    if (showStatus) {
-      setHint(llmStatus, result.message, result.ok ? 'ok' : 'error');
-    }
-  } catch (err) {
-    if (showStatus) {
-      setHint(llmStatus, String(err), 'error');
-    }
+    setHint(settingsStatus, String(err), 'error');
   }
 }
 
-llmBaseUrlInput.addEventListener('input', () => {
-  if (llmLoadTimer) {
-    window.clearTimeout(llmLoadTimer);
-  }
-  llmLoadTimer = window.setTimeout(() => {
-    void loadLlmModels(llmBaseUrlInput.value.trim(), false);
-  }, 500);
-});
+// ---------------------------------------------------------------------------
+// HF model browser (preserving the existing UX from cycle 2)
+// ---------------------------------------------------------------------------
 
-llmRefreshBtn.addEventListener('click', () => {
-  void loadLlmModels(llmBaseUrlInput.value.trim(), true);
-});
+async function loadHfModels(query = ''): Promise<void> {
+  setHint(hfStatus, 'Loading models…');
+  hfResults.innerHTML = '';
+  hfInstalled.innerHTML = '';
 
-llmTestBtn.addEventListener('click', () => {
-  void loadLlmModels(llmBaseUrlInput.value.trim(), true);
-});
-
-// ---- Hugging Face model browser --------------------------------------------
-
-function formatDownloads(downloads: number): string {
-  if (!Number.isFinite(downloads) || downloads <= 0) return '0';
-  if (downloads >= 1000000) return `${(downloads / 1000000).toFixed(1)}M`;
-  if (downloads >= 1000) return `${(downloads / 1000).toFixed(1)}k`;
-  return String(downloads);
-}
-
-function renderModelRow(
-  model: HfModelInfo,
-  container: HTMLElement,
-  installed: boolean,
-  active: boolean,
-  partial = false
-): HTMLElement {
-  const row = document.createElement('div');
-  row.className = 'model-row';
-  row.setAttribute('role', 'listitem');
-  row.dataset.repoId = model.id;
-
-  const label = document.createElement('span');
-  label.className = 'model-id';
-  label.textContent = model.id;
-  row.appendChild(label);
-
-  const meta = document.createElement('span');
-  meta.className = 'model-meta';
-  meta.textContent = `${formatDownloads(model.downloads)} downloads · ${model.format}`;
-  row.appendChild(meta);
-
-  if (installed || partial) {
-    const badge = document.createElement('span');
-    badge.className = partial ? 'badge partial' : 'badge';
-    badge.textContent = partial
-      ? active
-        ? 'active · incomplete'
-        : 'incomplete'
-      : active
-        ? 'active'
-        : 'installed';
-    row.appendChild(badge);
-  }
-
-  if (partial) {
-    row.classList.add('partial');
-    row.title = `${model.id} — download was interrupted; download it again to finish`;
-  }
-
-  if (model.kind === 'unsupported') {
-    row.classList.add('unsupported');
-    row.title = model.reason || 'Cannot run locally';
-    const reason = document.createElement('span');
-    reason.className = 'model-reason';
-    reason.textContent = model.reason || 'Cannot run locally as speech-to-text';
-    row.appendChild(reason);
-  } else {
-    row.addEventListener('click', () => selectModel(model.id, container === hfInstalled));
-  }
-
-  container.appendChild(row);
-  return row;
-}
-
-function selectModel(repoId: string, fromInstalled: boolean): void {
-  selectedModelId = repoId;
-  const rows = hfResults.querySelectorAll('.model-row');
-  rows.forEach((row) => {
-    row.classList.toggle('selected', (row as HTMLElement).dataset.repoId === repoId);
-  });
-  const isInstalled = installedModels.includes(repoId);
-  const isPartial = partialModels.includes(repoId);
-  // A partial snapshot can be downloaded again (and finished), but it is
-  // never "installed": it must not be offered as a working model.
-  hfDownloadBtn.disabled = !repoId || (isInstalled && !isPartial);
-  hfUseBtn.disabled = (!isInstalled && !isPartial) || repoId === activeModel;
-  hfUseBtn.textContent = repoId === activeModel ? 'Active' : 'Set active';
-  if (isPartial && !isInstalled) {
-    setHint(
-      hfStatus,
-      `${repoId} is incomplete — its download was interrupted. Download it again to finish before setting it active.`,
-      'error'
-    );
-  } else if (fromInstalled) {
-    setHint(hfStatus, `Selected ${repoId}`, 'ok');
-  }
-}
-
-async function refreshModels(): Promise<void> {
   try {
-    const result = await window.electronAPI.listHfModels(hfSearchInput.value.trim());
+    const result = await api.listHfModels(query);
     installedModels = result.installed || [];
     partialModels = result.partial || [];
-    activeModel = result.activeModel || '';
-    renderSearchResults(result);
-    renderInstalled(result);
-    hfLoaded = true;
+    activeModel = result.activeModel || activeModel;
+
     if (result.error) {
       setHint(hfStatus, result.error, 'error');
+    } else {
+      setHint(hfStatus, `${result.models.length} model${result.models.length !== 1 ? 's' : ''} found`);
     }
+
+    // Installed
+    for (const id of installedModels) {
+      const el = document.createElement('div');
+      el.className = 'hf-model-item' + (id === selectedModelId ? ' selected' : '');
+      el.innerHTML = `<span class="hf-model-id">${id}</span><span class="hf-model-format">Installed${id === activeModel ? ' ✓ Active' : ''}</span>`;
+      el.addEventListener('click', () => { selectedModelId = id; renderHfSelection(); });
+      hfInstalled.appendChild(el);
+    }
+
+    // Search results
+    for (const model of result.models) {
+      const el = document.createElement('div');
+      el.className = 'hf-model-item' + (model.id === selectedModelId ? ' selected' : '');
+      el.innerHTML = `<span class="hf-model-id">${model.id}</span><span class="hf-model-format">${model.format}</span>`;
+      if (model.kind === 'unsupported') el.style.opacity = '0.5';
+      el.addEventListener('click', () => {
+        if (model.kind !== 'unsupported') { selectedModelId = model.id; renderHfSelection(); }
+      });
+      hfResults.appendChild(el);
+    }
+
+    hfLoaded = true;
+    renderHfSelection();
   } catch (err) {
     setHint(hfStatus, String(err), 'error');
   }
 }
 
-function renderSearchResults(result: HfModelListResult): void {
-  hfResults.innerHTML = '';
-  if (result.error) {
-    setHint(hfStatus, result.error, 'error');
-    return;
-  }
-  if (result.models.length === 0) {
-    setHint(hfStatus, 'No models found', '');
-    return;
-  }
-  setHint(hfStatus, `${result.models.length} model(s) — click a row to select it`, 'ok');
-  for (const model of result.models) {
-    const row = renderModelRow(
-      model,
-      hfResults,
-      installedModels.includes(model.id),
-      model.id === activeModel,
-      partialModels.includes(model.id)
-    );
-    if (model.id === activeModel) {
-      row.classList.add('selected');
-    }
-  }
+function renderHfSelection(): void {
+  const hasSelection = !!selectedModelId;
+  const isInstalled = installedModels.includes(selectedModelId || '');
+  document.getElementById('hfActions')!.hidden = !hasSelection;
+  hfDownloadBtn.hidden = isInstalled;
+  hfUseBtn.hidden = !isInstalled;
+  // Update selected styling
+  document.querySelectorAll('.hf-model-item').forEach(el => {
+    el.classList.toggle('selected', el.querySelector('.hf-model-id')?.textContent === selectedModelId);
+  });
 }
 
-function renderInstalled(result: HfModelListResult): void {
-  hfInstalled.innerHTML = '';
-  const installed = result.installed || [];
-  const partial = result.partial || [];
-  if (installed.length === 0 && partial.length === 0) {
-    const empty = document.createElement('p');
-    empty.className = 'hint';
-    empty.textContent = `Nothing installed yet in ${currentSettings?.sttCacheDir || 'the cache directory'}`;
-    hfInstalled.appendChild(empty);
-    return;
-  }
-  for (const repoId of installed) {
-    renderModelRow(
-      {
-        id: repoId,
-        downloads: 0,
-        pipelineTag: 'automatic-speech-recognition',
-        tags: [],
-        kind: 'pytorch',
-        format: installedFormat(repoId),
-      },
-      hfInstalled,
-      true,
-      repoId === result.activeModel
-    );
-  }
-  // Interrupted downloads are listed apart from installed models: they can be
-  // downloaded again, but never activated or used for transcription.
-  for (const repoId of partial) {
-    renderModelRow(
-      {
-        id: repoId,
-        downloads: 0,
-        pipelineTag: 'automatic-speech-recognition',
-        tags: [],
-        kind: 'pytorch',
-        format: installedFormat(repoId),
-      },
-      hfInstalled,
-      false,
-      repoId === result.activeModel,
-      true
-    );
-  }
-  if (result.activeModel && partial.includes(result.activeModel)) {
-    setHint(
-      hfStatus,
-      `Active model ${result.activeModel} is incomplete — its download was interrupted. Download it again before transcribing.`,
-      'error'
-    );
-  }
-}
+// ---------------------------------------------------------------------------
+// Event wiring
+// ---------------------------------------------------------------------------
 
-function installedFormat(repoId: string): string {
-  if (repoId.toLowerCase().includes('faster-whisper')) return 'CTranslate2';
-  return 'PyTorch';
-}
-
-function runHfSearch(): void {
-  if (hfSearchTimer) {
-    window.clearTimeout(hfSearchTimer);
-    hfSearchTimer = undefined;
-  }
-  setHint(hfStatus, 'Searching…', 'busy');
-  void refreshModels();
-}
-
-hfSearchInput.addEventListener('input', () => {
-  if (hfSearchTimer) {
-    window.clearTimeout(hfSearchTimer);
-  }
-  hfSearchTimer = window.setTimeout(runHfSearch, 400);
+// Search
+searchInput.addEventListener('input', () => {
+  const q = searchInput.value.trim();
+  searchClearBtn.hidden = !q;
+  clearTimeout(hfSearchTimer);
+  hfSearchTimer = window.setTimeout(() => loadNotes(q), 300);
 });
 
-hfSearchBtn.addEventListener('click', runHfSearch);
+searchClearBtn.addEventListener('click', () => {
+  searchInput.value = '';
+  searchClearBtn.hidden = true;
+  loadNotes();
+});
+
+// Keyboard shortcut for search
+document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault();
+    searchInput.focus();
+  }
+});
+
+// Navigation
+navHome.addEventListener('click', () => {
+  currentView = 'home';
+  notesListLabel.textContent = 'Recent';
+  setActiveNav(navHome);
+  renderFolderList();
+  renderNoteList();
+});
+
+navAll.addEventListener('click', () => {
+  currentView = 'all';
+  notesListLabel.textContent = 'All notes';
+  setActiveNav(navAll);
+  renderFolderList();
+  renderNoteList();
+});
+
+navDictation.addEventListener('click', () => {
+  currentView = 'dictation';
+  notesListLabel.textContent = 'Dictation log';
+  setActiveNav(navDictation);
+  renderFolderList();
+  renderNoteList();
+});
+
+addFolderBtn.addEventListener('click', () => {
+  const name = prompt('Folder name:');
+  if (!name || !name.trim()) return;
+  const folderName = name.trim();
+  if (!folders.includes(folderName)) folders.push(folderName);
+  renderFolderList();
+});
+
+// Record buttons (sidebar + empty state)
+async function startRecording(): Promise<void> {
+  try {
+    await api.startRecording();
+    // The recording event will arrive via onTranscriptionEvent
+    pendingTranscriptNoteId = null;
+  } catch (err) {
+    showError(String(err));
+  }
+}
+
+recordBtn.addEventListener('click', startRecording);
+emptyRecordBtn?.addEventListener('click', startRecording);
+
+// Stop / cancel recording
+stopRecordBtn.addEventListener('click', async () => {
+  try {
+    await api.stopRecording();
+  } catch (err) {
+    showError(String(err));
+  }
+});
+
+cancelBtn.addEventListener('click', async () => {
+  try {
+    await api.cancelTranscription();
+    stopRecordingUI();
+    updateStatusBar({ status: 'idle' });
+  } catch (err) {
+    showError(String(err));
+  }
+});
+
+// Import audio
+async function importAudio(): Promise<void> {
+  fileInput.click();
+}
+
+importBtn.addEventListener('click', importAudio);
+emptyImportBtn?.addEventListener('click', importAudio);
+
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files?.[0];
+  if (!file) return;
+  const filePath = api.getPathForFile ? api.getPathForFile(file) : (file as unknown as { path?: string }).path || '';
+  if (!filePath) { showError('Could not get file path'); return; }
+  fileInput.value = '';
+  try {
+    await api.importAudio(filePath);
+    // transcription will start; we'll create a note on completion
+    // Store the filename to use as the note title
+    pendingTranscriptNoteId = null;
+  } catch (err) {
+    showError(String(err));
+  }
+});
+
+// Tabs
+tabTranscript.addEventListener('click', () => switchTab('transcript'));
+tabSummary.addEventListener('click', () => switchTab('summary'));
+summaryRawBtn.addEventListener('click', () => switchSummaryView('raw'));
+summaryPreviewBtn.addEventListener('click', () => switchSummaryView('preview'));
+
+// Transcript copy / save
+copyBtn.addEventListener('click', async () => {
+  await api.copyTranscript(transcriptArea.value);
+  copyBtn.textContent = 'Copied!';
+  setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+});
+
+saveBtn.addEventListener('click', async () => {
+  const filePath = await api.requestSavePath();
+  if (!filePath) return;
+  const result = await api.saveTranscript({ filePath, text: transcriptArea.value });
+  if (result.success) {
+    savedTranscriptPath.textContent = `Saved: ${result.filePath}`;
+    savedTranscriptPath.hidden = false;
+    savedPanel.hidden = false;
+  } else {
+    showError(result.error || 'Save failed');
+  }
+});
+
+// Summarize
+summarizeBtn.addEventListener('click', async () => {
+  const result = await api.summarize(transcriptArea.value || undefined);
+  if (!result.started && result.error) setHint(summaryStatus, result.error, 'error');
+  else switchTab('summary');
+});
+
+cancelSummaryBtn.addEventListener('click', async () => {
+  await api.cancelSummary();
+});
+
+copySummaryBtn.addEventListener('click', async () => {
+  await api.copyTranscript(summaryArea.value);
+  copySummaryBtn.textContent = 'Copied!';
+  setTimeout(() => { copySummaryBtn.textContent = 'Copy Markdown'; }, 1500);
+});
+
+// Note detail actions
+noteTitle.addEventListener('blur', async () => {
+  if (!selectedNoteId) return;
+  const newTitle = noteTitle.value.trim();
+  if (!newTitle) return;
+  await api.updateNote({ id: selectedNoteId, title: newTitle });
+  await loadNotes();
+});
+
+noteFolderSelect.addEventListener('change', async () => {
+  if (!selectedNoteId) return;
+  await api.updateNote({ id: selectedNoteId, folder: noteFolderSelect.value });
+  await loadNotes();
+});
+
+reTranscribeBtn.addEventListener('click', async () => {
+  if (!selectedNoteId) return;
+  const result = await api.reTranscribe(selectedNoteId);
+  if (!result.started) {
+    showError(result.error || 'Re-transcribe failed to start');
+    return;
+  }
+  pendingTranscriptNoteId = selectedNoteId;
+  updateStatusBar({ status: 'transcribing' });
+});
+
+deleteNoteBtn.addEventListener('click', async () => {
+  if (!selectedNoteId) return;
+  const note = notes.find(n => n.id === selectedNoteId);
+  if (!confirm(`Delete "${note?.title || 'this note'}"? This cannot be undone.`)) return;
+  await api.deleteNote(selectedNoteId);
+  selectedNoteId = null;
+  emptyState.hidden = false;
+  noteDetail.hidden = true;
+  await loadNotes();
+});
+
+// Dictation
+dictationGrantBtn.addEventListener('click', async () => {
+  await api.requestDictationAccess();
+  const status = await api.getDictationStatus();
+  applyDictationStatus(status);
+});
+
+// Settings
+settingsBtn.addEventListener('click', openSettings);
+settingsCloseBtn.addEventListener('click', closeSettings);
+settingsSaveBtn.addEventListener('click', saveSettings);
+
+pythonBrowseBtn.addEventListener('click', async () => {
+  const p = await api.pickPythonFile();
+  if (p) pythonPathInput.value = p;
+});
+
+pythonValidateBtn.addEventListener('click', async () => {
+  setHint(pythonStatus, 'Validating…');
+  const result = await api.validatePython(pythonPathInput.value.trim());
+  setHint(pythonStatus, result.message, result.ok ? 'ok' : 'error');
+});
+
+dataDirBrowseBtn.addEventListener('click', async () => {
+  const p = await api.pickDirectory('Choose data directory');
+  if (p) dataDirInput.value = p;
+});
+
+cacheDirBrowseBtn.addEventListener('click', async () => {
+  const p = await api.pickDirectory('Choose model cache directory');
+  if (p) cacheDirInput.value = p;
+});
+
+llmRefreshBtn.addEventListener('click', async () => {
+  clearTimeout(llmLoadTimer);
+  setHint(llmStatus, 'Loading models…');
+  const url = llmBaseUrlInput.value.trim() || currentSettings?.llmBaseUrl;
+  const result = await api.testLlmConnection(url);
+  llmModelSelect.innerHTML = '';
+  for (const m of result.models) {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    llmModelSelect.appendChild(opt);
+  }
+  if (currentSettings?.llmModel) llmModelSelect.value = currentSettings.llmModel;
+  setHint(llmStatus, result.message, result.ok ? 'ok' : 'error');
+});
+
+llmTestBtn.addEventListener('click', async () => {
+  setHint(llmStatus, 'Testing…');
+  const url = llmBaseUrlInput.value.trim() || currentSettings?.llmBaseUrl;
+  const result = await api.testLlmConnection(url);
+  setHint(llmStatus, result.message, result.ok ? 'ok' : 'error');
+});
+
+hfSearchBtn.addEventListener('click', () => loadHfModels(hfSearchInput.value.trim()));
+
+hfSearchInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') loadHfModels(hfSearchInput.value.trim());
+});
 
 hfDownloadBtn.addEventListener('click', async () => {
   if (!selectedModelId) return;
-  setHint(downloadStatus, `Starting download of ${selectedModelId}…`, 'busy');
-  downloadProgress.hidden = false;
-  downloadProgress.value = 0;
-  try {
-    const result = await window.electronAPI.downloadModel(selectedModelId);
-    if (!result.started) {
-      downloadProgress.hidden = true;
-      setHint(downloadStatus, result.error || 'Download failed to start', 'error');
-    }
-  } catch (err) {
-    downloadProgress.hidden = true;
-    setHint(downloadStatus, String(err), 'error');
-  }
-});
-
-hfCancelDownloadBtn.addEventListener('click', async () => {
-  try {
-    await window.electronAPI.cancelDownload();
-  } catch (err) {
-    setHint(downloadStatus, String(err), 'error');
-  }
+  setHint(downloadStatus, 'Starting download…');
+  const result = await api.downloadModel(selectedModelId);
+  if (!result.started && result.error) setHint(downloadStatus, result.error, 'error');
 });
 
 hfUseBtn.addEventListener('click', async () => {
   if (!selectedModelId) return;
-  if (partialModels.includes(selectedModelId)) {
-    setHint(
-      hfStatus,
-      `Cannot set ${selectedModelId} active: its download is incomplete. Download it again to finish, then set it active.`,
-      'error'
-    );
-    return;
-  }
-  try {
-    const result = await window.electronAPI.updateSettings({ activeModel: selectedModelId });
-    applySettingsToForm(result.settings);
-    activeModel = result.settings.activeModel;
-    setHint(hfStatus, `Active model: ${activeModel || 'none (fallback chain)'}`, 'ok');
-    await refreshModels();
-  } catch (err) {
-    setHint(hfStatus, String(err), 'error');
-  }
+  activeModel = selectedModelId;
+  setHint(promptPathStatus, `Active model: ${activeModel}`, 'ok');
 });
 
-// ---- Dictation status (hold Option) ----------------------------------------
+hfCancelDownloadBtn.addEventListener('click', async () => {
+  await api.cancelDownload();
+  hfCancelDownloadBtn.hidden = true;
+  downloadProgress.hidden = true;
+  setHint(downloadStatus, 'Download cancelled.');
+});
 
-function applyDictationStatus(status: DictationStatusInfo): void {
-  const needsGrant = status.supported && status.enabled && !status.accessibilityTrusted;
-  dictationBanner.hidden = !needsGrant;
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
 
-  if (!status.supported) {
-    setHint(dictationStatusHint, 'Dictation unavailable: uiohook-napi failed to load', 'error');
-  } else if (!status.enabled) {
-    setHint(dictationStatusHint, 'Dictation is switched off', '');
-  } else if (needsGrant) {
-    setHint(dictationStatusHint, 'Grant Accessibility to start dictation', 'error');
-  } else if (status.running) {
-    setHint(dictationStatusHint, DICTATION_HINT, 'ok');
-  } else {
-    setHint(dictationStatusHint, `Dictation not listening${status.reason ? ` (${status.reason})` : ''}`, 'error');
-  }
-}
+async function init(): Promise<void> {
+  // Load notes
+  await loadNotes();
 
-async function refreshDictationStatus(): Promise<void> {
+  // Restore status
   try {
-    applyDictationStatus(await window.electronAPI.getDictationStatus());
-  } catch (err) {
-    setHint(dictationStatusHint, `Cannot read dictation status: ${String(err)}`, 'error');
-  }
-}
-
-dictationGrantBtn.addEventListener('click', () => {
-  void (async () => {
-    dictationGrantBtn.disabled = true;
-    try {
-      // ask === true shows the system prompt; trust arrives asynchronously,
-      // so poll for a while before giving up.
-      let status = await window.electronAPI.requestDictationAccess();
-      applyDictationStatus(status);
-      for (let attempt = 0; attempt < 40 && !status.accessibilityTrusted; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        status = await window.electronAPI.getDictationStatus();
-        applyDictationStatus(status);
-      }
-    } catch (err) {
-      setHint(dictationStatusHint, String(err), 'error');
-    } finally {
-      dictationGrantBtn.disabled = false;
+    const status = await api.requestStatus();
+    updateStatusBar({ status: status.status });
+    if (status.text) {
+      transcriptArea.value = status.text;
+      copyBtn.disabled = !status.text;
+      saveBtn.disabled = !status.text;
     }
-  })();
-});
+  } catch { /* ignore */ }
 
-// ---- Boot -------------------------------------------------------------------
+  // Dictation status
+  try {
+    const dictStatus = await api.getDictationStatus();
+    applyDictationStatus(dictStatus);
+    startDictationPolling();
+  } catch { /* ignore */ }
 
-window.electronAPI.onTranscriptionEvent(handleEvent);
+  // Listen for transcription events
+  api.onTranscriptionEvent(handleTranscriptionEvent);
 
-window.electronAPI.requestStatus().then((status) => {
-  updateStatus({ status: status.status as TranscriptionEvent['status'], text: status.text });
-}).catch(() => {
-  updateStatus({ status: 'idle' });
-});
+  // Pre-load settings (for LLM model list, etc.)
+  try {
+    currentSettings = await api.getSettings();
+    if (currentSettings) {
+      activeModel = currentSettings.activeModel || '';
+    }
+  } catch { /* ignore */ }
+}
 
-void loadSettings();
-void refreshDictationStatus();
-applySummaryView();
+init().catch(console.error);

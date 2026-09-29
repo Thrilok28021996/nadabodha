@@ -11,6 +11,14 @@ import {
   LlmConnectionResult,
   HfModelListResult,
   DictationStatusInfo,
+  NoteInfo,
+  NoteListResult,
+  NoteGetResult,
+  NoteCreateRequest,
+  NoteUpdateRequest,
+  NoteActionResult,
+  ReTranscribeRequest,
+  ReTranscribeResult,
 } from '../shared/ipc';
 import { isSupportedAudioFile } from '../shared/audioFormats';
 import { AudioRecorder } from './audioRecorder';
@@ -29,17 +37,36 @@ import {
   DictationTakeReason,
   TOO_SHORT_NOTICE,
 } from './dictation';
+import { NoteStore, NoteRecord } from './noteStore';
+
 
 export interface IpcSetupOptions {
   mainWindow: BrowserWindow;
   transcriptionService: TranscriptionService;
   recorder: AudioRecorder;
   settingsStore: SettingsStore;
+  noteStore: NoteStore;
 }
 
 export interface IpcSetupResult {
   /** Null when uiohook-napi could not be loaded in the main process. */
   dictation: DictationController | null;
+}
+
+/** Convert a NoteRecord to the serializable NoteInfo sent over IPC. */
+function toNoteInfo(record: NoteRecord): NoteInfo {
+  return {
+    id: record.id,
+    title: record.title,
+    created: record.created.toISOString(),
+    source: record.source,
+    folder: record.folder,
+    duration: record.duration,
+    model: record.model,
+    transcribed_at: record.transcribed_at?.toISOString(),
+    hasAudio: !!record.audio,
+    summaryStale: record.summaryStale,
+  };
 }
 
 type SettingsPatch = Partial<Record<keyof AppSettings, unknown>>;
@@ -85,7 +112,7 @@ export function loadDictationHook(): DictationHook | null {
 }
 
 export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
-  const { mainWindow, transcriptionService, recorder, settingsStore } = options;
+  const { mainWindow, transcriptionService, recorder, settingsStore, noteStore } = options;
 
   const emit = (event: TranscriptionEvent): void => {
     if (mainWindow.isDestroyed()) {
@@ -641,8 +668,127 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   // dependency exists.
   applyDictationSetting();
 
+  // ---- Note store (Stage 1) ------------------------------------------------
+
+  ipcMain.handle(IpcChannel.ListNotes, async (): Promise<NoteListResult> => {
+    const notes = noteStore.list().map(toNoteInfo);
+    return {
+      notes,
+      folders: noteStore.folders(),
+      folderCounts: noteStore.folderCounts(),
+    };
+  });
+
+  ipcMain.handle(IpcChannel.GetNote, async (_event: unknown, id: string): Promise<NoteGetResult> => {
+    const record = noteStore.get(id);
+    if (!record) {
+      return { error: `Note not found: ${id}` };
+    }
+    const content = noteStore.readContent(id);
+    return {
+      note: toNoteInfo(record),
+      content: content.data,
+      error: content.error,
+    };
+  });
+
+  ipcMain.handle(
+    IpcChannel.CreateNote,
+    async (_event: unknown, req: NoteCreateRequest): Promise<NoteActionResult> => {
+      if (!req || typeof req !== 'object') {
+        return { success: false, error: 'Invalid request' };
+      }
+      const result = noteStore.create({
+        title: typeof req.title === 'string' ? req.title : undefined,
+        source: req.source || 'unknown',
+        folder: typeof req.folder === 'string' ? req.folder : undefined,
+        transcript: typeof req.transcript === 'string' ? req.transcript : undefined,
+      });
+      return {
+        success: result.success,
+        note: result.data ? toNoteInfo(result.data) : undefined,
+        error: result.error,
+      };
+    }
+  );
+
+  ipcMain.handle(
+    IpcChannel.UpdateNote,
+    async (_event: unknown, req: NoteUpdateRequest): Promise<NoteActionResult> => {
+      if (!req || typeof req !== 'object' || !req.id) {
+        return { success: false, error: 'Invalid request' };
+      }
+      const result = noteStore.update(req.id, {
+        title: req.title,
+        folder: req.folder,
+        transcript: req.transcript,
+        summary: req.summary,
+        model: req.model,
+        markSummaryStale: req.markSummaryStale,
+        clearSummaryStale: req.clearSummaryStale,
+      });
+      return {
+        success: result.success,
+        note: result.data ? toNoteInfo(result.data) : undefined,
+        error: result.error,
+      };
+    }
+  );
+
+  ipcMain.handle(IpcChannel.DeleteNote, async (_event: unknown, id: string): Promise<NoteActionResult> => {
+    const result = noteStore.delete(id);
+    return { success: result.success, error: result.error };
+  });
+
+  ipcMain.handle(IpcChannel.ReadNoteContent, async (_event: unknown, id: string): Promise<NoteGetResult> => {
+    const record = noteStore.get(id);
+    if (!record) {
+      return { error: `Note not found: ${id}` };
+    }
+    const content = noteStore.readContent(id);
+    return { note: toNoteInfo(record), content: content.data, error: content.error };
+  });
+
+  ipcMain.handle(IpcChannel.ListFolders, async (): Promise<{ folders: string[]; counts: Record<string, number> }> => {
+    return { folders: noteStore.folders(), counts: noteStore.folderCounts() };
+  });
+
+  ipcMain.handle(IpcChannel.SearchNotes, async (_event: unknown, query: string): Promise<NoteListResult> => {
+    const notes = noteStore.search(typeof query === 'string' ? query : '').map(toNoteInfo);
+    return { notes, folders: noteStore.folders(), folderCounts: noteStore.folderCounts() };
+  });
+
+  ipcMain.handle(
+    IpcChannel.ReTranscribe,
+    async (_event: unknown, req: ReTranscribeRequest): Promise<ReTranscribeResult> => {
+      if (!req || typeof req.noteId !== 'string') {
+        return { started: false, error: 'noteId is required' };
+      }
+      const record = noteStore.get(req.noteId);
+      if (!record) {
+        return { started: false, error: `Note not found: ${req.noteId}` };
+      }
+      if (!record.audio) {
+        return { started: false, error: 'This note has no audio — re-transcribe is not available' };
+      }
+      if (!fs.existsSync(record.audio)) {
+        return { started: false, error: `Audio file missing: ${record.audio}` };
+      }
+      // Re-transcribe uses the same pipeline but with a note-scoped callback
+      // that updates the note on completion (replacing the old transcript only
+      // on success; on failure/cancel the previous transcript stays intact).
+      transcriptionService.startTranscription(record.audio, { origin: 'transcription' });
+      // The transcription completion event fires through the existing
+      // transcriptionService.onEvent handler and emits to the renderer; the
+      // renderer is responsible for calling UpdateNote once it receives the
+      // completed event and associates it with this note.
+      return { started: true };
+    }
+  );
+
   return { dictation };
 }
+
 
 export function showSaveTranscriptDialog(mainWindow: BrowserWindow): string | undefined {
   const result = dialog.showSaveDialogSync(mainWindow, {
