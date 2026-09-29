@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, clipboard } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -10,6 +10,7 @@ import {
   PythonValidation,
   LlmConnectionResult,
   HfModelListResult,
+  DictationStatusInfo,
 } from '../shared/ipc';
 import { isSupportedAudioFile } from '../shared/audioFormats';
 import { AudioRecorder } from './audioRecorder';
@@ -21,12 +22,24 @@ import { ensureDataDirLayout, readPromptTemplate, saveSummaryToDataDir, saveTran
 import { Summarizer, listLlmModels } from './summarizer';
 import { ModelDownloadService } from './modelDownloadService';
 import { classifyRepo, searchHfModels } from './hfModels';
+import {
+  CHORD_NOTICE,
+  DictationController,
+  DictationHook,
+  DictationTakeReason,
+  TOO_SHORT_NOTICE,
+} from './dictation';
 
 export interface IpcSetupOptions {
   mainWindow: BrowserWindow;
   transcriptionService: TranscriptionService;
   recorder: AudioRecorder;
   settingsStore: SettingsStore;
+}
+
+export interface IpcSetupResult {
+  /** Null when uiohook-napi could not be loaded in the main process. */
+  dictation: DictationController | null;
 }
 
 type SettingsPatch = Partial<Record<keyof AppSettings, unknown>>;
@@ -38,7 +51,40 @@ function describeError(err: unknown): string {
   return String(err);
 }
 
-export function setupIpcHandlers(options: IpcSetupOptions): void {
+/**
+ * Accessibility check behind the dictation crash guard: libuiohook installs a
+ * macOS event tap that takes the process down when the app is not trusted, so
+ * this is consulted BEFORE the hook starts.
+ *
+ * NADABODHA_DICTATION_NO_ACCESSIBILITY=1 forces the "not trusted" branch. It
+ * exists so the banner + no-start path can be exercised without revoking the
+ * machine's TCC grant (which can only be restored by a human clicking the
+ * system prompt).
+ */
+export function isAccessibilityTrusted(ask: boolean): boolean {
+  if (process.env.NADABODHA_DICTATION_NO_ACCESSIBILITY === '1') {
+    return false;
+  }
+  return systemPreferences.isTrustedAccessibilityClient(ask);
+}
+
+/**
+ * Loads the global input hook. A missing or broken native module disables
+ * dictation instead of taking the app down.
+ */
+export function loadDictationHook(): DictationHook | null {
+  try {
+    // Optional native dependency: a load failure must disable dictation, not
+    // the app, so it is required behind a try/catch instead of imported.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require('uiohook-napi') as { uIOhook?: DictationHook };
+    return mod && mod.uIOhook ? mod.uIOhook : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   const { mainWindow, transcriptionService, recorder, settingsStore } = options;
 
   const emit = (event: TranscriptionEvent): void => {
@@ -74,6 +120,21 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
     emit(event);
   });
 
+  /**
+   * Upper bound on generated tokens for a summary. Local reasoning models
+   * otherwise keep emitting hidden reasoning until the context is exhausted,
+   * which pushes a single summary past the summarizer's own 300s timeout.
+   * Measured on the bundled test model: ~600 reasoning + ~400 answer tokens.
+   */
+  const SUMMARY_MAX_TOKENS = 4096;
+  /**
+   * System-level instruction for local reasoning models: without it they can
+   * burn the whole token budget on hidden reasoning before answering (it
+   * roughly halves reasoning tokens for the bundled test model).
+   */
+  const SUMMARY_SYSTEM_PROMPT =
+    'You are a local summarization assistant. Reply with the Markdown summary only: no preamble and no commentary.';
+
   function runSummary(settings: AppSettings, transcript: string): void {
     const { template } = readPromptTemplate(settings.dataDir);
     void summarizer
@@ -83,6 +144,8 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
         apiKey: settings.llmApiKey,
         transcript,
         template,
+        systemPrompt: SUMMARY_SYSTEM_PROMPT,
+        maxTokens: SUMMARY_MAX_TOKENS,
       })
       .catch((err) => {
         summaryInFlight = false;
@@ -96,6 +159,138 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
     pythonExecutable: () => resolvePythonExecutable(settingsStore.get()),
     onEvent: (event) => emit(event),
   });
+
+  // ---- Dictation (hold Option, system-wide) ---------------------------------
+
+  /**
+   * Take bookkeeping. `dictationTakeId` is bumped by every abort so a take
+   * whose microphone permission check is still in flight can never start
+   * recording after it was cancelled.
+   */
+  let dictationTakeId = 0;
+  let dictationStartPromise: Promise<void> | null = null;
+  let dictationTakeOpen = false;
+
+  const startDictationTake = (): void => {
+    const id = ++dictationTakeId;
+    dictationTakeOpen = true;
+    const pending = (async () => {
+      const permission = await ensureMicrophonePermission();
+      if (id !== dictationTakeId) return; // aborted while waiting
+      if (!permission.granted) {
+        dictationTakeOpen = false;
+        emit({ status: 'error', origin: 'dictation', error: MICROPHONE_DENIED_MESSAGE });
+        return;
+      }
+      try {
+        recorder.start();
+      } catch (err) {
+        if (id !== dictationTakeId) return;
+        dictationTakeOpen = false;
+        emit({ status: 'error', origin: 'dictation', error: describeError(err) });
+        return;
+      }
+      if (id !== dictationTakeId) {
+        // Aborted between the permission check and the actual start.
+        recorder.cancel();
+        return;
+      }
+      emit({ status: 'recording', origin: 'dictation' });
+    })();
+    dictationStartPromise = pending;
+    void pending
+      .catch(() => undefined)
+      .then(() => {
+        if (dictationStartPromise === pending) dictationStartPromise = null;
+      });
+  };
+
+  const abortDictationTake = (reason: DictationTakeReason): void => {
+    dictationTakeId += 1; // invalidate an in-flight start
+    dictationTakeOpen = false;
+    recorder.cancel();
+    emit({
+      status: 'idle',
+      origin: 'dictation',
+      dictationNotice: reason === 'too-short' ? TOO_SHORT_NOTICE : CHORD_NOTICE,
+    });
+  };
+
+  const finishDictationTake = (_heldMs: number): void => {
+    const pending = dictationStartPromise;
+    void (async () => {
+      if (pending) await pending.catch(() => undefined);
+      const outputPath = await recorder.stop();
+      dictationTakeOpen = false;
+      const usable =
+        typeof outputPath === 'string' && outputPath.length > 0 && fs.existsSync(outputPath);
+      if (usable) {
+        // Dictation appends: the transcript grows take by take.
+        transcriptionService.startTranscription(outputPath, {
+          append: true,
+          origin: 'dictation',
+        });
+      } else {
+        emit({ status: 'idle', origin: 'dictation' });
+      }
+    })().catch((err) => {
+      dictationTakeOpen = false;
+      emit({ status: 'error', origin: 'dictation', error: describeError(err) });
+    });
+  };
+
+  /** Refuses a dictation take while the app is already recording/transcribing. */
+  const canStartDictationTake = (): boolean => {
+    if (dictationTakeOpen) return false;
+    if (recorder.getState().status === 'recording') return false;
+    const state = transcriptionService.getState();
+    return state !== 'transcribing' && state !== 'recording';
+  };
+
+  const hook = loadDictationHook();
+  const dictation = hook
+    ? new DictationController({
+        hook,
+        actions: {
+          startTake: startDictationTake,
+          abortTake: abortDictationTake,
+          finishTake: finishDictationTake,
+        },
+        isDictationEnabled: () => settingsStore.get().dictationEnabled !== false,
+        isTrustedAccessibilityClient: isAccessibilityTrusted,
+        canStartTake: canStartDictationTake,
+      })
+    : null;
+
+  const applyDictationSetting = (): void => {
+    if (!dictation) return;
+    if (settingsStore.get().dictationEnabled !== false) {
+      const result = dictation.start();
+      if (!result.started && result.outcome === 'hook-error') {
+        // Non-fatal: dictation is unavailable, the rest of the app is not.
+        console.error(`dictation hook failed to start: ${result.error || result.outcome}`);
+      }
+    } else if (dictation.isRunning()) {
+      dictation.stop();
+    }
+  };
+
+  const dictationStatus = (): DictationStatusInfo => {
+    const enabled = settingsStore.get().dictationEnabled !== false;
+    const accessibilityTrusted = isAccessibilityTrusted(false);
+    let reason: string | undefined;
+    if (!dictation) reason = 'uiohook-napi failed to load';
+    else if (!enabled) reason = 'disabled';
+    else if (!accessibilityTrusted) reason = 'no-accessibility';
+    else if (!dictation.isRunning()) reason = dictation.getLastOutcome();
+    return {
+      supported: dictation !== null,
+      enabled,
+      accessibilityTrusted,
+      running: dictation !== null && dictation.isRunning(),
+      reason,
+    };
+  };
 
   // ---- Transcription events (autosave + auto-summary) ------------------------
 
@@ -112,7 +307,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
 
     const settings = settingsStore.get();
     const text = event.text || '';
-    let withSaves: TranscriptionEvent = { ...event, origin: 'transcription' };
+    let withSaves: TranscriptionEvent = {
+      ...event,
+      origin: event.origin === 'dictation' ? 'dictation' : 'transcription',
+    };
 
     if (settings.dataDir) {
       const saved = saveTranscriptToDataDir(settings.dataDir, text);
@@ -277,9 +475,18 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
       if (typeof patch.activeModel === 'string') {
         accepted.activeModel = patch.activeModel.trim();
       }
+      if (typeof patch.dictationEnabled === 'boolean') {
+        accepted.dictationEnabled = patch.dictationEnabled;
+      }
 
       try {
-        return { settings: settingsStore.update(accepted), errors, messages };
+        const settings = settingsStore.update(accepted);
+        if (typeof patch.dictationEnabled === 'boolean') {
+          // Start/stop the global hook immediately so the setting is live
+          // without restarting the app.
+          applyDictationSetting();
+        }
+        return { settings, errors, messages };
       } catch (err) {
         return {
           settings: settingsStore.get(),
@@ -393,6 +600,27 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
     return { cancelled: true };
   });
 
+  // ---- Dictation status -----------------------------------------------------
+
+  ipcMain.handle(
+    IpcChannel.DictationStatus,
+    async (): Promise<DictationStatusInfo> => dictationStatus()
+  );
+
+  ipcMain.handle(
+    IpcChannel.DictationRequestAccess,
+    async (): Promise<DictationStatusInfo> => {
+      // ask === true shows the system Accessibility prompt; it returns with
+      // the current (usually still false) trust state while the user decides,
+      // which is why the renderer polls afterwards.
+      if (process.env.NADABODHA_DICTATION_NO_ACCESSIBILITY !== '1') {
+        systemPreferences.isTrustedAccessibilityClient(true);
+      }
+      applyDictationSetting();
+      return dictationStatus();
+    }
+  );
+
   // ---- Recorder failure forwarding -----------------------------------------
 
   // Forward recorder failures (e.g. ffmpeg missing or crashing) to the
@@ -401,6 +629,12 @@ export function setupIpcHandlers(options: IpcSetupOptions): void {
   recorder.on('error', (err: Error) => {
     emit({ status: 'error', error: err.message });
   });
+
+  // Start (or deliberately skip) the global Option hook now that every
+  // dependency exists.
+  applyDictationSetting();
+
+  return { dictation };
 }
 
 export function showSaveTranscriptDialog(mainWindow: BrowserWindow): string | undefined {

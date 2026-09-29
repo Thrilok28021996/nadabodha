@@ -9,8 +9,10 @@ let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
+    width: 1180,
+    height: 760,
+    minWidth: 960,
+    minHeight: 640,
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
@@ -47,12 +49,20 @@ app.whenReady().then(() => {
     throw new Error('Main window not created');
   }
 
-  setupIpcHandlers({
+  const { dictation } = setupIpcHandlers({
     mainWindow,
     transcriptionService,
     recorder,
     settingsStore,
   });
+
+  // The global Option hook must never outlive the app (approved plan,
+  // workstream 3: "Stop the hook on app quit").
+  if (dictation) {
+    app.on('will-quit', () => {
+      dictation.stop();
+    });
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

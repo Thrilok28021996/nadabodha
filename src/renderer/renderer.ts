@@ -10,6 +10,15 @@ type SettingsUpdateResult = import('../shared/ipc').SettingsUpdateResult;
 type LlmConnectionResult = import('../shared/ipc').LlmConnectionResult;
 type HfModelInfo = import('../shared/ipc').HfModelInfo;
 type HfModelListResult = import('../shared/ipc').HfModelListResult;
+type DictationStatusInfo = import('../shared/ipc').DictationStatusInfo;
+
+// Vendored UMD globals loaded by <script> tags before this file: there is no
+// bundler in this sandboxed renderer, so they cannot be imported.
+declare const marked: { parse(src: string): string };
+declare const DOMPurify: {
+  sanitize(dirty: string): string;
+  addHook(hook: string, callback: (node: Node) => void): void;
+};
 
 // Preload API is injected at runtime; declare a minimal typed interface here
 // to avoid importing from the sandboxed preload bundle.
@@ -36,6 +45,9 @@ interface ElectronApi {
   cancelDownload: () => Promise<{ cancelled: boolean }>;
   summarize: (text?: string) => Promise<{ started: boolean; error?: string }>;
   cancelSummary: () => Promise<{ cancelled: boolean }>;
+  // Dictation (hold Option, system-wide)
+  getDictationStatus: () => Promise<DictationStatusInfo>;
+  requestDictationAccess: () => Promise<DictationStatusInfo>;
 }
 
 // Merged into the global Window declared by lib.dom; only read as a type.
@@ -74,6 +86,23 @@ const savedPanel = document.getElementById('savedPanel') as HTMLElement;
 const savedTranscriptPath = document.getElementById('savedTranscriptPath') as HTMLParagraphElement;
 const savedSummaryPath = document.getElementById('savedSummaryPath') as HTMLParagraphElement;
 const saveErrorText = document.getElementById('saveErrorText') as HTMLParagraphElement;
+
+// Summary view (Raw / Preview) + rendered markdown
+const summaryPreview = document.getElementById('summaryPreview') as HTMLElement;
+const summaryRawBtn = document.getElementById('summaryRawBtn') as HTMLButtonElement;
+const summaryPreviewBtn = document.getElementById('summaryPreviewBtn') as HTMLButtonElement;
+const copySummaryBtn = document.getElementById('copySummaryBtn') as HTMLButtonElement;
+
+// Dictation (hold Option)
+const dictationBadge = document.getElementById('dictationBadge') as HTMLParagraphElement;
+const dictationNotice = document.getElementById('dictationNotice') as HTMLParagraphElement;
+const dictationBanner = document.getElementById('dictationBanner') as HTMLElement;
+const dictationGrantBtn = document.getElementById('dictationGrantBtn') as HTMLButtonElement;
+const dictationEnabledChk = document.getElementById('dictationEnabledChk') as HTMLInputElement;
+const dictationStatusHint = document.getElementById('dictationStatus') as HTMLParagraphElement;
+
+/** Exact hint string required by the approved plan. */
+const DICTATION_HINT = 'Hold the Option key anywhere to dictate';
 
 // Settings
 const settingsBtn = document.getElementById('settingsBtn') as HTMLButtonElement;
@@ -119,11 +148,90 @@ let activeModel = '';
 let hfLoaded = false;
 let hfSearchTimer: number | undefined;
 let llmLoadTimer: number | undefined;
+/** Summary view mode. Default is the rendered preview (approved plan). */
+let summaryView: 'raw' | 'preview' = 'preview';
 
 function setHint(element: HTMLElement, text: string, state: HintState = ''): void {
   element.textContent = text;
   element.hidden = !text;
   element.setAttribute('data-state', state);
+}
+
+// ---- Summary rendering (workstream 2) -------------------------------------
+
+/** Empty-state copy for the preview panel. */
+function emptyState(text: string): HTMLElement {
+  const element = document.createElement('p');
+  element.className = 'empty';
+  element.textContent = text;
+  return element;
+}
+
+/**
+ * Extra sanitization pass for untrusted LLM output: only absolute http(s)/data
+ * `src` values survive. A relative source (e.g. `src=x`) would resolve against
+ * the app's own file:// origin, which both leaks local paths to the renderer
+ * and logs a 404 for every hostile payload.
+ */
+let sanitizeHooksInstalled = false;
+function ensureSanitizeHooks(): void {
+  if (sanitizeHooksInstalled) {
+    return;
+  }
+  sanitizeHooksInstalled = true;
+  const SRC_ELEMENTS = ['IMG', 'VIDEO', 'AUDIO', 'SOURCE', 'TRACK', 'EMBED'];
+  DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+    const element = node as Element;
+    if (!SRC_ELEMENTS.includes(element.tagName)) {
+      return;
+    }
+    const src = element.getAttribute('src') || '';
+    if (!/^(https?:|data:)/i.test(src)) {
+      element.removeAttribute('src');
+    }
+  });
+}
+
+/**
+ * Renders the raw Markdown source of the summary into the preview panel.
+ *
+ * LLM output is untrusted: DOMPurify.sanitize runs on EVERY render, before
+ * anything reaches innerHTML. If either vendored library failed to load the
+ * preview refuses to render rather than inject unsanitized markup.
+ */
+function renderSummaryPreview(): void {
+  const raw = summaryArea.value;
+  if (!raw.trim()) {
+    summaryPreview.replaceChildren(emptyState('Summary will appear here…'));
+    return;
+  }
+  try {
+    if (typeof marked === 'undefined' || typeof marked.parse !== 'function') {
+      throw new Error('marked is not loaded');
+    }
+    if (typeof DOMPurify === 'undefined' || typeof DOMPurify.sanitize !== 'function') {
+      throw new Error('DOMPurify is not loaded');
+    }
+    ensureSanitizeHooks();
+    const html = marked.parse(raw);
+    summaryPreview.innerHTML = DOMPurify.sanitize(html);
+  } catch (err) {
+    summaryPreview.replaceChildren(emptyState(`Preview unavailable: ${String(err)}`));
+  }
+}
+
+/** Applies the Raw / Preview toggle. The raw source never changes. */
+function applySummaryView(): void {
+  const raw = summaryView === 'raw';
+  summaryRawBtn.classList.toggle('active', raw);
+  summaryPreviewBtn.classList.toggle('active', !raw);
+  summaryRawBtn.setAttribute('aria-pressed', String(raw));
+  summaryPreviewBtn.setAttribute('aria-pressed', String(!raw));
+  summaryArea.hidden = !raw;
+  summaryPreview.hidden = raw;
+  if (!raw) {
+    renderSummaryPreview();
+  }
 }
 
 function showTab(which: 'transcript' | 'summary'): void {
@@ -161,19 +269,34 @@ function showSaveError(message: string): void {
   savedPanel.hidden = false;
 }
 
-function updateStatus(event: TranscriptionEvent): void {
+function updateStatus(event: TranscriptionEvent, options: { preserveText?: boolean } = {}): void {
+  const fromDictation = event.origin === 'dictation';
+  // Dictation appends to the transcript that is already on screen; plain
+  // record/import keep their replace semantics.
+  const preserveText = options.preserveText ?? fromDictation;
+
   statusText.textContent = `Status: ${event.status}`;
   errorText.hidden = true;
+  dictationBadge.hidden = !(fromDictation && event.status === 'recording');
+  if (event.dictationNotice) {
+    setHint(dictationNotice, event.dictationNotice);
+  }
 
   if (event.status === 'recording' || event.status === 'transcribing') {
-    // N-F3: a new capture or transcription replaces the transcript on
-    // screen as soon as it starts, not only when it completes.
-    currentText = '';
-    transcriptArea.value = '';
-    summaryArea.value = '';
-    setHint(summaryStatus, '');
-    summaryError.hidden = true;
-    clearSavedPaths();
+    // A new take starts with a clean slate for its own notices.
+    setHint(dictationNotice, '');
+    if (!preserveText) {
+      // N-F3: a new capture or transcription replaces the transcript on
+      // screen as soon as it starts, not only when it completes.
+      currentText = '';
+      transcriptArea.value = '';
+      summaryArea.value = '';
+      copySummaryBtn.disabled = true;
+      renderSummaryPreview();
+      setHint(summaryStatus, '');
+      summaryError.hidden = true;
+      clearSavedPaths();
+    }
     recordBtn.disabled = true;
     stopRecordBtn.disabled = event.status === 'transcribing';
     importBtn.disabled = true;
@@ -236,13 +359,18 @@ function handleSummaryEvent(event: TranscriptionEvent): void {
     setHint(summaryStatus, `Summarizing…${typeof event.progress === 'number' ? ` ${event.progress}%` : ''}`, 'busy');
     summaryError.hidden = true;
     summarizeBtn.disabled = true;
+    copySummaryBtn.disabled = true;
     cancelSummaryBtn.hidden = false;
   } else if (event.status === 'completed') {
     setHint(summaryStatus, 'Summary ready', 'ok');
     summaryError.hidden = true;
     if (typeof event.text === 'string') {
+      // The raw Markdown source stays in #summaryArea; the preview shows the
+      // sanitized, rendered version of exactly this text.
       summaryArea.value = event.text;
     }
+    renderSummaryPreview();
+    copySummaryBtn.disabled = !summaryArea.value.trim();
     summarizeBtn.disabled = !currentText.trim();
     cancelSummaryBtn.hidden = true;
     if (event.savedSummaryPath) {
@@ -390,6 +518,30 @@ saveBtn.addEventListener('click', async () => {
 tabTranscript.addEventListener('click', () => showTab('transcript'));
 tabSummary.addEventListener('click', () => showTab('summary'));
 
+// ---- Summary view: Raw / Preview -------------------------------------------
+
+summaryRawBtn.addEventListener('click', () => {
+  summaryView = 'raw';
+  applySummaryView();
+});
+
+summaryPreviewBtn.addEventListener('click', () => {
+  summaryView = 'preview';
+  applySummaryView();
+});
+
+// Copies the RAW Markdown source — never the rendered HTML.
+copySummaryBtn.addEventListener('click', async () => {
+  try {
+    await window.electronAPI.copyTranscript(summaryArea.value);
+    copySummaryBtn.textContent = 'Copied!';
+    setTimeout(() => (copySummaryBtn.textContent = 'Copy Markdown'), 1500);
+  } catch (err) {
+    summaryError.textContent = String(err);
+    summaryError.hidden = false;
+  }
+});
+
 summarizeBtn.addEventListener('click', async () => {
   try {
     const result = await window.electronAPI.summarize(transcriptArea.value);
@@ -458,6 +610,7 @@ function applySettingsToForm(settings: AppSettings): void {
   cacheDirInput.value = settings.sttCacheDir;
   summarizeEnabledChk.checked = settings.summarizationEnabled;
   autoSummarizeChk.checked = settings.autoSummarize;
+  dictationEnabledChk.checked = settings.dictationEnabled !== false;
   activeModel = settings.activeModel;
   updatePromptPathStatus(settings.dataDir);
   if (settings.dataDir) {
@@ -488,9 +641,11 @@ settingsSaveBtn.addEventListener('click', async () => {
       sttCacheDir: cacheDirInput.value.trim(),
       summarizationEnabled: summarizeEnabledChk.checked,
       autoSummarize: autoSummarizeChk.checked,
+      dictationEnabled: dictationEnabledChk.checked,
     });
 
     applySettingsToForm(result.settings);
+    void refreshDictationStatus();
 
     const messages = result.messages || {};
     const errors = result.errors || {};
@@ -902,6 +1057,54 @@ hfUseBtn.addEventListener('click', async () => {
   }
 });
 
+// ---- Dictation status (hold Option) ----------------------------------------
+
+function applyDictationStatus(status: DictationStatusInfo): void {
+  const needsGrant = status.supported && status.enabled && !status.accessibilityTrusted;
+  dictationBanner.hidden = !needsGrant;
+
+  if (!status.supported) {
+    setHint(dictationStatusHint, 'Dictation unavailable: uiohook-napi failed to load', 'error');
+  } else if (!status.enabled) {
+    setHint(dictationStatusHint, 'Dictation is switched off', '');
+  } else if (needsGrant) {
+    setHint(dictationStatusHint, 'Grant Accessibility to start dictation', 'error');
+  } else if (status.running) {
+    setHint(dictationStatusHint, DICTATION_HINT, 'ok');
+  } else {
+    setHint(dictationStatusHint, `Dictation not listening${status.reason ? ` (${status.reason})` : ''}`, 'error');
+  }
+}
+
+async function refreshDictationStatus(): Promise<void> {
+  try {
+    applyDictationStatus(await window.electronAPI.getDictationStatus());
+  } catch (err) {
+    setHint(dictationStatusHint, `Cannot read dictation status: ${String(err)}`, 'error');
+  }
+}
+
+dictationGrantBtn.addEventListener('click', () => {
+  void (async () => {
+    dictationGrantBtn.disabled = true;
+    try {
+      // ask === true shows the system prompt; trust arrives asynchronously,
+      // so poll for a while before giving up.
+      let status = await window.electronAPI.requestDictationAccess();
+      applyDictationStatus(status);
+      for (let attempt = 0; attempt < 40 && !status.accessibilityTrusted; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        status = await window.electronAPI.getDictationStatus();
+        applyDictationStatus(status);
+      }
+    } catch (err) {
+      setHint(dictationStatusHint, String(err), 'error');
+    } finally {
+      dictationGrantBtn.disabled = false;
+    }
+  })();
+});
+
 // ---- Boot -------------------------------------------------------------------
 
 window.electronAPI.onTranscriptionEvent(handleEvent);
@@ -913,3 +1116,5 @@ window.electronAPI.requestStatus().then((status) => {
 });
 
 void loadSettings();
+void refreshDictationStatus();
+applySummaryView();

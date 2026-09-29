@@ -25,6 +25,8 @@ enum IpcChannel {
   CancelDownload = 'cancel-download',
   Summarize = 'summarize',
   CancelSummary = 'cancel-summary',
+  DictationStatus = 'dictation-status',
+  DictationRequestAccess = 'dictation-request-access',
 }
 
 type TranscriptionStatus =
@@ -37,7 +39,7 @@ type TranscriptionStatus =
   | 'downloading'
   | 'summarizing';
 
-type EventOrigin = 'transcription' | 'download' | 'summary';
+type EventOrigin = 'transcription' | 'download' | 'summary' | 'dictation';
 
 interface TranscriptionEvent {
   status: TranscriptionStatus;
@@ -45,6 +47,7 @@ interface TranscriptionEvent {
   progress?: number;
   error?: string;
   origin?: EventOrigin;
+  dictationNotice?: string;
   repoId?: string;
   path?: string;
   file?: string;
@@ -76,6 +79,15 @@ interface AppSettings {
   summarizationEnabled: boolean;
   autoSummarize: boolean;
   activeModel: string;
+  dictationEnabled: boolean;
+}
+
+interface DictationStatusInfo {
+  supported: boolean;
+  enabled: boolean;
+  accessibilityTrusted: boolean;
+  running: boolean;
+  reason?: string;
 }
 
 interface PythonValidation {
@@ -141,6 +153,9 @@ export interface ElectronApi {
   cancelDownload: () => Promise<{ cancelled: boolean }>;
   summarize: (text?: string) => Promise<{ started: boolean; error?: string }>;
   cancelSummary: () => Promise<{ cancelled: boolean }>;
+  // Dictation (hold Option)
+  getDictationStatus: () => Promise<DictationStatusInfo>;
+  requestDictationAccess: () => Promise<DictationStatusInfo>;
 }
 
 const api: ElectronApi = {
@@ -180,6 +195,8 @@ const api: ElectronApi = {
   cancelDownload: () => ipcRenderer.invoke(IpcChannel.CancelDownload),
   summarize: (text) => ipcRenderer.invoke(IpcChannel.Summarize, { text }),
   cancelSummary: () => ipcRenderer.invoke(IpcChannel.CancelSummary),
+  getDictationStatus: () => ipcRenderer.invoke(IpcChannel.DictationStatus),
+  requestDictationAccess: () => ipcRenderer.invoke(IpcChannel.DictationRequestAccess),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', api);

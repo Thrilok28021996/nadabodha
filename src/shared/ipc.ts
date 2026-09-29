@@ -22,6 +22,8 @@ export enum IpcChannel {
   CancelDownload = 'cancel-download',
   Summarize = 'summarize',
   CancelSummary = 'cancel-summary',
+  DictationStatus = 'dictation-status',
+  DictationRequestAccess = 'dictation-request-access',
 }
 
 export type TranscriptionStatus =
@@ -39,7 +41,7 @@ export type TranscriptionStatus =
  * transcription events (the Python adapter does not set one for its classic
  * transcript events).
  */
-export type EventOrigin = 'transcription' | 'download' | 'summary';
+export type EventOrigin = 'transcription' | 'download' | 'summary' | 'dictation';
 
 export interface TranscriptionEvent {
   status: TranscriptionStatus;
@@ -47,6 +49,8 @@ export interface TranscriptionEvent {
   progress?: number; // 0-100 when transcribing / downloading / summarizing
   error?: string;
   origin?: EventOrigin;
+  /** Inline, non-error hint shown by the dictation UI (e.g. too-short take). */
+  dictationNotice?: string;
   // Model download details
   repoId?: string;
   path?: string;
@@ -91,6 +95,22 @@ export interface AppSettings {
   autoSummarize: boolean;
   /** Hugging Face repo id used as the primary STT model. Empty = fallback chain. */
   activeModel: string;
+  /** Hold-Option system-wide dictation (workstream 3). Default ON. */
+  dictationEnabled: boolean;
+}
+
+/** Live state of the hold-Option dictation hook. */
+export interface DictationStatusInfo {
+  /** False when uiohook-napi could not be loaded in the main process. */
+  supported: boolean;
+  /** The dictationEnabled setting. */
+  enabled: boolean;
+  /** systemPreferences.isTrustedAccessibilityClient(false). */
+  accessibilityTrusted: boolean;
+  /** True when the global key hook is actually listening. */
+  running: boolean;
+  /** Why the hook is not running ('disabled' | 'no-accessibility' | 'hook-error' | ...). */
+  reason?: string;
 }
 
 export interface PythonValidation {

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { TranscriptionAdapter } from './transcriptionAdapter';
 import {
+  EventOrigin,
   TranscriptionEvent,
   TranscriptionStatus,
 } from '../shared/ipc';
@@ -12,6 +13,25 @@ export type ServiceState =
   | 'completed'
   | 'cancelled'
   | 'error';
+
+export interface StartTranscriptionOptions {
+  /**
+   * Append the result to the transcript held from the previous run instead of
+   * replacing it. Used by hold-Option dictation, which builds text
+   * incrementally; plain record/import keep their replace semantics.
+   */
+  append?: boolean;
+  /** Origin stamped on every event produced by this run (e.g. 'dictation'). */
+  origin?: EventOrigin;
+}
+
+/** Joins two transcript fragments: newline between takes, unless already spaced. */
+export function joinTranscriptParts(base: string, fragment: string): string {
+  if (!base) return fragment;
+  if (!fragment) return base;
+  if (/\s$/.test(base)) return `${base}${fragment}`;
+  return `${base}\n${fragment}`;
+}
 
 export interface TranscriptionServiceOptions {
   /** Resolved lazily on every run so settings changes apply immediately. */
@@ -28,6 +48,10 @@ export class TranscriptionService {
   private transcript = '';
   private lastError?: string;
   private listeners: ((event: TranscriptionEvent) => void)[] = [];
+  /** Text the current run appends to (dictation), else ''. */
+  private runBase = '';
+  /** Origin stamped on the current run's events. */
+  private currentOrigin: EventOrigin | undefined;
 
   constructor(private readonly options: TranscriptionServiceOptions = {}) {}
 
@@ -47,10 +71,13 @@ export class TranscriptionService {
     return this.currentFilePath;
   }
 
-  startTranscription(filePath: string): void {
+  startTranscription(filePath: string, options: StartTranscriptionOptions = {}): void {
     if (this.state === 'recording' || this.state === 'transcribing') {
       throw new Error(`Cannot start transcription while in state ${this.state}`);
     }
+
+    this.currentOrigin = options.origin;
+    this.runBase = options.append ? this.transcript : '';
 
     if (!fs.existsSync(filePath)) {
       this.setState('error', undefined, `File not found: ${filePath}`);
@@ -58,7 +85,12 @@ export class TranscriptionService {
     }
 
     this.currentFilePath = filePath;
-    this.transcript = '';
+    if (!options.append) {
+      // Replace semantics (plain record / import): the previous transcript is
+      // dropped as soon as a new run starts.
+      this.transcript = '';
+      this.runBase = '';
+    }
     this.lastError = undefined;
     this.setState('transcribing', 0);
 
@@ -112,6 +144,8 @@ export class TranscriptionService {
     this.currentFilePath = null;
     this.transcript = '';
     this.lastError = undefined;
+    this.runBase = '';
+    this.currentOrigin = undefined;
     this.broadcast({ status: 'idle' });
   }
 
@@ -126,7 +160,12 @@ export class TranscriptionService {
     if (event.status === 'transcribing') {
       this.setState('transcribing', event.progress);
     } else if (event.status === 'completed') {
-      this.transcript = event.text || '';
+      const fragment = event.text || '';
+      // Append runs (dictation) keep everything dictated so far and add this
+      // take; replace runs overwrite with the new text.
+      this.transcript = this.runBase
+        ? joinTranscriptParts(this.runBase, fragment)
+        : fragment;
       this.setState('completed', 100, undefined, this.transcript);
       this.cleanup();
     } else if (event.status === 'error') {
@@ -151,6 +190,7 @@ export class TranscriptionService {
       progress,
       error,
       text,
+      origin: this.currentOrigin,
     });
   }
 
@@ -165,5 +205,7 @@ export class TranscriptionService {
       this.adapter.stop();
       this.adapter = null;
     }
+    this.runBase = '';
+    this.currentOrigin = undefined;
   }
 }
