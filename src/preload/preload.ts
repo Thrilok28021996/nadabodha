@@ -67,6 +67,7 @@ interface TranscriptionEvent {
   savedTranscriptPath?: string;
   savedSummaryPath?: string;
   saveError?: string;
+  partial?: boolean;
 }
 
 interface SaveTranscriptRequest {

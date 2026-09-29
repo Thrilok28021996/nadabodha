@@ -52,6 +52,7 @@ interface TranscriptionEvent {
   savedTranscriptPath?: string;
   savedSummaryPath?: string;
   saveError?: string;
+  partial?: boolean;
   file?: string;
   bytesDone?: number;
   bytesTotal?: number;
@@ -670,13 +671,22 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
 
   if (origin === 'dictation') {
     // Dictation-specific UI updates
-    dictationBadge.hidden = status !== 'recording';
+    dictationBadge.hidden = status !== 'recording' && status !== 'transcribing';
+    if (event.partial && text) {
+      dictationBadge.textContent = '🎙️ ' + text;
+      dictationBadge.style.opacity = '0.7';
+    } else if (status === 'recording') {
+      dictationBadge.textContent = '🎙️ Dictation active';
+      dictationBadge.style.opacity = '1';
+    }
+
     if (notice) {
       setHint(dictationNotice, notice, 'info');
       dictationNotice.hidden = false;
       dictationNotice.textContent = notice;
     }
     if (status === 'completed' && text) {
+      dictationBadge.textContent = '🎙️ Dictation active';
       // Append to existing transcript or create a dictation-log note
       appendDictationText(text);
     }
@@ -700,12 +710,20 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
   if (status === 'recording') {
     startRecordingUI();
   } else if (status === 'transcribing') {
-    stopRecordingUI();
+    if (event.partial && text) {
+      // We are streaming during recording.
+      transcriptArea.value = text;
+      transcriptArea.style.opacity = '0.7';
+    } else {
+      stopRecordingUI();
+    }
   } else if (status === 'completed' && text) {
     stopRecordingUI();
+    transcriptArea.style.opacity = '1.0';
     handleTranscriptionCompleted(text, event);
   } else if (status === 'cancelled' || status === 'error') {
     stopRecordingUI();
+    transcriptArea.style.opacity = '1.0';
     if (status === 'error' && error) showError(error);
     setTimeout(() => updateStatusBar({ status: 'idle' }), 3000);
   }

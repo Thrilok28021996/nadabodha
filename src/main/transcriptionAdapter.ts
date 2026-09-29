@@ -62,6 +62,45 @@ export class TranscriptionAdapter extends EventEmitter {
     });
   }
 
+  startStream(repoId: string, cacheDir: string): NodeJS.WritableStream {
+    if (this.process) {
+      throw new Error('Transcription adapter already running');
+    }
+
+    const python = this.options.pythonExecutable || 'python3';
+    const script =
+      this.options.pythonScriptPath ||
+      path.join(__dirname, '../../python/nadabodha_transcribe.py');
+
+    this.process = spawn(python, [script, '--stream', '--repo_id', repoId, '--cache_dir', cacheDir], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+
+    this.process.stdout?.on('data', (chunk: Buffer) => {
+      this.buffer += chunk.toString('utf8');
+      this.flushLines();
+    });
+
+    this.process.stderr?.on('data', (chunk: Buffer) => {
+      const line = chunk.toString('utf8').trim();
+      if (line) {
+        this.emit('stderr', line);
+      }
+    });
+
+    this.process.on('error', (err) => {
+      this.options.onError(err);
+    });
+
+    this.process.on('exit', (code) => {
+      this.process = null;
+      this.options.onExit(code);
+    });
+
+    return this.process.stdin!;
+  }
+
   stop(): void {
     if (!this.process) return;
     this.process.kill('SIGTERM');

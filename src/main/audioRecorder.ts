@@ -58,6 +58,10 @@ export class AudioRecorder extends EventEmitter {
     return this._state;
   }
 
+  getStream() {
+    return this.process?.stdout || null;
+  }
+
   start(): string {
     if (this.process) {
       throw new Error('Recording already in progress');
@@ -77,6 +81,11 @@ export class AudioRecorder extends EventEmitter {
       '-sample_fmt', 's16',
       '-y',
       this.outputPath,
+      // Tee to stdout as raw PCM for streaming
+      '-f', 's16le',
+      '-ar', String(sampleRate),
+      '-ac', String(channels),
+      'pipe:1',
     ];
 
     this._state = { status: 'recording', outputPath: this.outputPath };

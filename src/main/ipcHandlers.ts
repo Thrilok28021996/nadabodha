@@ -212,6 +212,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       }
       try {
         recorder.start();
+        const stream = recorder.getStream();
+        if (stream) {
+          transcriptionService.startStreaming(stream, { origin: 'dictation', append: true });
+        }
       } catch (err) {
         if (id !== dictationTakeId) return;
         dictationTakeOpen = false;
@@ -256,6 +260,8 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       const usable =
         typeof outputPath === 'string' && outputPath.length > 0 && fs.existsSync(outputPath);
       if (usable) {
+        // Cancel the streaming process before running the file pass
+        transcriptionService.cancel();
         // Dictation appends: the transcript grows take by take.
         transcriptionService.startTranscription(outputPath, {
           append: true,
@@ -411,6 +417,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       return { outputPath: null };
     }
     const outputPath = recorder.start();
+    const stream = recorder.getStream();
+    if (stream) {
+      transcriptionService.startStreaming(stream, { origin: 'transcription' });
+    }
     emit({ status: 'recording' });
     return { outputPath };
   });
@@ -422,6 +432,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     const usable =
       typeof outputPath === 'string' && outputPath.length > 0 && fs.existsSync(outputPath);
     if (usable) {
+      transcriptionService.cancel();
       transcriptionService.startTranscription(outputPath);
     }
     return { outputPath: usable ? outputPath : null };

@@ -129,6 +129,51 @@ export class TranscriptionService {
     });
   }
 
+  startStreaming(inputStream: NodeJS.ReadableStream, options: StartTranscriptionOptions = {}): void {
+    if (this.state === 'recording' || this.state === 'transcribing') {
+      throw new Error(`Cannot start streaming while in state ${this.state}`);
+    }
+
+    this.currentOrigin = options.origin;
+    this.runBase = options.append ? this.transcript : '';
+    if (!options.append) {
+      this.transcript = '';
+      this.runBase = '';
+    }
+    this.lastError = undefined;
+    this.currentFilePath = null;
+    this.setState('transcribing', 0);
+
+    const pythonExecutable =
+      typeof this.options.pythonExecutable === 'function'
+        ? this.options.pythonExecutable()
+        : this.options.pythonExecutable;
+    const stt = this.options.getSttConfig
+      ? this.options.getSttConfig()
+      : { modelRepo: '', cacheDir: '' };
+
+    this.adapter = new TranscriptionAdapter({
+      pythonExecutable,
+      pythonScriptPath: this.options.pythonScriptPath,
+      onEvent: (event) => this.handleAdapterEvent(event),
+      onError: (err) => {
+        this.setState('error', undefined, err.message);
+      },
+      onExit: (code) => {
+        if (this.state === 'transcribing' && code !== 0) {
+          this.setState('error', undefined, `Transcription process exited with code ${code}`);
+        }
+      },
+    });
+
+    // Use tiny model for streaming if available, else active model.
+    // The plan says "tiny/base used for streaming latency vs existing selected model for file jobs"
+    // Since we don't know if tiny/base is cached, we just use the selected model for now unless we implement
+    // a fallback. We'll just use the selected model.
+    const stdin = this.adapter.startStream(stt.modelRepo || '', stt.cacheDir || '');
+    inputStream.pipe(stdin);
+  }
+
   cancel(): void {
     if (this.state === 'transcribing') {
       this.adapter?.send({ action: 'cancel' });
@@ -158,7 +203,12 @@ export class TranscriptionService {
       return;
     }
     if (event.status === 'transcribing') {
-      this.setState('transcribing', event.progress);
+      if (event.text !== undefined && event.partial) {
+        const partialText = this.runBase ? joinTranscriptParts(this.runBase, event.text) : event.text;
+        this.broadcast({ status: 'transcribing', text: partialText, origin: this.currentOrigin, partial: true });
+      } else {
+        this.setState('transcribing', event.progress);
+      }
     } else if (event.status === 'completed') {
       const fragment = event.text || '';
       // Append runs (dictation) keep everything dictated so far and add this

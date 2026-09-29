@@ -68,6 +68,7 @@ export interface TranscriptionEvent {
   file?: string;
   bytesDone?: number;
   bytesTotal?: number;
+  partial?: boolean;
   // Auto-save results surfaced alongside the completed events
   savedTranscriptPath?: string;
   savedSummaryPath?: string;
