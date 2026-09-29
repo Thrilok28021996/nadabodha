@@ -14,8 +14,11 @@ export type ServiceState =
   | 'error';
 
 export interface TranscriptionServiceOptions {
-  pythonExecutable?: string;
+  /** Resolved lazily on every run so settings changes apply immediately. */
+  pythonExecutable?: string | (() => string);
   pythonScriptPath?: string;
+  /** Active Hugging Face model + cache dir handed to the Python adapter. */
+  getSttConfig?: () => { modelRepo: string; cacheDir: string };
 }
 
 export class TranscriptionService {
@@ -59,8 +62,16 @@ export class TranscriptionService {
     this.lastError = undefined;
     this.setState('transcribing', 0);
 
+    const pythonExecutable =
+      typeof this.options.pythonExecutable === 'function'
+        ? this.options.pythonExecutable()
+        : this.options.pythonExecutable;
+    const stt = this.options.getSttConfig
+      ? this.options.getSttConfig()
+      : { modelRepo: '', cacheDir: '' };
+
     this.adapter = new TranscriptionAdapter({
-      pythonExecutable: this.options.pythonExecutable,
+      pythonExecutable,
       pythonScriptPath: this.options.pythonScriptPath,
       onEvent: (event) => this.handleAdapterEvent(event),
       onError: (err) => {
@@ -78,7 +89,12 @@ export class TranscriptionService {
     });
 
     this.adapter.start();
-    this.adapter.send({ action: 'transcribe', file_path: filePath });
+    this.adapter.send({
+      action: 'transcribe',
+      file_path: filePath,
+      model_repo: stt.modelRepo || '',
+      cache_dir: stt.cacheDir || '',
+    });
   }
 
   cancel(): void {
@@ -100,6 +116,13 @@ export class TranscriptionService {
   }
 
   private handleAdapterEvent(event: TranscriptionEvent): void {
+    // Model-download events can be interleaved with transcription events
+    // (an active model that still needs fetching). They must reach the
+    // renderer untouched and must never advance the transcription state.
+    if (event.origin === 'download') {
+      this.broadcast(event);
+      return;
+    }
     if (event.status === 'transcribing') {
       this.setState('transcribing', event.progress);
     } else if (event.status === 'completed') {

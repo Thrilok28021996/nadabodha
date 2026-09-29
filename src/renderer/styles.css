@@ -118,3 +118,247 @@ progress {
   font-size: 14px;
   line-height: 1.5;
 }
+
+.app-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+button.gear {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0;
+}
+
+button.gear:hover:not(:disabled),
+button.gear[aria-expanded='true'] {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button.secondary {
+  background: var(--surface);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: #eef6ff;
+}
+
+button.danger {
+  background: var(--danger);
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.tab {
+  background: transparent;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 6px 10px;
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-spacer {
+  flex: 1;
+}
+
+.hint {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.hint[data-state='ok'] {
+  color: #1a7f37;
+  font-weight: 600;
+}
+
+.hint[data-state='error'] {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.hint[data-state='busy'] {
+  color: var(--accent);
+}
+
+.saved,
+.settings {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 16px;
+}
+
+.saved h3,
+.settings h2 {
+  margin: 0 0 8px;
+}
+
+.saved-path {
+  margin: 4px 0;
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+
+.setting-group {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+
+.setting-group h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.setting-group h4 {
+  margin: 14px 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.row label {
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 64px;
+}
+
+.row input[type='text'],
+.row input[type='password'],
+.row input[type='search'],
+.row select {
+  flex: 1;
+  min-width: 200px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  background: #fff;
+}
+
+.check {
+  display: block;
+  margin: 6px 0;
+  font-size: 14px;
+}
+
+.settings-actions {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+
+.model-list {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  margin-bottom: 8px;
+}
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.model-row:last-child {
+  border-bottom: none;
+}
+
+.model-row:hover {
+  background: #f0f6ff;
+}
+
+.model-row.selected {
+  background: #e3efff;
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.model-row.unsupported {
+  cursor: not-allowed;
+  opacity: 0.7;
+  background: #fafafa;
+}
+
+.model-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+
+.model-meta {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.model-reason {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.badge {
+  background: #1a7f37;
+  color: #fff;
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+/* Interrupted download: present on disk, not usable yet. */
+.badge.partial {
+  background: #b54708;
+}
+
+.model-row.partial {
+  background: #fff8f0;
+}
+
+code {
+  background: #ececf0;
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 13px;
+}

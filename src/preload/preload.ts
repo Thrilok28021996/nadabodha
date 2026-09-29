@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 /**
  * IPC channel names and payload shapes, duplicated here so the preload
@@ -14,6 +14,17 @@ enum IpcChannel {
   CopyTranscript = 'copy-transcript',
   TranscriptionEvent = 'transcription-event',
   RequestStatus = 'request-status',
+  SettingsGet = 'settings-get',
+  SettingsSet = 'settings-set',
+  ValidatePython = 'validate-python',
+  PickDirectory = 'pick-directory',
+  PickFile = 'pick-file',
+  TestLlmConnection = 'test-llm-connection',
+  ListHfModels = 'list-hf-models',
+  DownloadModel = 'download-model',
+  CancelDownload = 'cancel-download',
+  Summarize = 'summarize',
+  CancelSummary = 'cancel-summary',
 }
 
 type TranscriptionStatus =
@@ -22,13 +33,26 @@ type TranscriptionStatus =
   | 'transcribing'
   | 'completed'
   | 'cancelled'
-  | 'error';
+  | 'error'
+  | 'downloading'
+  | 'summarizing';
+
+type EventOrigin = 'transcription' | 'download' | 'summary';
 
 interface TranscriptionEvent {
   status: TranscriptionStatus;
   text?: string;
   progress?: number;
   error?: string;
+  origin?: EventOrigin;
+  repoId?: string;
+  path?: string;
+  file?: string;
+  bytesDone?: number;
+  bytesTotal?: number;
+  savedTranscriptPath?: string;
+  savedSummaryPath?: string;
+  saveError?: string;
 }
 
 interface SaveTranscriptRequest {
@@ -39,6 +63,53 @@ interface SaveTranscriptRequest {
 interface SaveTranscriptResult {
   success: boolean;
   filePath?: string;
+  error?: string;
+}
+
+interface AppSettings {
+  pythonPath: string;
+  llmBaseUrl: string;
+  llmModel: string;
+  llmApiKey: string;
+  dataDir: string;
+  sttCacheDir: string;
+  summarizationEnabled: boolean;
+  autoSummarize: boolean;
+  activeModel: string;
+}
+
+interface PythonValidation {
+  ok: boolean;
+  blocking: boolean;
+  message: string;
+}
+
+interface SettingsUpdateResult {
+  settings: AppSettings;
+  errors: Partial<Record<string, string>>;
+  messages?: Partial<Record<string, string>>;
+}
+
+interface LlmConnectionResult {
+  ok: boolean;
+  models: string[];
+  message: string;
+}
+
+interface HfModelInfo {
+  id: string;
+  downloads: number;
+  pipelineTag: string | null;
+  tags: string[];
+  kind: 'ctranslate2' | 'pytorch' | 'unsupported';
+  reason?: string;
+  format: string;
+}
+
+interface HfModelListResult {
+  models: HfModelInfo[];
+  installed: string[];
+  activeModel: string;
   error?: string;
 }
 
@@ -57,6 +128,19 @@ export interface ElectronApi {
   requestSavePath: () => Promise<string | undefined>;
   onTranscriptionEvent: (callback: (event: TranscriptionEvent) => void) => void;
   removeTranscriptionListener: () => void;
+  // Settings + summarization + model browser
+  getSettings: () => Promise<AppSettings>;
+  updateSettings: (patch: Partial<AppSettings>) => Promise<SettingsUpdateResult>;
+  validatePython: (pythonPath: string) => Promise<PythonValidation>;
+  pickDirectory: (title?: string) => Promise<string | null>;
+  pickPythonFile: () => Promise<string | null>;
+  getPathForFile?: (file: File) => string;
+  testLlmConnection: (baseUrl?: string) => Promise<LlmConnectionResult>;
+  listHfModels: (query?: string) => Promise<HfModelListResult>;
+  downloadModel: (repoId: string) => Promise<{ started: boolean; error?: string }>;
+  cancelDownload: () => Promise<{ cancelled: boolean }>;
+  summarize: (text?: string) => Promise<{ started: boolean; error?: string }>;
+  cancelSummary: () => Promise<{ cancelled: boolean }>;
 }
 
 const api: ElectronApi = {
@@ -78,6 +162,24 @@ const api: ElectronApi = {
   removeTranscriptionListener: () => {
     ipcRenderer.removeAllListeners(IpcChannel.TranscriptionEvent);
   },
+  getSettings: () => ipcRenderer.invoke(IpcChannel.SettingsGet),
+  updateSettings: (patch) => ipcRenderer.invoke(IpcChannel.SettingsSet, patch),
+  validatePython: (pythonPath) => ipcRenderer.invoke(IpcChannel.ValidatePython, pythonPath),
+  pickDirectory: (title) => ipcRenderer.invoke(IpcChannel.PickDirectory, title),
+  pickPythonFile: () => ipcRenderer.invoke(IpcChannel.PickFile),
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return (file as unknown as { path?: string }).path || '';
+    }
+  },
+  testLlmConnection: (baseUrl) => ipcRenderer.invoke(IpcChannel.TestLlmConnection, baseUrl),
+  listHfModels: (query) => ipcRenderer.invoke(IpcChannel.ListHfModels, query),
+  downloadModel: (repoId) => ipcRenderer.invoke(IpcChannel.DownloadModel, repoId),
+  cancelDownload: () => ipcRenderer.invoke(IpcChannel.CancelDownload),
+  summarize: (text) => ipcRenderer.invoke(IpcChannel.Summarize, { text }),
+  cancelSummary: () => ipcRenderer.invoke(IpcChannel.CancelSummary),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', api);

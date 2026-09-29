@@ -9,9 +9,12 @@
 </head>
 <body>
   <div class="app">
-    <header>
-      <h1>Nadabodha</h1>
-      <p>Local speech-to-text for macOS</p>
+    <header class="app-header">
+      <div>
+        <h1>Nadabodha</h1>
+        <p>Local speech-to-text for macOS</p>
+      </div>
+      <button id="settingsBtn" type="button" class="gear" title="Settings" aria-label="Settings" aria-expanded="false">&#9881;</button>
     </header>
 
     <section class="controls">
@@ -27,14 +30,121 @@
       <p id="errorText" class="error" hidden></p>
     </section>
 
-    <section class="transcript">
+    <section class="tabs" role="tablist">
+      <button id="tabTranscript" type="button" class="tab active" role="tab" aria-selected="true">Transcript</button>
+      <button id="tabSummary" type="button" class="tab" role="tab" aria-selected="false">Summary</button>
+      <span class="tab-spacer"></span>
+      <button id="summarizeBtn" type="button" disabled>Summarize</button>
+      <button id="cancelSummaryBtn" type="button" class="danger" hidden>Cancel Summary</button>
+    </section>
+
+    <section class="transcript" id="transcriptPanel">
       <label for="transcriptArea">Transcript</label>
       <textarea id="transcriptArea" readonly rows="12" placeholder="Transcript will appear here…"></textarea>
+    </section>
+
+    <section class="transcript" id="summaryPanel" hidden>
+      <label for="summaryArea">Summary</label>
+      <p id="summaryStatus" class="hint"></p>
+      <p id="summaryError" class="error" hidden></p>
+      <textarea id="summaryArea" readonly rows="12" placeholder="Summary will appear here…"></textarea>
     </section>
 
     <section class="actions">
       <button id="copyBtn" type="button" disabled>Copy</button>
       <button id="saveBtn" type="button" disabled>Save as Text</button>
+    </section>
+
+    <section class="saved" id="savedPanel" hidden>
+      <h3>Saved files</h3>
+      <p id="savedTranscriptPath" class="saved-path" hidden></p>
+      <p id="savedSummaryPath" class="saved-path" hidden></p>
+      <p id="saveErrorText" class="error" hidden></p>
+    </section>
+
+    <section class="settings" id="settingsPanel" hidden>
+      <h2>Settings</h2>
+
+      <div class="setting-group" id="pythonGroup">
+        <h3>Python interpreter</h3>
+        <div class="row">
+          <input type="text" id="pythonPathInput" placeholder="/path/to/python3" spellcheck="false" aria-label="Python interpreter path">
+          <button id="pythonBrowseBtn" type="button">Browse…</button>
+          <button id="pythonValidateBtn" type="button" class="secondary">Validate</button>
+        </div>
+        <p id="pythonStatus" class="hint" data-state=""></p>
+      </div>
+
+      <div class="setting-group" id="llmGroup">
+        <h3>Local LLM (OpenAI-compatible)</h3>
+        <div class="row">
+          <label for="llmBaseUrlInput">Base URL</label>
+          <input type="text" id="llmBaseUrlInput" spellcheck="false" placeholder="http://127.0.0.1:1234/v1">
+        </div>
+        <div class="row">
+          <label for="llmModelSelect">Model</label>
+          <select id="llmModelSelect" aria-label="LLM model">
+            <option value="">— none —</option>
+          </select>
+          <button id="llmRefreshBtn" type="button" class="secondary">Load models</button>
+        </div>
+        <div class="row">
+          <label for="llmApiKeyInput">API key</label>
+          <input type="password" id="llmApiKeyInput" autocomplete="off" placeholder="optional">
+          <button id="llmTestBtn" type="button" class="secondary">Test Connection</button>
+        </div>
+        <p id="llmStatus" class="hint"></p>
+      </div>
+
+      <div class="setting-group" id="dataDirGroup">
+        <h3>Data directory</h3>
+        <div class="row">
+          <input type="text" id="dataDirInput" spellcheck="false" placeholder="Folder holding transcripts/, summaries/, scripts/">
+          <button id="dataDirBrowseBtn" type="button">Choose…</button>
+        </div>
+        <p id="dataDirStatus" class="hint"></p>
+        <p class="hint">Created on save: <code>transcripts/</code> (auto-saved .txt), <code>summaries/</code> (auto-saved .md), <code>scripts/summarize-prompt.md</code> (editable prompt).</p>
+      </div>
+
+      <div class="setting-group" id="cacheDirGroup">
+        <h3>STT model cache directory</h3>
+        <div class="row">
+          <input type="text" id="cacheDirInput" spellcheck="false" placeholder="Where Hugging Face models are stored">
+          <button id="cacheDirBrowseBtn" type="button">Choose…</button>
+        </div>
+        <p id="cacheDirStatus" class="hint"></p>
+      </div>
+
+      <div class="setting-group" id="summarizationGroup">
+        <h3>Summarization</h3>
+        <label class="check"><input type="checkbox" id="summarizeEnabledChk"> Enable summarization</label>
+        <label class="check"><input type="checkbox" id="autoSummarizeChk"> Summarize automatically when a transcription completes</label>
+        <p id="promptPathStatus" class="hint"></p>
+      </div>
+
+      <div class="setting-group" id="modelBrowserGroup">
+        <h3>Hugging Face speech-to-text models</h3>
+        <div class="row">
+          <input type="search" id="hfSearchInput" spellcheck="false" placeholder="Search ASR models (empty = top by downloads)" aria-label="Search models">
+          <button id="hfSearchBtn" type="button" class="secondary">Search</button>
+        </div>
+        <p id="hfStatus" class="hint"></p>
+        <div id="hfResults" class="model-list" role="list" aria-label="Search results"></div>
+        <div class="row">
+          <button id="hfDownloadBtn" type="button" disabled>Download selected</button>
+          <button id="hfUseBtn" type="button" class="secondary" disabled>Set active</button>
+          <button id="hfCancelDownloadBtn" type="button" class="danger" hidden>Cancel download</button>
+        </div>
+        <progress id="downloadProgress" value="0" max="100" hidden></progress>
+        <p id="downloadStatus" class="hint"></p>
+        <h4>Installed</h4>
+        <div id="hfInstalled" class="model-list" role="list" aria-label="Installed models"></div>
+      </div>
+
+      <div class="row settings-actions">
+        <button id="settingsSaveBtn" type="button">Save settings</button>
+        <p id="settingsStatus" class="hint"></p>
+      </div>
     </section>
 
     <input type="file" id="fileInput" accept="audio/*" hidden>

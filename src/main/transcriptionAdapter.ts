@@ -94,6 +94,12 @@ export class TranscriptionAdapter extends EventEmitter {
         text: parsed.text,
         progress: typeof parsed.progress === 'number' ? parsed.progress : undefined,
         error: parsed.error,
+        origin: parsed.origin,
+        repoId: parsed.repo_id,
+        path: parsed.path,
+        file: parsed.file,
+        bytesDone: typeof parsed.bytes_done === 'number' ? parsed.bytes_done : undefined,
+        bytesTotal: typeof parsed.bytes_total === 'number' ? parsed.bytes_total : undefined,
       };
       this.options.onEvent(event);
     } catch (err) {

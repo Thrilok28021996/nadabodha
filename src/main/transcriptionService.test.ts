@@ -87,4 +87,24 @@ describe('TranscriptionService', () => {
       done();
     }, 150);
   });
+
+  it('forwards interleaved download events without touching transcription state', () => {
+    const service = new TranscriptionService();
+    const events: { status: string; origin?: string; progress?: number }[] = [];
+    service.onEvent((event) => events.push(event));
+
+    const internal = service as unknown as {
+      handleAdapterEvent: (event: { status: string; origin?: string; progress?: number }) => void;
+    };
+    internal.handleAdapterEvent({ status: 'downloading', origin: 'download', progress: 40 });
+    internal.handleAdapterEvent({ status: 'completed', origin: 'download' });
+
+    // state machine must stay untouched by download events
+    expect(service.getState()).toBe('idle');
+    expect(service.getTranscript()).toBe('');
+    expect(events).toEqual([
+      { status: 'downloading', origin: 'download', progress: 40 },
+      { status: 'completed', origin: 'download' },
+    ]);
+  });
 });
