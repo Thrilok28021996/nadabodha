@@ -93,6 +93,7 @@ interface AppSettings {
   activeModel: string;
   dictationEnabled: boolean;
   dictationPasteEnabled?: boolean;
+  meetingModeEnabled?: boolean;
 }
 
 interface DictationStatusInfo {
@@ -197,7 +198,7 @@ interface NoteActionResult {
 }
 
 export interface ElectronApi {
-  startRecording: () => Promise<{ outputPath: string }>;
+  startRecording: (options?: { meetingMode?: boolean }) => Promise<{ outputPath: string }>;
   stopRecording: () => Promise<{ outputPath: string | null }>;
   importAudio: (filePath: string) => Promise<{ filePath: string }>;
   cancelTranscription: () => Promise<{ cancelled: boolean }>;
@@ -240,7 +241,7 @@ export interface ElectronApi {
 }
 
 const api: ElectronApi = {
-  startRecording: () => ipcRenderer.invoke(IpcChannel.StartRecording),
+  startRecording: (options) => ipcRenderer.invoke(IpcChannel.StartRecording, options),
   stopRecording: () => ipcRenderer.invoke(IpcChannel.StopRecording),
   importAudio: (filePath: string) => ipcRenderer.invoke(IpcChannel.ImportAudio, filePath),
   cancelTranscription: () => ipcRenderer.invoke(IpcChannel.CancelTranscription),

@@ -36,7 +36,9 @@ interface RecorderState {
  */
 export class AudioRecorder extends EventEmitter {
   private process: ChildProcess | null = null;
+  private systemProcess: ChildProcess | null = null;
   private outputPath: string | null = null;
+  private systemOutputPath: string | undefined = undefined;
   private tempDir: string | null = null;
   private stopping = false;
   /**
@@ -62,8 +64,8 @@ export class AudioRecorder extends EventEmitter {
     return this.process?.stdout || null;
   }
 
-  start(): string {
-    if (this.process) {
+  start(options?: { meetingMode?: boolean }): { micPath: string; systemPath?: string } {
+    if (this.process || this.systemProcess) {
       throw new Error('Recording already in progress');
     }
 
@@ -96,6 +98,15 @@ export class AudioRecorder extends EventEmitter {
       this.process = spawn(ffmpeg, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+      
+      if (options?.meetingMode) {
+        this.systemOutputPath = path.join(this.tempDir, `system-${Date.now()}.wav`);
+        this.systemProcess = spawn('catap', [
+          'record', '--system', '--mono', '-o', this.systemOutputPath
+        ], {
+          stdio: 'ignore'
+        });
+      }
     } catch (err) {
       this._state = {
         status: 'error',
@@ -103,6 +114,10 @@ export class AudioRecorder extends EventEmitter {
         outputPath: null,
       };
       this.process = null;
+      if (this.systemProcess) {
+        this.killSignal(this.systemProcess, 'SIGKILL');
+        this.systemProcess = null;
+      }
       this.cleanupTempDir();
       throw err;
     }
@@ -144,10 +159,10 @@ export class AudioRecorder extends EventEmitter {
       this.process = null;
     });
 
-    return this.outputPath;
+    return { micPath: this.outputPath, systemPath: this.systemOutputPath };
   }
 
-  stop(): Promise<string | null> {
+  stop(): Promise<{ micPath: string; systemPath?: string } | null> {
     const proc = this.process;
     if (!proc) {
       if (this._state.status === 'recording') {
@@ -155,7 +170,7 @@ export class AudioRecorder extends EventEmitter {
         // untouched); finalise the same way a normal stop would.
         const verified = this.verifyRecording();
         if (verified) {
-          this._state = { status: 'idle', outputPath: verified };
+          this._state = { status: 'idle', outputPath: verified.micPath };
         }
         return Promise.resolve(verified);
       }
@@ -181,6 +196,12 @@ export class AudioRecorder extends EventEmitter {
         if (this.process === proc) {
           this.process = null;
         }
+        if (this.systemProcess) {
+          this.killSignal(this.systemProcess, 'SIGINT');
+          const sysEsc = setTimeout(() => this.systemProcess && this.killSignal(this.systemProcess, 'SIGTERM'), 1500);
+          const sysKill = setTimeout(() => { this.systemProcess && this.killSignal(this.systemProcess, 'SIGKILL'); this.systemProcess = null; }, 4000);
+          this.systemProcess.once('exit', () => { clearTimeout(sysEsc); clearTimeout(sysKill); this.systemProcess = null; });
+        }
         this.stopping = false;
         if (this._state.status === 'error') {
           // ffmpeg never produced a usable file (e.g. binary missing);
@@ -190,7 +211,7 @@ export class AudioRecorder extends EventEmitter {
         }
         const verified = this.verifyRecording();
         if (verified) {
-          this._state = { status: 'idle', outputPath: verified };
+          this._state = { status: 'idle', outputPath: verified.micPath };
         }
         resolve(verified);
       };
@@ -232,7 +253,7 @@ export class AudioRecorder extends EventEmitter {
    * after a cancel.
    */
   cancel(): string | null {
-    if (this.process) {
+    if (this.process || this.systemProcess) {
       this.cleanup();
     }
     const output = this.outputPath;
@@ -243,9 +264,18 @@ export class AudioRecorder extends EventEmitter {
         // Best-effort cleanup.
       }
     }
+    const sysOutput = this.systemOutputPath;
+    if (sysOutput && fs.existsSync(sysOutput)) {
+      try {
+        fs.unlinkSync(sysOutput);
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
     this.cleanupTempDir();
     this.resetState();
     this.outputPath = null;
+    this.systemOutputPath = undefined;
     return null;
   }
 
@@ -258,7 +288,7 @@ export class AudioRecorder extends EventEmitter {
    * "File not found: .../recording-*.wav" (N-F2/F11). Fail here instead,
    * quoting ffmpeg's own stderr so the UI shows a recording error.
    */
-  private verifyRecording(): string | null {
+  private verifyRecording(): { micPath: string; systemPath?: string } | null {
     const output = this.outputPath;
     let size = -1;
     if (output) {
@@ -269,7 +299,7 @@ export class AudioRecorder extends EventEmitter {
       }
     }
     if (output && size > 0) {
-      return output;
+      return { micPath: output, systemPath: this.systemOutputPath };
     }
     const detail = this.stderrTail();
     const base = detail

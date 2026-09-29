@@ -71,7 +71,7 @@ export class TranscriptionService {
     return this.currentFilePath;
   }
 
-  startTranscription(filePath: string, options: StartTranscriptionOptions = {}): void {
+  startTranscription(paths: { micPath: string; systemPath?: string } | string, options: StartTranscriptionOptions = {}): void {
     if (this.state === 'recording' || this.state === 'transcribing') {
       throw new Error(`Cannot start transcription while in state ${this.state}`);
     }
@@ -79,15 +79,16 @@ export class TranscriptionService {
     this.currentOrigin = options.origin;
     this.runBase = options.append ? this.transcript : '';
 
-    if (!fs.existsSync(filePath)) {
-      this.setState('error', undefined, `File not found: ${filePath}`);
+    const micPath = typeof paths === 'string' ? paths : paths.micPath;
+    const systemPath = typeof paths === 'string' ? undefined : paths.systemPath;
+
+    if (!fs.existsSync(micPath)) {
+      this.setState('error', undefined, `File not found: ${micPath}`);
       return;
     }
 
-    this.currentFilePath = filePath;
+    this.currentFilePath = micPath;
     if (!options.append) {
-      // Replace semantics (plain record / import): the previous transcript is
-      // dropped as soon as a new run starts.
       this.transcript = '';
       this.runBase = '';
     }
@@ -102,31 +103,78 @@ export class TranscriptionService {
       ? this.options.getSttConfig()
       : { modelRepo: '', cacheDir: '' };
 
-    this.adapter = new TranscriptionAdapter({
-      pythonExecutable,
-      pythonScriptPath: this.options.pythonScriptPath,
-      onEvent: (event) => this.handleAdapterEvent(event),
-      onError: (err) => {
-        this.setState('error', undefined, err.message);
-      },
-      onExit: (code) => {
-        if (this.state === 'transcribing' && code !== 0) {
-          this.setState(
-            'error',
-            undefined,
-            `Transcription process exited with code ${code}`
-          );
-        }
-      },
-    });
+    const runAdapter = (filePath: string, role: 'mic' | 'system', onDone: (text: string) => void) => {
+      let runTranscript = '';
+      const adapter = new TranscriptionAdapter({
+        pythonExecutable,
+        pythonScriptPath: this.options.pythonScriptPath,
+        onEvent: (event) => {
+          if (event.origin === 'download') {
+            this.broadcast(event);
+            return;
+          }
+          if (event.status === 'transcribing') {
+            if (event.text !== undefined && event.partial) {
+              const prefix = role === 'mic' && systemPath ? '[You] ' : role === 'system' ? '[Others] ' : '';
+              const partialText = this.runBase ? joinTranscriptParts(this.runBase, prefix + event.text) : prefix + event.text;
+              this.broadcast({ status: 'transcribing', text: partialText, origin: this.currentOrigin, partial: true });
+            } else {
+              this.setState('transcribing', event.progress);
+            }
+          } else if (event.status === 'completed') {
+            runTranscript = event.text || '';
+            if (role === 'mic' && systemPath) {
+              const formatted = runTranscript.split('\n').map(l => l.trim() ? `[You] ${l}` : l).join('\n');
+              this.runBase = this.runBase ? joinTranscriptParts(this.runBase, formatted) : formatted;
+              this.cleanup();
+              onDone(formatted);
+            } else if (role === 'system') {
+              const formatted = runTranscript.split('\n').map(l => l.trim() ? `[Others] ${l}` : l).join('\n');
+              this.transcript = this.runBase ? joinTranscriptParts(this.runBase, formatted) : formatted;
+              this.setState('completed', 100, undefined, this.transcript);
+              this.cleanup();
+            } else {
+              this.transcript = this.runBase ? joinTranscriptParts(this.runBase, runTranscript) : runTranscript;
+              this.setState('completed', 100, undefined, this.transcript);
+              this.cleanup();
+            }
+          } else if (event.status === 'error') {
+            this.setState('error', undefined, event.error);
+            this.cleanup();
+          } else if (event.status === 'cancelled') {
+            this.setState('cancelled');
+            this.cleanup();
+          }
+        },
+        onError: (err) => {
+          if (this.adapter === adapter) {
+            this.setState('error', undefined, err.message);
+          }
+        },
+        onExit: (code) => {
+          if (this.adapter === adapter && this.state === 'transcribing' && code !== 0 && code !== null) {
+            this.setState('error', undefined, `Transcription process exited with code ${code}`);
+          }
+        },
+      });
 
-    this.adapter.start();
-    this.adapter.send({
-      action: 'transcribe',
-      file_path: filePath,
-      model_repo: stt.modelRepo || '',
-      cache_dir: stt.cacheDir || '',
-    });
+      this.adapter = adapter;
+      adapter.start();
+      adapter.send({
+        action: 'transcribe',
+        file_path: filePath,
+        model_repo: stt.modelRepo || '',
+        cache_dir: stt.cacheDir || '',
+      });
+    };
+
+    if (systemPath && fs.existsSync(systemPath)) {
+      runAdapter(micPath, 'mic', () => {
+        runAdapter(systemPath, 'system', () => {});
+      });
+    } else {
+      runAdapter(micPath, 'mic', () => {});
+    }
   }
 
   startStreaming(inputStream: NodeJS.ReadableStream, options: StartTranscriptionOptions = {}): void {

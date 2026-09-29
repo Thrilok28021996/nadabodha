@@ -43,22 +43,23 @@ describe('AudioRecorder', () => {
     const errors: Error[] = [];
     recorder.on('error', (err: Error) => errors.push(err));
 
-    const outputPath = recorder.start();
+    const { micPath: outputPath } = recorder.start();
     expect(typeof outputPath).toBe('string');
     expect(path.isAbsolute(outputPath)).toBe(true);
     expect(recorder.getState().status).toBe('recording');
 
-    const stoppedPath = await recorder.stop();
+    const stoppedResult = await recorder.stop();
     // Process should have exited.
     expect(recorder.getState().status).not.toBe('recording');
 
-    if (stoppedPath === null) {
+    if (stoppedResult === null) {
       // Host has no usable microphone (N-F2/F11): stop must fail loudly
       // instead of handing transcription a phantom path.
       expect(recorder.getState().status).toBe('error');
       expect(errors.length).toBeGreaterThan(0);
       expect(errors[errors.length - 1].message).toContain('Recording failed:');
     } else {
+      const stoppedPath = stoppedResult.micPath;
       expect(stoppedPath).toBe(outputPath);
       expect(fs.existsSync(stoppedPath)).toBe(true);
       expect(fs.statSync(stoppedPath).size).toBeGreaterThan(0);
@@ -68,7 +69,7 @@ describe('AudioRecorder', () => {
 
   it('cleans up temp file on cancel', async () => {
     const recorder = new AudioRecorder();
-    const outputPath = recorder.start();
+    const { micPath: outputPath } = recorder.start();
     const tempDir = path.dirname(outputPath);
     try {
       // ffmpeg creates the file only after it opens the output, on a later
@@ -99,13 +100,13 @@ describe('AudioRecorder', () => {
       recorder.on('error', (err: Error) => errors.push(err));
 
       recorder.start();
-      const stoppedPath = await recorder.stop();
+      const stoppedResult = await recorder.stop();
 
       expect(errors.length).toBeGreaterThan(0);
       expect(errors[0].message).toContain('ENOENT');
       expect(recorder.getState().status).toBe('error');
       // stop() must settle even though the process never spawned (F5).
-      expect(stoppedPath).toBeNull();
+      expect(stoppedResult).toBeNull();
     } finally {
       fs.rmSync(emptyBin, { recursive: true, force: true });
     }
@@ -122,7 +123,7 @@ describe('AudioRecorder', () => {
       const errors: Error[] = [];
       recorder.on('error', (err: Error) => errors.push(err));
 
-      const outputPath = recorder.start();
+      const { micPath: outputPath } = recorder.start();
       expect(recorder.getState().status).toBe('recording');
 
       const stoppedPath = await recorder.stop();
@@ -158,7 +159,7 @@ describe('AudioRecorder', () => {
       const errors: Error[] = [];
       recorder.on('error', (err: Error) => errors.push(err));
 
-      const outputPath = recorder.start();
+      const { micPath: outputPath } = recorder.start();
       // Let the fake ffmpeg write stderr and exit; a small extra delay
       // ensures the piped stderr has been drained by this process.
       await waitFor(() => fs.existsSync(marker), 5000);
@@ -254,15 +255,15 @@ describe('AudioRecorder', () => {
     const errors: Error[] = [];
     recorder.on('error', (err: Error) => errors.push(err));
 
-    const outputPath = recorder.start();
+    const { micPath: outputPath } = recorder.start();
     const tempDir = path.dirname(outputPath);
 
     expect(recorder.cancel()).toBeNull();
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(fs.existsSync(tempDir)).toBe(false);
 
-    const stoppedPath = await recorder.stop();
-    expect(stoppedPath).toBeNull();
+    const stoppedResult = await recorder.stop();
+    expect(stoppedResult).toBeNull();
     expect(recorder.getState().status).toBe('idle');
     // Nothing failed; cancel/stop must not fabricate recording errors.
     expect(errors).toHaveLength(0);
@@ -287,9 +288,9 @@ describe('AudioRecorder', () => {
     const secondStop = await recorder.stop();
 
     expect(secondStop).toBeNull();
-    if (firstStop !== null) {
-      expect(fs.existsSync(firstStop)).toBe(true);
-      expect(fs.statSync(firstStop).size).toBeGreaterThan(0);
+    if (firstStop) {
+      expect(fs.existsSync(firstStop.micPath)).toBe(true);
+      expect(fs.statSync(firstStop.micPath).size).toBeGreaterThan(0);
     }
   });
 });

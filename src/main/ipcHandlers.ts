@@ -4,6 +4,7 @@ import path from 'path';
 import {
   IpcChannel,
   TranscriptionEvent,
+  StartRecordingRequest,
   SaveTranscriptRequest,
   AppSettings,
   SettingsUpdateResult,
@@ -258,7 +259,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       const outputPath = await recorder.stop();
       dictationTakeOpen = false;
       const usable =
-        typeof outputPath === 'string' && outputPath.length > 0 && fs.existsSync(outputPath);
+        outputPath && typeof outputPath.micPath === 'string' && outputPath.micPath.length > 0 && fs.existsSync(outputPath.micPath);
       if (usable) {
         // Cancel the streaming process before running the file pass
         transcriptionService.cancel();
@@ -406,7 +407,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     };
   });
 
-  ipcMain.handle(IpcChannel.StartRecording, async () => {
+  ipcMain.handle(IpcChannel.StartRecording, async (_event: unknown, request?: StartRecordingRequest) => {
     // Microphone permission first: a denial must never spawn ffmpeg (a
     // blocked capture device fails with a cryptic avfoundation error or a
     // hung device open). The guidance goes out on the same error-event route
@@ -416,26 +417,35 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       emit({ status: 'error', error: MICROPHONE_DENIED_MESSAGE });
       return { outputPath: null };
     }
-    const outputPath = recorder.start();
+    
+    if (request?.meetingMode) {
+      const { ensureScreenPermission, SCREEN_DENIED_MESSAGE } = require('./micPermission');
+      const screenPerm = await ensureScreenPermission();
+      if (!screenPerm.granted) {
+        emit({ status: 'error', error: SCREEN_DENIED_MESSAGE });
+        return { outputPath: null };
+      }
+    }
+    
+    const paths = recorder.start({ meetingMode: request?.meetingMode });
     const stream = recorder.getStream();
     if (stream) {
       transcriptionService.startStreaming(stream, { origin: 'transcription' });
     }
     emit({ status: 'recording' });
-    return { outputPath };
+    return { outputPath: paths.micPath };
   });
 
   ipcMain.handle(IpcChannel.StopRecording, async () => {
-    const outputPath = await recorder.stop();
+    const paths = await recorder.stop();
     // N-F2: a null path, or one whose file never materialised, must never
     // reach transcription, where it surfaces as "File not found".
-    const usable =
-      typeof outputPath === 'string' && outputPath.length > 0 && fs.existsSync(outputPath);
+    const usable = paths && typeof paths.micPath === 'string' && paths.micPath.length > 0 && fs.existsSync(paths.micPath);
     if (usable) {
       transcriptionService.cancel();
-      transcriptionService.startTranscription(outputPath);
+      transcriptionService.startTranscription(paths);
     }
-    return { outputPath: usable ? outputPath : null };
+    return { outputPath: usable ? paths.micPath : null };
   });
 
   ipcMain.handle(IpcChannel.ImportAudio, async (_event: unknown, filePath: string) => {

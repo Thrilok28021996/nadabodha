@@ -69,6 +69,7 @@ interface AppSettings {
   activeModel: string;
   dictationEnabled: boolean;
   dictationPasteEnabled?: boolean;
+  meetingModeEnabled?: boolean;
 }
 interface DictationStatusInfo { supported: boolean; enabled: boolean; accessibilityTrusted: boolean; running: boolean; reason?: string; }
 interface HfModelInfo { id: string; downloads: number; pipelineTag: string | null; tags: string[]; kind: string; reason?: string; format: string; }
@@ -78,7 +79,7 @@ interface PythonValidation { ok: boolean; blocking: boolean; message: string; }
 interface SettingsUpdateResult { settings: AppSettings; errors: Partial<Record<string, string>>; messages?: Partial<Record<string, string>>; }
 
 interface ElectronAPI {
-  startRecording(): Promise<{ outputPath: string }>;
+  startRecording(options?: { meetingMode?: boolean }): Promise<{ outputPath: string }>;
   stopRecording(): Promise<{ outputPath: string | null }>;
   importAudio(fp: string): Promise<{ filePath: string }>;
   cancelTranscription(): Promise<{ cancelled: boolean }>;
@@ -930,6 +931,7 @@ async function loadSettings(): Promise<void> {
     autoSummarizeChk.checked = currentSettings.autoSummarize;
     (document.getElementById('settingsDictationChk') as HTMLInputElement).checked = currentSettings.dictationEnabled;
     (document.getElementById('dictationPasteChk') as HTMLInputElement).checked = currentSettings.dictationPasteEnabled !== false;
+    (document.getElementById('meetingModeChk') as HTMLInputElement).checked = currentSettings.meetingModeEnabled === true;
     activeModel = currentSettings.activeModel || '';
     setHint(promptPathStatus, activeModel ? `Active model: ${activeModel}` : 'No STT model selected');
   } catch (err) {
@@ -949,6 +951,7 @@ async function saveSettings(): Promise<void> {
     autoSummarize: autoSummarizeChk.checked,
     dictationEnabled: (document.getElementById('settingsDictationChk') as HTMLInputElement).checked,
     dictationPasteEnabled: (document.getElementById('dictationPasteChk') as HTMLInputElement).checked,
+    meetingModeEnabled: (document.getElementById('meetingModeChk') as HTMLInputElement).checked,
   };
   if (activeModel) patch.activeModel = activeModel;
 
@@ -1096,7 +1099,8 @@ addFolderBtn.addEventListener('click', () => {
 // Record buttons (sidebar + empty state)
 async function startRecording(): Promise<void> {
   try {
-    await api.startRecording();
+    const meetingModeChk = document.getElementById('meetingModeChk') as HTMLInputElement;
+    await api.startRecording({ meetingMode: meetingModeChk ? meetingModeChk.checked : false });
     // The recording event will arrive via onTranscriptionEvent
     pendingTranscriptNoteId = null;
   } catch (err) {

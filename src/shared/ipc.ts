@@ -75,6 +75,10 @@ export interface TranscriptionEvent {
   saveError?: string;
 }
 
+export interface StartRecordingRequest {
+  meetingMode?: boolean;
+}
+
 export interface ImportAudioRequest {
   filePath: string;
 }
@@ -111,6 +115,7 @@ export interface AppSettings {
   dictationEnabled: boolean;
   /** Whether dictation pastes text at cursor. Default ON. OFF = append-in-app only. */
   dictationPasteEnabled?: boolean;
+  meetingModeEnabled?: boolean;
 }
 
 /** Live state of the hold-Option dictation hook. */

@@ -2,7 +2,8 @@
 # Install only the adapter(s) you plan to use.
 
 # Best-quality local transcription (downloads models automatically)
-# openai-whisper
+openai-whisper
+catap
 
 # Lightweight alternative; requires a model directory set via VOSK_MODEL
 # vosk
