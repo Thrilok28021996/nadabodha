@@ -23,7 +23,7 @@ const STRING_KEYS = [
   'activeModel',
 ] as const;
 
-const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled'] as const;
+const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled'] as const;
 
 export function settingsFilePath(userDataDir: string): string {
   return path.join(userDataDir, SETTINGS_FILE_NAME);
@@ -45,6 +45,7 @@ export function defaultSettings(
     autoSummarize: true,
     activeModel: '',
     dictationEnabled: true,
+    dictationPasteEnabled: true, // Stage 2: ON by default
   };
 }
 

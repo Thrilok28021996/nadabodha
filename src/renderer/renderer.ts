@@ -67,6 +67,7 @@ interface AppSettings {
   autoSummarize: boolean;
   activeModel: string;
   dictationEnabled: boolean;
+  dictationPasteEnabled?: boolean;
 }
 interface DictationStatusInfo { supported: boolean; enabled: boolean; accessibilityTrusted: boolean; running: boolean; reason?: string; }
 interface HfModelInfo { id: string; downloads: number; pipelineTag: string | null; tags: string[]; kind: string; reason?: string; format: string; }
@@ -759,30 +760,41 @@ async function handleTranscriptionCompleted(text: string, event: TranscriptionEv
 }
 
 async function appendDictationText(text: string): Promise<void> {
-  // Append to the selected note if it's a dictation-log note,
-  // otherwise update transcript display inline
-  if (selectedNoteId) {
-    const note = notes.find(n => n.id === selectedNoteId);
-    if (note) {
-      const updated = currentNoteContent.transcript
-        ? currentNoteContent.transcript + '\n\n' + text
-        : text;
-      await api.updateNote({ id: selectedNoteId, transcript: updated });
+  // Find today's dictation log note
+  const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const title = `Dictation Log - ${today}`;
+  
+  let logNote = notes.find(n => n.source === 'dictation-log' && n.title === title);
+  
+  if (logNote) {
+    const result = await api.readNoteContent(logNote.id);
+    const existing = result.content?.transcript || '';
+    const updated = existing ? existing + '\n\n' + text : text;
+    await api.updateNote({ id: logNote.id, transcript: updated });
+    
+    // If it's the currently selected note, update UI immediately
+    if (selectedNoteId === logNote.id) {
       currentNoteContent.transcript = updated;
       transcriptArea.value = updated;
       copyBtn.disabled = false;
       saveBtn.disabled = false;
-      return;
+    }
+  } else {
+    // Create new log note for today
+    const req = {
+      title,
+      source: 'dictation-log',
+      folder: 'Dictation',
+      transcript: text
+    };
+    const result = await api.createNote(req);
+    if (result.success && result.note) {
+      logNote = result.note;
     }
   }
-  // Fallback: show in transcript area
-  if (transcriptArea.value) {
-    transcriptArea.value += '\n\n' + text;
-  } else {
-    transcriptArea.value = text;
-  }
-  copyBtn.disabled = false;
-  saveBtn.disabled = false;
+  
+  // Reload notes to reflect new size/content
+  await loadNotes();
 }
 
 function handleSummaryEvent(event: TranscriptionEvent): void {
@@ -899,6 +911,7 @@ async function loadSettings(): Promise<void> {
     summarizeEnabledChk.checked = currentSettings.summarizationEnabled;
     autoSummarizeChk.checked = currentSettings.autoSummarize;
     (document.getElementById('settingsDictationChk') as HTMLInputElement).checked = currentSettings.dictationEnabled;
+    (document.getElementById('dictationPasteChk') as HTMLInputElement).checked = currentSettings.dictationPasteEnabled !== false;
     activeModel = currentSettings.activeModel || '';
     setHint(promptPathStatus, activeModel ? `Active model: ${activeModel}` : 'No STT model selected');
   } catch (err) {
@@ -917,6 +930,7 @@ async function saveSettings(): Promise<void> {
     summarizationEnabled: summarizeEnabledChk.checked,
     autoSummarize: autoSummarizeChk.checked,
     dictationEnabled: (document.getElementById('settingsDictationChk') as HTMLInputElement).checked,
+    dictationPasteEnabled: (document.getElementById('dictationPasteChk') as HTMLInputElement).checked,
   };
   if (activeModel) patch.activeModel = activeModel;
 

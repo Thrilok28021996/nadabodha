@@ -38,6 +38,7 @@ import {
   TOO_SHORT_NOTICE,
 } from './dictation';
 import { NoteStore, NoteRecord } from './noteStore';
+import { pasteTextAtCursor } from './paste';
 
 
 export interface IpcSetupOptions {
@@ -328,7 +329,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
 
   // ---- Transcription events (autosave + auto-summary) ------------------------
 
-  transcriptionService.onEvent((event) => {
+  transcriptionService.onEvent(async (event) => {
     if (event.origin === 'download' || event.origin === 'summary') {
       emit(event);
       return;
@@ -341,9 +342,27 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
 
     const settings = settingsStore.get();
     const text = event.text || '';
+
+    let dictationNotice: string | undefined;
+
+    // Stage 2: Dictation insert-at-cursor
+    if (event.origin === 'dictation' && settings.dictationPasteEnabled !== false && text) {
+      const pasteResult = await pasteTextAtCursor(text).catch(err => {
+        console.error('[paste] failed', err);
+        return 'error' as const;
+      });
+      
+      if (pasteResult === 'secure-input') {
+        dictationNotice = 'Skipped paste (Secure Input active)';
+      } else if (pasteResult === 'error') {
+        dictationNotice = 'Paste failed, saved to log';
+      }
+    }
+
     let withSaves: TranscriptionEvent = {
       ...event,
       origin: event.origin === 'dictation' ? 'dictation' : 'transcription',
+      ...(dictationNotice ? { dictationNotice } : {})
     };
 
     if (settings.dataDir) {
@@ -511,6 +530,9 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       }
       if (typeof patch.dictationEnabled === 'boolean') {
         accepted.dictationEnabled = patch.dictationEnabled;
+      }
+      if (typeof patch.dictationPasteEnabled === 'boolean') {
+        accepted.dictationPasteEnabled = patch.dictationPasteEnabled;
       }
 
       try {

@@ -108,6 +108,8 @@ export interface AppSettings {
   activeModel: string;
   /** Hold-Option system-wide dictation (workstream 3). Default ON. */
   dictationEnabled: boolean;
+  /** Whether dictation pastes text at cursor. Default ON. OFF = append-in-app only. */
+  dictationPasteEnabled?: boolean;
 }
 
 /** Live state of the hold-Option dictation hook. */

@@ -91,6 +91,7 @@ interface AppSettings {
   autoSummarize: boolean;
   activeModel: string;
   dictationEnabled: boolean;
+  dictationPasteEnabled?: boolean;
 }
 
 interface DictationStatusInfo {
