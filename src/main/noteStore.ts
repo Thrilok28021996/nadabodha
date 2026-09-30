@@ -194,13 +194,26 @@ const NOTES_SUBDIR = 'notes';
 // ---------------------------------------------------------------------------
 
 export class NoteStore {
-  private readonly dataDir: string;
-  private readonly notesDir: string;
+  private dataDir: string;
+  private notesDir: string;
   private index: Map<string, NoteRecord> = new Map();
 
   constructor(dataDir: string) {
     this.dataDir = dataDir;
     this.notesDir = path.join(dataDir, NOTES_SUBDIR);
+  }
+
+  /**
+   * Point the store at a (potentially different) data dir and rebuild the
+   * in-memory index. Called when the user changes dataDir in settings so the
+   * vault follows the setting instead of keeping the boot-time directory.
+   */
+  setDataDir(dataDir: string): NoteStoreResult<NoteRecord[]> {
+    if (dataDir !== this.dataDir) {
+      this.dataDir = dataDir;
+      this.notesDir = path.join(dataDir, NOTES_SUBDIR);
+    }
+    return this.reindex();
   }
 
   /**

@@ -8,7 +8,12 @@ export interface TranscriptionAdapterOptions {
   pythonScriptPath?: string;
   onEvent: (event: TranscriptionEvent) => void;
   onError: (error: Error) => void;
-  onExit: (code: number | null) => void;
+  /**
+   * The child exited. `code` is null when the process was terminated by a
+   * signal — `signal` carries which one so callers can report a real reason
+   * instead of "exited with code null".
+   */
+  onExit: (code: number | null, signal?: NodeJS.Signals | null) => void;
 }
 
 /**
@@ -56,9 +61,9 @@ export class TranscriptionAdapter extends EventEmitter {
       this.options.onError(err);
     });
 
-    this.process.on('exit', (code) => {
+    this.process.on('exit', (code, signal) => {
       this.process = null;
-      this.options.onExit(code);
+      this.options.onExit(code, signal);
     });
   }
 
@@ -93,17 +98,27 @@ export class TranscriptionAdapter extends EventEmitter {
       this.options.onError(err);
     });
 
-    this.process.on('exit', (code) => {
+    this.process.on('exit', (code, signal) => {
       this.process = null;
-      this.options.onExit(code);
+      this.options.onExit(code, signal);
     });
 
     return this.process.stdin!;
   }
 
   stop(): void {
-    if (!this.process) return;
-    this.process.kill('SIGTERM');
+    const proc = this.process;
+    if (!proc) return;
+    // A child that never spawned (ENOENT python) has no pid; killing it would
+    // signal pid 0 — the whole process group. Same guard the recorder uses.
+    if (proc.pid === undefined || proc.exitCode !== null || proc.signalCode !== null) {
+      return;
+    }
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      // Best-effort: the child may have exited between the check and the kill.
+    }
   }
 
   send(command: unknown): void {
@@ -139,6 +154,10 @@ export class TranscriptionAdapter extends EventEmitter {
         file: parsed.file,
         bytesDone: typeof parsed.bytes_done === 'number' ? parsed.bytes_done : undefined,
         bytesTotal: typeof parsed.bytes_total === 'number' ? parsed.bytes_total : undefined,
+        // Streaming partials and word timestamps are part of the adapter's
+        // JSON contract; dropping them here silently broke live partials.
+        partial: typeof parsed.partial === 'boolean' ? parsed.partial : undefined,
+        words: Array.isArray(parsed.words) ? parsed.words : undefined,
       };
       this.options.onEvent(event);
     } catch {

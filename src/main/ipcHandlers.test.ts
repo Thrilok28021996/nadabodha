@@ -101,6 +101,7 @@ const mockNoteStore = {
   update: jest.fn(),
   delete: jest.fn(),
   reindex: jest.fn(() => ({ success: true })),
+  setDataDir: jest.fn(() => ({ success: true })),
   migrateFromLegacy: jest.fn(),
 };
 

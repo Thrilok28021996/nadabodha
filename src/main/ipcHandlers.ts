@@ -318,13 +318,15 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     const pending = dictationStartPromise;
     void (async () => {
       if (pending) await pending.catch(() => undefined);
+      // Cancel streaming BEFORE the recorder stops — same EOF race as
+      // StopRecording: the streaming child's own "completed" must not beat
+      // the file pass (it would append the take twice).
+      transcriptionService.cancel();
       const outputPath = await recorder.stop();
       dictationTakeOpen = false;
       const usable =
         outputPath && typeof outputPath.micPath === 'string' && outputPath.micPath.length > 0 && fs.existsSync(outputPath.micPath);
       if (usable) {
-        // Cancel the streaming process before running the file pass
-        transcriptionService.cancel();
         // Dictation appends: the transcript grows take by take.
         transcriptionService.startTranscription(outputPath, {
           append: true,
@@ -501,12 +503,16 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   });
 
   ipcMain.handle(IpcChannel.StopRecording, async () => {
+    // Commit stop: kill the streaming pass FIRST. Once the recorder stops,
+    // python sees stdin EOF and reports "completed" on its own — racing the
+    // file pass (a second note) or leaving a stale child that signals into
+    // the run that replaces it. cancel() is state-guarded and idempotent.
+    transcriptionService.cancel();
     const paths = await recorder.stop();
     // N-F2: a null path, or one whose file never materialised, must never
     // reach transcription, where it surfaces as "File not found".
     const usable = paths && typeof paths.micPath === 'string' && paths.micPath.length > 0 && fs.existsSync(paths.micPath);
     if (usable) {
-      transcriptionService.cancel();
       transcriptionService.startTranscription(paths);
     }
     return { outputPath: usable ? paths.micPath : null };
@@ -631,6 +637,15 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
 
       try {
         const settings = settingsStore.update(accepted);
+        if (typeof patch.dataDir === 'string' && !errors.dataDir) {
+          // The vault follows a dataDir change (noteStore only reads the dir
+          // it was constructed with, so without this new notes land in the
+          // boot-time directory and the list keeps showing the old vault).
+          noteStore.setDataDir(
+            settings.dataDir ||
+              path.join(app.getPath('userData'), 'nadabodha-data'),
+          );
+        }
         if (typeof patch.dictationEnabled === 'boolean') {
           // Start/stop the global hook immediately so the setting is live
           // without restarting the app.
@@ -854,12 +869,22 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       if (!req || typeof req !== 'object') {
         return { success: false, error: 'Invalid request' };
       }
+      const source = req.source || 'unknown';
+      // Stage 1 of the plan ("audio (when recorded)"): a note born from a
+      // transcription run keeps a copy of the WAV it was transcribed from.
+      // Without this the audio dies in os.tmpdir() and re-transcribe has
+      // no bytes to read.
+      const audioPath =
+        source === 'recording' ? transcriptionService.getCurrentFilePath() ?? undefined : undefined;
       const result = noteStore.create({
         title: typeof req.title === 'string' ? req.title : undefined,
-        source: req.source || 'unknown',
+        source,
         folder: typeof req.folder === 'string' ? req.folder : undefined,
         transcript: typeof req.transcript === 'string' ? req.transcript : undefined,
         words: req.words,
+        // Note field 'model' (plan): which STT model produced this transcript.
+        model: settingsStore.get().activeModel || undefined,
+        audioPath,
       });
       return {
         success: result.success,

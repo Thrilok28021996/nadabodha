@@ -38,7 +38,10 @@ export function defaultSettings(
   return {
     pythonPath: '',
     llmBaseUrl: DEFAULT_LLM_BASE_URL,
-    llmModel: '',
+    // Out-of-the-box auto-summarize against LM Studio: this model is loaded
+    // and served at 127.0.0.1:1234/v1 (a saved user value still wins —
+    // mergeSettings applies on top of these defaults).
+    llmModel: 'mistralai/ministral-3-3b',
     llmApiKey: '',
     dataDir: '',
     sttCacheDir: hfHome,

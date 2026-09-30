@@ -27,6 +27,8 @@ describe('defaultSettings', () => {
     expect(settings.summarizationEnabled).toBe(true);
     expect(settings.autoSummarize).toBe(true);
     expect(settings.activeModel).toBe('');
+    // Out-of-the-box auto-summarize target (LM Studio serves this model).
+    expect(settings.llmModel).toBe('mistralai/ministral-3-3b');
   });
 
   it('falls back to ~/.cache/huggingface when HF_HOME is unset', () => {

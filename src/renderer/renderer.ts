@@ -634,7 +634,9 @@ function showError(msg: string): void {
   statusBar.hidden = false;
   errorText.textContent = msg;
   errorText.hidden = false;
-  statusText.textContent = '';
+  // Keep the reason in #statusText too: blanking it here left the pipeline
+  // showing an empty status exactly when it had just died with a reason.
+  statusText.textContent = msg;
 }
 
 // ---------------------------------------------------------------------------
@@ -729,8 +731,20 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
       dictationNotice.hidden = false;
       dictationNotice.textContent = notice;
     }
+    if (status === 'error' && error) {
+      // A dictation take whose transcription died must say WHY instead of
+      // silently hiding the badge.
+      showError(error);
+    }
     if (status === 'completed' && text) {
       dictationBadge.textContent = '🎙️ Dictation active';
+      // In-app append fallback (plan Stage 2: "append-in-app becomes the
+      // fallback"): the finished take lands in the open transcript view as an
+      // append (text = prior transcript + this take), while the dictation-log
+      // note below keeps the history. Without this the transcript view never
+      // reflected a take unless the log note happened to be selected.
+      transcriptArea.value = text;
+      transcriptArea.style.opacity = '1.0';
       // Append to existing transcript or create a dictation-log note
       appendDictationText(text);
     }
@@ -774,7 +788,10 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
       // We are streaming during recording.
       transcriptArea.value = text;
       transcriptArea.style.opacity = '0.7';
-    } else {
+    } else if (!isRecording) {
+      // Progress lines from the file pass mean the recording UI is already
+      // done — but while a recording is live these are warm-up progress, and
+      // tearing the pill down here hid the Stop button seconds after start.
       stopRecordingUI();
     }
   } else if (status === 'completed' && text) {
@@ -797,7 +814,9 @@ async function handleTranscriptionCompleted(text: string, event: TranscriptionEv
   pendingTranscriptNoteId = null;
   if (routedNoteId) {
     const noteId = routedNoteId;
-    await api.updateNote({ id: noteId, transcript: text, markSummaryStale: true });
+    // D4 replace + record which model produced the new transcript (plan note
+    // field 'model').
+    await api.updateNote({ id: noteId, transcript: text, model: activeModel, markSummaryStale: true });
     await loadNotes();
     if (selectedNoteId === noteId) {
       openNote(noteId);
