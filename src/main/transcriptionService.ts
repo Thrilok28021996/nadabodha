@@ -74,6 +74,8 @@ export class TranscriptionService {
   private runBase = '';
   /** Origin stamped on the current run's events. */
   private currentOrigin: EventOrigin | undefined;
+  private pipedInputStream: NodeJS.ReadableStream | null = null;
+  private pipedStdin: NodeJS.WritableStream | null = null;
 
   constructor(private readonly options: TranscriptionServiceOptions = {}) {}
 
@@ -262,10 +264,38 @@ export class TranscriptionService {
     // Since we don't know if tiny/base is cached, we just use the selected model for now unless we implement
     // a fallback. We'll just use the selected model.
     const stdin = adapter.startStream(stt.modelRepo || '', stt.cacheDir || '');
+    this.pipedInputStream = inputStream;
+    this.pipedStdin = stdin;
+
+    const unpipeStreams = () => {
+      if (this.pipedInputStream && this.pipedStdin) {
+        try {
+          this.pipedInputStream.unpipe(this.pipedStdin);
+        } catch {}
+      }
+    };
+
+    stdin.on('error', () => {
+      unpipeStreams();
+    });
+    stdin.on('close', () => {
+      unpipeStreams();
+    });
+    inputStream.on('error', () => {
+      unpipeStreams();
+    });
+
     inputStream.pipe(stdin);
   }
 
   cancel(): void {
+    if (this.pipedInputStream && this.pipedStdin) {
+      try {
+        this.pipedInputStream.unpipe(this.pipedStdin);
+      } catch {}
+      this.pipedInputStream = null;
+      this.pipedStdin = null;
+    }
     const adapter = this.adapter;
     if (this.state === 'transcribing' && adapter) {
       try {
@@ -359,6 +389,13 @@ export class TranscriptionService {
    * child and wipe its context. A superseded adapter must only stop ITSELF.
    */
   private finishRun(adapter: TranscriptionAdapter | null): void {
+    if (this.pipedInputStream && this.pipedStdin) {
+      try {
+        this.pipedInputStream.unpipe(this.pipedStdin);
+      } catch {}
+      this.pipedInputStream = null;
+      this.pipedStdin = null;
+    }
     if (adapter) {
       adapter.stop();
     }

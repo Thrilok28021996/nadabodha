@@ -95,11 +95,46 @@ def apply_cache_dir(cache_dir: str) -> None:
     Explicit cache_dir/download_root arguments are passed as well; this only
     makes implicit lookups agree with them so nothing ever lands in ~/.cache
     when the user picked a different folder.
+
+    We also disable the xet transport here. The xet protocol (introduced in
+    huggingface_hub >=0.24) adds significant per-file connection overhead that
+    makes even small config files take 30-40 seconds each. The standard HTTPS
+    downloader is faster for all practical model sizes we support.
+
+    Finally, when HF_TOKEN is not in the environment (Electron launched from
+    the dock/Finder does not inherit shell RC exports), we fall back to reading
+    it from the token file written by ``huggingface-cli login`` so that
+    downloads are authenticated without any extra user action.
     """
-    if not cache_dir:
+    if cache_dir:
+        os.environ["HF_HOME"] = cache_dir
+        os.environ["HF_HUB_CACHE"] = cache_dir
+    os.environ.setdefault("HF_HUB_DISABLE_XET_TRANSPORT", "1")
+    _ensure_hf_token()
+
+
+def _ensure_hf_token() -> None:
+    """Inject HF_TOKEN from the huggingface-cli token file when not already set.
+
+    Electron apps launched from the dock do not inherit shell RC exports such
+    as ``export HF_TOKEN=...`` in ~/.zshrc.  The token file written by
+    ``huggingface-cli login`` works as a reliable fallback.
+    """
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
         return
-    os.environ["HF_HOME"] = cache_dir
-    os.environ["HF_HUB_CACHE"] = cache_dir
+    # Standard token-file locations (huggingface_hub writes the first one).
+    candidates = [
+        Path.home() / ".cache" / "huggingface" / "token",
+        Path.home() / ".huggingface" / "token",
+    ]
+    for path in candidates:
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+            if token:
+                os.environ["HF_TOKEN"] = token
+                return
+        except OSError:
+            continue
 
 
 def _snapshot_present(repo_id: str, cache_dir: str) -> bool:
@@ -385,17 +420,40 @@ def _make_progress_tqdm(reporter: ProgressReporter):
     class ProgressTqdm(hf_tqdm):  # type: ignore[misc,valid-type]
         def __init__(self, *args, **kwargs):  # noqa: ANN001
             super().__init__(*args, **kwargs)
-            # tqdm returns early for disabled bars and never assigns several
-            # attributes (unit/desc/initial). snapshot_download builds its
-            # aggregate byte bar with disable=<non-tty>, so without restoring
-            # `unit` the byte counters stay at 0 and the percentage jumps per
-            # finished file instead of tracking bytes.
-            if not hasattr(self, "unit"):
-                self.unit = kwargs.get("unit") or "it"
-            if not hasattr(self, "desc"):
-                self.desc = kwargs.get("desc") or ""
-            if not hasattr(self, "initial"):
-                self.initial = kwargs.get("initial") or 0
+            # tqdm skips attribute assignments for disabled bars (non-TTY).
+            # Guard every attribute that tqdm's `format_dict` property reads
+            # so that huggingface_hub's xet progress reporter never raises
+            # AttributeError regardless of tqdm version.
+            _DEFAULTS: dict = {
+                "unit": kwargs.get("unit") or "it",
+                "desc": kwargs.get("desc") or "",
+                "initial": kwargs.get("initial") or 0,
+                "dynamic_ncols": False,
+                "ncols": None,
+                "nrows": None,
+                "ascii": kwargs.get("ascii", False),
+                "unit_scale": kwargs.get("unit_scale", False),
+                "unit_divisor": kwargs.get("unit_divisor", 1000),
+                "bar_format": kwargs.get("bar_format", None),
+                "postfix": None,
+                "miniters": kwargs.get("miniters") or 0,
+                "smoothing": kwargs.get("smoothing", 0.3),
+                "colour": kwargs.get("colour", None),
+                "delay": kwargs.get("delay", 0),
+                "pos": 0,
+            }
+            for attr, default in _DEFAULTS.items():
+                if not hasattr(self, attr):
+                    setattr(self, attr, default)
+
+        def __getattr__(self, name: str):  # noqa: ANN001
+            # tqdm's format_dict calls self._ema_dn() and self._ema_dt() to
+            # compute the download rate. Disabled bars skip setting these up.
+            # Return a zero-callable so the rate just shows None instead of
+            # raising AttributeError.
+            if name.startswith("_ema_"):
+                return lambda: 0
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
         def update(self, n: int = 1):  # noqa: ANN001
             reporter.check_cancelled()
@@ -1002,27 +1060,45 @@ def _run_server() -> None:
             emit({"status": "error", "error": f"Unknown action: {action}"})
 
 
+def _drain_stdin() -> None:
+    """Drain stdin until EOF so the upstream audio recorder never encounters EPIPE."""
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read(4096)
+            if not chunk:
+                break
+    except Exception:
+        pass
+
+
 def run_stream(repo_id: str, cache_dir: str) -> None:
     import numpy as np
-    try:
-        from faster_whisper import WhisperModel  # type: ignore
-    except Exception as exc:
-        emit({"status": "error", "error": f"faster-whisper not available: {exc}"})
-        return
 
     apply_cache_dir(cache_dir)
-    emit({"status": "transcribing", "progress": 5})
 
-    try:
-        model = WhisperModel(
-            repo_id,
-            device="cpu",
-            compute_type="int8",
-            download_root=cache_dir or None,
-            local_files_only=True,
-        )
-    except Exception as exc:
-        emit({"status": "error", "error": f"faster-whisper load failed: {exc}"})
+    model = None
+    if repo_id:
+        try:
+            from faster_whisper import WhisperModel  # type: ignore
+            model = WhisperModel(
+                repo_id,
+                device="cpu",
+                compute_type="int8",
+                download_root=cache_dir or None,
+                local_files_only=True,
+            )
+        except Exception:
+            model = None
+
+    if model is None:
+        # If faster-whisper cannot load this model locally (e.g. PyTorch-only weights
+        # such as openai/whisper-* or nvidia/*, or unselected model), do not exit
+        # abruptly while the recorder is streaming audio into stdin. Instead, emit
+        # a friendly listening status and drain stdin until EOF. The final transcription
+        # pass will handle the saved WAV file using the full local loader chain.
+        emit({"status": "transcribing", "progress": 10, "text": "Listening…", "partial": True})
+        _drain_stdin()
+        emit({"status": "completed", "text": ""})
         return
 
     emit({"status": "transcribing", "progress": 10})
@@ -1105,12 +1181,13 @@ def main() -> None:
     parser.add_argument("--cache_dir", type=str, default="")
     args = parser.parse_args()
 
+    # Apply token and transport settings early — before any HF network call.
+    _ensure_hf_token()
+    os.environ.setdefault("HF_HUB_DISABLE_XET_TRANSPORT", "1")
+
     if args.server:
         _run_server()
     elif args.stream:
-        if not args.repo_id:
-            emit({"status": "error", "error": "repo_id is required for streaming"})
-            return
         run_stream(args.repo_id, args.cache_dir)
     else:
         parser.print_help()

@@ -6,6 +6,16 @@ import { TranscriptionService } from './transcriptionService';
 import { SettingsStore, resolvePythonExecutable, settingsFilePath } from './settingsStore';
 import { NoteStore } from './noteStore';
 
+// Suppress benign EPIPE errors from child process stream closures so they don't trigger
+// unhandled exception dialogs.
+process.on('uncaughtException', (err: Error) => {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+    return;
+  }
+  console.error('[Uncaught Exception]', err);
+});
+
 let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): void {

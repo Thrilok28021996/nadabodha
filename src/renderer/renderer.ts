@@ -1064,6 +1064,73 @@ async function saveSettings(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Curated featured models (shown by default without a search)
+// ---------------------------------------------------------------------------
+
+interface FeaturedModel {
+  id: string;
+  label: string;
+  size: string;
+  description: string;
+  kind: 'ctranslate2' | 'pytorch';
+}
+
+const FEATURED_MODELS: FeaturedModel[] = [
+  // OpenAI Whisper — via faster-whisper (CTranslate2, CPU-friendly)
+  { id: 'Systran/faster-whisper-tiny',   label: 'Whisper Tiny',   size: '~75 MB',  description: 'Fastest, lowest accuracy',         kind: 'ctranslate2' },
+  { id: 'Systran/faster-whisper-base',   label: 'Whisper Base',   size: '~145 MB', description: 'Good balance for short clips',      kind: 'ctranslate2' },
+  { id: 'Systran/faster-whisper-small',  label: 'Whisper Small',  size: '~465 MB', description: 'Recommended for most use cases',    kind: 'ctranslate2' },
+  { id: 'Systran/faster-whisper-medium', label: 'Whisper Medium', size: '~1.4 GB', description: 'High accuracy, needs ~4 GB RAM',    kind: 'ctranslate2' },
+  { id: 'Systran/faster-whisper-large-v3', label: 'Whisper Large v3', size: '~3 GB', description: 'Best accuracy, needs ~8 GB RAM', kind: 'ctranslate2' },
+  // Nvidia NeMo — via transformers (PyTorch)
+  { id: 'nvidia/canary-1b',    label: 'Nvidia Canary 1B',      size: '~4 GB', description: 'High accuracy, multilingual NeMo model',  kind: 'pytorch' },
+  { id: 'nvidia/parakeet-tdt-0.6b-v2', label: 'Nvidia Parakeet 0.6B', size: '~2.4 GB', description: 'Fast English ASR, NeMo model', kind: 'pytorch' },
+];
+
+function renderFeaturedModels(): void {
+  const container = document.getElementById('featuredList');
+  if (!container) return;
+  container.innerHTML = '';
+
+  for (const m of FEATURED_MODELS) {
+    const isInstalled = installedModels.includes(m.id);
+    const isActive    = m.id === activeModel;
+    const isSelected  = m.id === selectedModelId;
+
+    const card = document.createElement('div');
+    card.className = 'hf-featured-card' + (isSelected ? ' selected' : '') + (isInstalled ? ' installed' : '');
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    card.setAttribute('aria-pressed', String(isSelected));
+
+    const badge = m.kind === 'ctranslate2' ? 'OpenAI · CTranslate2' : 'Nvidia · PyTorch';
+    card.innerHTML = `
+      <div class="hf-featured-header">
+        <span class="hf-featured-label">${m.label}</span>
+        <span class="hf-featured-size">${m.size}</span>
+      </div>
+      <p class="hf-featured-desc">${m.description}</p>
+      <div class="hf-featured-footer">
+        <span class="hf-featured-badge">${badge}</span>
+        ${isInstalled ? `<span class="hf-featured-installed">${isActive ? '✓ Active' : 'Installed'}</span>` : ''}
+      </div>`;
+
+    card.addEventListener('click', () => {
+      selectedModelId = m.id;
+      renderFeaturedModels();
+      // Also deselect anything in the search results list
+      document.querySelectorAll('.hf-model-item').forEach(el =>
+        el.classList.toggle('selected', el.querySelector('.hf-model-id')?.textContent === selectedModelId)
+      );
+      renderHfSelection();
+    });
+    card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') card.click(); });
+
+    container.appendChild(card);
+  }
+}
+
 // HF model browser (preserving the existing UX from cycle 2)
 // ---------------------------------------------------------------------------
 
@@ -1077,14 +1144,19 @@ async function loadHfModels(query = ''): Promise<void> {
     installedModels = result.installed || [];
     activeModel = result.activeModel || activeModel;
 
+    // Always re-render featured cards so their Installed/Active badges update.
+    renderFeaturedModels();
+
     if (result.error) {
       setHint(hfStatus, result.error, 'error');
     } else {
       setHint(hfStatus, `${result.models.length} model${result.models.length !== 1 ? 's' : ''} found`);
     }
 
-    // Installed
+    // Installed — skip any that are already shown as featured cards
+    const featuredIds = new Set(FEATURED_MODELS.map(m => m.id));
     for (const id of installedModels) {
+      if (featuredIds.has(id)) continue; // shown in featured section instead
       const el = document.createElement('div');
       el.className = 'hf-model-item' + (id === selectedModelId ? ' selected' : '');
       el.innerHTML = `<span class="hf-model-id">${id}</span><span class="hf-model-format">Installed${id === activeModel ? ' ✓ Active' : ''}</span>`;
@@ -1452,7 +1524,42 @@ hfDownloadBtn.addEventListener('click', async () => {
 hfUseBtn.addEventListener('click', async () => {
   if (!selectedModelId) return;
   activeModel = selectedModelId;
+
+  // Persist immediately — don't wait for the user to click "Save settings".
+  try {
+    await api.updateSettings({ activeModel });
+  } catch { /* non-fatal; in-memory value is still correct */ }
+
+  // Update all visual indicators.
   setHint(promptPathStatus, `Active model: ${activeModel}`, 'ok');
+  setHint(downloadStatus, `✓ Now using ${activeModel}`, 'ok');
+
+  // Refresh featured cards so the "✓ Active" badge moves to the right card.
+  renderFeaturedModels();
+
+  // Refresh the installed flat list too.
+  hfInstalled.innerHTML = '';
+  const featuredIds = new Set(FEATURED_MODELS.map(m => m.id));
+  for (const id of installedModels) {
+    if (featuredIds.has(id)) continue;
+    const el = document.createElement('div');
+    el.className = 'hf-model-item' + (id === selectedModelId ? ' selected' : '');
+    el.innerHTML = `<span class="hf-model-id">${id}</span><span class="hf-model-format">Installed${id === activeModel ? ' ✓ Active' : ''}</span>`;
+    el.addEventListener('click', () => { selectedModelId = id; renderHfSelection(); });
+    hfInstalled.appendChild(el);
+  }
+
+  // Also update any search-result rows that match.
+  document.querySelectorAll('.hf-model-item').forEach(el => {
+    const idEl = el.querySelector('.hf-model-id');
+    const fmtEl = el.querySelector('.hf-model-format');
+    if (idEl && fmtEl) {
+      const id = idEl.textContent || '';
+      if (installedModels.includes(id)) {
+        fmtEl.textContent = `Installed${id === activeModel ? ' ✓ Active' : ''}`;
+      }
+    }
+  });
 });
 
 hfCancelDownloadBtn.addEventListener('click', async () => {

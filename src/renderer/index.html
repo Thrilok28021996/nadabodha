@@ -327,13 +327,28 @@
           <!-- HF model browser -->
           <div class="setting-group">
             <h3>STT model browser</h3>
-            <div class="setting-row">
-              <input type="text" id="hfSearchInput" placeholder="Search Hugging Face…" spellcheck="false" aria-label="Search Hugging Face models">
-              <button id="hfSearchBtn" type="button" class="chip-btn">Search</button>
-            </div>
-            <p id="hfStatus" class="setting-status"></p>
-            <div id="hfResults" class="hf-results"></div>
+
+            <!-- Installed models (always shown) -->
             <div id="hfInstalled" class="hf-installed"></div>
+
+            <!-- Featured / curated models -->
+            <div id="featuredModels" class="hf-featured">
+              <p class="hf-section-label">Featured models</p>
+              <div id="featuredList" class="hf-featured-list"></div>
+            </div>
+
+            <!-- Collapsible HF search -->
+            <details id="hfSearchDetails" class="hf-search-details">
+              <summary class="hf-search-summary">Search Hugging Face for more models</summary>
+              <div class="setting-row" style="margin-top:8px">
+                <input type="text" id="hfSearchInput" placeholder="e.g. whisper large, nvidia parakeet…" spellcheck="false" aria-label="Search Hugging Face models">
+                <button id="hfSearchBtn" type="button" class="chip-btn">Search</button>
+              </div>
+              <p id="hfStatus" class="setting-status"></p>
+              <div id="hfResults" class="hf-results"></div>
+            </details>
+
+            <!-- Actions -->
             <div class="setting-row hf-actions" id="hfActions" hidden>
               <button id="hfDownloadBtn" type="button" class="chip-btn">Download</button>
               <button id="hfUseBtn" type="button" class="chip-btn">Use</button>
