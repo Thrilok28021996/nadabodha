@@ -274,7 +274,7 @@ def classify_repo(
     if rid.startswith("mlx-community/") or "mlx" in tag_list:
         return ("unsupported", "MLX weights - this app runs faster-whisper/transformers, not MLX")
 
-    if "ctranslate2" in tag_list or "ct2" in tag_list or "faster-whisper" in rid:
+    if "ctranslate2" in tag_list or "ct2" in tag_list or "faster-whisper" in rid or "-ct2" in rid:
         return ("ctranslate2", None)
 
     if (

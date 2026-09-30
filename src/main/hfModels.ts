@@ -100,7 +100,12 @@ export function classifyRepo(input: ClassifyInput): RepoClassification {
   }
 
   // CTranslate2 (faster-whisper) checkpoints.
-  if (tags.includes('ctranslate2') || tags.includes('ct2') || id.includes('faster-whisper')) {
+  if (
+    tags.includes('ctranslate2') ||
+    tags.includes('ct2') ||
+    id.includes('faster-whisper') ||
+    id.includes('-ct2')
+  ) {
     return { kind: 'ctranslate2', format: 'CTranslate2' };
   }
 

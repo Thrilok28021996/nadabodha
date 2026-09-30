@@ -139,8 +139,8 @@ interface ElectronAPI {
   requestDictationAccess(): Promise<DictationStatusInfo>;
   listNotes(): Promise<NoteListResult>;
   getNote(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
-  createNote(req: { title?: string; source: string; folder?: string; transcript?: string }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
-  updateNote(req: { id: string; title?: string; folder?: string; transcript?: string; summary?: string; model?: string; markSummaryStale?: boolean; clearSummaryStale?: boolean }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
+  createNote(req: { title?: string; source: string; folder?: string; transcript?: string; audioPath?: string }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
+  updateNote(req: { id: string; title?: string; folder?: string; transcript?: string; summary?: string; model?: string; audioPath?: string; markSummaryStale?: boolean; clearSummaryStale?: boolean }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
   deleteNote(id: string): Promise<{ success: boolean; error?: string }>;
   readNoteContent(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
   listFolders(): Promise<{ folders: string[]; counts: Record<string, number> }>;
@@ -253,12 +253,14 @@ const dataDirBrowseBtn  = document.getElementById('dataDirBrowseBtn') as HTMLBut
 const dataDirStatus     = document.getElementById('dataDirStatus') as HTMLParagraphElement;
 const watchFolderInput  = document.getElementById('watchFolderInput') as HTMLInputElement;
 const watchFolderBrowseBtn = document.getElementById('watchFolderBrowseBtn') as HTMLButtonElement;
+const watchFolderClearBtn = document.getElementById('watchFolderClearBtn') as HTMLButtonElement;
 const cacheDirInput     = document.getElementById('cacheDirInput') as HTMLInputElement;
 const cacheDirBrowseBtn = document.getElementById('cacheDirBrowseBtn') as HTMLButtonElement;
 const cacheDirStatus    = document.getElementById('cacheDirStatus') as HTMLParagraphElement;
 const summarizeEnabledChk = document.getElementById('summarizeEnabledChk') as HTMLInputElement;
 const autoSummarizeChk  = document.getElementById('autoSummarizeChk') as HTMLInputElement;
 const promptPathStatus  = document.getElementById('promptPathStatus') as HTMLParagraphElement;
+const sttActiveModelStatus = document.getElementById('sttActiveModelStatus') as HTMLParagraphElement;
 const hfSearchInput     = document.getElementById('hfSearchInput') as HTMLInputElement;
 const hfSearchBtn       = document.getElementById('hfSearchBtn') as HTMLButtonElement;
 const hfStatus          = document.getElementById('hfStatus') as HTMLParagraphElement;
@@ -270,6 +272,7 @@ const hfCancelDownloadBtn = document.getElementById('hfCancelDownloadBtn') as HT
 const downloadProgress  = document.getElementById('downloadProgress') as HTMLProgressElement;
 const downloadStatus    = document.getElementById('downloadStatus') as HTMLParagraphElement;
 const fileInput         = document.getElementById('fileInput') as HTMLInputElement;
+const reTranscribeFileInput = document.getElementById('reTranscribeFileInput') as HTMLInputElement;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -477,6 +480,25 @@ function renderNoteList(): void {
     li.appendChild(title);
     li.appendChild(meta);
 
+    // Delete button for this note item
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'note-item-delete';
+    deleteBtn.title = 'Delete note';
+    deleteBtn.setAttribute('aria-label', `Delete ${note.title}`);
+    deleteBtn.textContent = '✕';
+    deleteBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete "${note.title}"? This cannot be undone.`)) return;
+      if (selectedNoteId === note.id) {
+        selectedNoteId = null;
+        emptyState.hidden = false;
+        noteDetail.hidden = true;
+      }
+      await api.deleteNote(note.id);
+      await loadNotes();
+    });
+    li.appendChild(deleteBtn);
+
     li.addEventListener('click', () => openNote(note.id));
     noteList.appendChild(li);
   }
@@ -514,14 +536,8 @@ async function openNote(id: string): Promise<void> {
     refreshFolderSelect(note.folder);
     noteFolderSelect.value = note.folder || '';
 
-    // Re-transcribe button (D4: disabled with an explanatory tooltip when
-    // the note has no audio, or while a run is already in flight).
-    reTranscribeBtn.disabled = !note.hasAudio || retranscribeInFlight;
-    reTranscribeBtn.title = !note.hasAudio
-      ? 'No audio stored — re-transcribe is not available for this note'
-      : retranscribeInFlight
-        ? 'A re-transcribe run is already in progress'
-        : 'Re-transcribe using the current model';
+    // Re-transcribe button state
+    syncReTranscribeButton();
 
     // Transcript
     transcriptArea.value = currentNoteContent.transcript;
@@ -1019,10 +1035,31 @@ async function loadSettings(): Promise<void> {
     (document.getElementById('dictationPasteChk') as HTMLInputElement).checked = currentSettings.dictationPasteEnabled !== false;
     (document.getElementById('meetingModeChk') as HTMLInputElement).checked = currentSettings.meetingModeEnabled === true;
     activeModel = currentSettings.activeModel || '';
-    setHint(promptPathStatus, activeModel ? `Active model: ${activeModel}` : 'No STT model selected');
+    updateActiveModelDisplay();
+
+    // Preserve saved LLM model in select options
+    const savedLlmModel = currentSettings.llmModel;
+    if (savedLlmModel) {
+      if (!Array.from(llmModelSelect.options).some(o => o.value === savedLlmModel)) {
+        const opt = document.createElement('option');
+        opt.value = savedLlmModel;
+        opt.textContent = savedLlmModel;
+        llmModelSelect.appendChild(opt);
+      }
+      llmModelSelect.value = savedLlmModel;
+    }
+
+    // Populate STT model cards immediately upon opening settings
+    await loadHfModels();
   } catch (err) {
     setHint(settingsStatus, String(err), 'error');
   }
+}
+
+function updateActiveModelDisplay(): void {
+  const label = activeModel ? `Active model: ${activeModel}` : 'No STT model selected (using built-in fallback)';
+  if (sttActiveModelStatus) setHint(sttActiveModelStatus, label, activeModel ? 'ok' : 'info');
+  if (promptPathStatus) setHint(promptPathStatus, label, activeModel ? 'ok' : 'info');
 }
 
 async function saveSettings(): Promise<void> {
@@ -1082,7 +1119,10 @@ const FEATURED_MODELS: FeaturedModel[] = [
   { id: 'Systran/faster-whisper-base',   label: 'Whisper Base',   size: '~145 MB', description: 'Good balance for short clips',      kind: 'ctranslate2' },
   { id: 'Systran/faster-whisper-small',  label: 'Whisper Small',  size: '~465 MB', description: 'Recommended for most use cases',    kind: 'ctranslate2' },
   { id: 'Systran/faster-whisper-medium', label: 'Whisper Medium', size: '~1.4 GB', description: 'High accuracy, needs ~4 GB RAM',    kind: 'ctranslate2' },
+  { id: 'deepdml/faster-whisper-large-v3-turbo-ct2', label: 'Whisper Large v3 Turbo', size: '~1.6 GB', description: 'Large v3 accuracy at 4x speed', kind: 'ctranslate2' },
   { id: 'Systran/faster-whisper-large-v3', label: 'Whisper Large v3', size: '~3 GB', description: 'Best accuracy, needs ~8 GB RAM', kind: 'ctranslate2' },
+  // OpenAI Whisper — Official PyTorch
+  { id: 'openai/whisper-large-v3-turbo', label: 'Whisper Large v3 Turbo (PyTorch)', size: '~1.6 GB', description: 'Official OpenAI Turbo model', kind: 'pytorch' },
   // Nvidia NeMo — via transformers (PyTorch)
   { id: 'nvidia/canary-1b',    label: 'Nvidia Canary 1B',      size: '~4 GB', description: 'High accuracy, multilingual NeMo model',  kind: 'pytorch' },
   { id: 'nvidia/parakeet-tdt-0.6b-v2', label: 'Nvidia Parakeet 0.6B', size: '~2.4 GB', description: 'Fast English ASR, NeMo model', kind: 'pytorch' },
@@ -1104,7 +1144,9 @@ function renderFeaturedModels(): void {
     card.setAttribute('tabindex', '0');
     card.setAttribute('aria-pressed', String(isSelected));
 
-    const badge = m.kind === 'ctranslate2' ? 'OpenAI · CTranslate2' : 'Nvidia · PyTorch';
+    const badge = m.kind === 'ctranslate2'
+      ? 'OpenAI · CTranslate2'
+      : (m.id.startsWith('openai/') ? 'OpenAI · PyTorch' : 'Nvidia · PyTorch');
     card.innerHTML = `
       <div class="hf-featured-header">
         <span class="hf-featured-label">${m.label}</span>
@@ -1212,8 +1254,12 @@ searchClearBtn.addEventListener('click', () => {
   loadNotes();
 });
 
-// Keyboard shortcut for search
+// Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !settingsPanel.hidden) {
+    closeSettings();
+    return;
+  }
   if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
     e.preventDefault();
     searchInput.focus();
@@ -1254,7 +1300,10 @@ addFolderBtn.addEventListener('click', () => {
 });
 
 // Record buttons (sidebar + empty state)
+let startingRecording = false;
 async function startRecording(): Promise<void> {
+  if (startingRecording || isRecording) return;
+  startingRecording = true;
   try {
     const meetingModeChk = document.getElementById('meetingModeChk') as HTMLInputElement;
     await api.startRecording({ meetingMode: meetingModeChk ? meetingModeChk.checked : false });
@@ -1262,11 +1311,25 @@ async function startRecording(): Promise<void> {
     pendingTranscriptNoteId = null;
   } catch (err) {
     showError(String(err));
+  } finally {
+    startingRecording = false;
   }
 }
 
-recordBtn.addEventListener('click', startRecording);
-emptyRecordBtn?.addEventListener('click', startRecording);
+async function handleRecordBtnClick(): Promise<void> {
+  if (isRecording) {
+    try {
+      await api.stopRecording();
+    } catch (err) {
+      showError(String(err));
+    }
+    return;
+  }
+  await startRecording();
+}
+
+recordBtn.addEventListener('click', handleRecordBtnClick);
+emptyRecordBtn?.addEventListener('click', handleRecordBtnClick);
 
 // Stop / cancel recording
 stopRecordBtn.addEventListener('click', async () => {
@@ -1399,30 +1462,30 @@ noteFolderSelect.addEventListener('change', async () => {
 
 /**
  * D4: single source of truth for the re-transcribe button state — disabled
- * when the open note has no audio, and while a run is in flight (tooltip
- * explains which of the two applies).
+ * while a run is in flight. If the note has no audio, clicking it allows
+ * attaching an audio file and transcribing it.
  */
 function syncReTranscribeButton(): void {
   const note = notes.find((n) => n.id === selectedNoteId);
   const hasAudio = Boolean(note && note.hasAudio);
-  reTranscribeBtn.disabled = !hasAudio || retranscribeInFlight;
-  reTranscribeBtn.title = !hasAudio
-    ? 'No audio stored — re-transcribe is not available for this note'
-    : retranscribeInFlight
-      ? 'A re-transcribe run is already in progress'
-      : 'Re-transcribe using the current model';
+  reTranscribeBtn.disabled = retranscribeInFlight;
+  if (retranscribeInFlight) {
+    reTranscribeBtn.textContent = '↻ Re-transcribing…';
+    reTranscribeBtn.title = 'A re-transcribe run is already in progress';
+  } else {
+    reTranscribeBtn.textContent = '↻ Re-transcribe';
+    reTranscribeBtn.title = hasAudio
+      ? 'Re-transcribe using the current model'
+      : 'Select an audio file to transcribe for this note';
+  }
 }
 
-reTranscribeBtn.addEventListener('click', async () => {
-  // D4 guard (a): a second trigger while a run is in flight is a no-op —
-  // the button is disabled too, this is belt-and-braces for keyboard/programmatic clicks.
-  if (!selectedNoteId || retranscribeInFlight) return;
-  const requestedNoteId = selectedNoteId;
+async function executeReTranscribe(noteId: string): Promise<void> {
   retranscribeInFlight = true;
   syncReTranscribeButton();
   let result: { started: boolean; error?: string; runId?: number };
   try {
-    result = await api.reTranscribe(requestedNoteId);
+    result = await api.reTranscribe(noteId);
   } catch (err) {
     result = { started: false, error: String(err) };
   }
@@ -1432,18 +1495,58 @@ reTranscribeBtn.addEventListener('click', async () => {
     showError(result.error || 'Re-transcribe failed to start');
     return;
   }
-  pendingTranscriptNoteId = requestedNoteId;
+  pendingTranscriptNoteId = noteId;
   updateStatusBar({ status: 'transcribing' });
+}
+
+reTranscribeBtn.addEventListener('click', async () => {
+  if (!selectedNoteId || retranscribeInFlight) return;
+  const note = notes.find((n) => n.id === selectedNoteId);
+  const hasAudio = Boolean(note && note.hasAudio);
+
+  if (!hasAudio) {
+    // Note has no audio stored — let the user pick an audio file to attach and transcribe
+    reTranscribeFileInput.click();
+    return;
+  }
+
+  await executeReTranscribe(selectedNoteId);
+});
+
+reTranscribeFileInput.addEventListener('change', async () => {
+  const files = reTranscribeFileInput.files;
+  if (!files || files.length === 0 || !selectedNoteId) return;
+  const file = files[0];
+  const filePath = api.getPathForFile ? api.getPathForFile(file) : (file as unknown as { path?: string }).path || '';
+  reTranscribeFileInput.value = '';
+  if (!filePath) {
+    showError('Could not get audio file path');
+    return;
+  }
+  const noteId = selectedNoteId;
+  try {
+    const updateResult = await api.updateNote({ id: noteId, audioPath: filePath });
+    if (!updateResult.success) {
+      showError(updateResult.error || 'Failed to attach audio file');
+      return;
+    }
+    await loadNotes();
+    await openNote(noteId);
+    await executeReTranscribe(noteId);
+  } catch (err) {
+    showError(String(err));
+  }
 });
 
 deleteNoteBtn.addEventListener('click', async () => {
   if (!selectedNoteId) return;
   const note = notes.find(n => n.id === selectedNoteId);
   if (!confirm(`Delete "${note?.title || 'this note'}"? This cannot be undone.`)) return;
-  await api.deleteNote(selectedNoteId);
+  const idToDelete = selectedNoteId;
   selectedNoteId = null;
   emptyState.hidden = false;
   noteDetail.hidden = true;
+  await api.deleteNote(idToDelete);
   await loadNotes();
 });
 
@@ -1478,6 +1581,10 @@ dataDirBrowseBtn.addEventListener('click', async () => {
 watchFolderBrowseBtn.addEventListener('click', async () => {
   const p = await api.pickWatchFolder();
   if (p) watchFolderInput.value = p;
+});
+
+watchFolderClearBtn.addEventListener('click', () => {
+  watchFolderInput.value = '';
 });
 
 cacheDirBrowseBtn.addEventListener('click', async () => {
@@ -1531,7 +1638,7 @@ hfUseBtn.addEventListener('click', async () => {
   } catch { /* non-fatal; in-memory value is still correct */ }
 
   // Update all visual indicators.
-  setHint(promptPathStatus, `Active model: ${activeModel}`, 'ok');
+  updateActiveModelDisplay();
   setHint(downloadStatus, `✓ Now using ${activeModel}`, 'ok');
 
   // Refresh featured cards so the "✓ Active" badge moves to the right card.

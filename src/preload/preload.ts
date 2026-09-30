@@ -196,6 +196,7 @@ interface NoteCreateRequest {
   source: NoteSource;
   folder?: string;
   transcript?: string;
+  audioPath?: string;
 }
 
 interface NoteUpdateRequest {
@@ -205,6 +206,7 @@ interface NoteUpdateRequest {
   transcript?: string;
   summary?: string;
   model?: string;
+  audioPath?: string;
   markSummaryStale?: boolean;
   clearSummaryStale?: boolean;
 }

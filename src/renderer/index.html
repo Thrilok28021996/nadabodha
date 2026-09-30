@@ -152,8 +152,8 @@
             <select id="noteFolderSelect" class="folder-select" aria-label="Note folder">
               <option value="">Unfiled</option>
             </select>
-            <button id="reTranscribeBtn" type="button" class="chip-btn" title="Re-transcribe using the current model" disabled>Re-transcribe</button>
-            <button id="deleteNoteBtn" type="button" class="chip-btn chip-danger" title="Delete note">Delete</button>
+            <button id="reTranscribeBtn" type="button" class="chip-btn" title="Re-transcribe using the current model" disabled>↻ Re-transcribe</button>
+            <button id="deleteNoteBtn" type="button" class="chip-btn chip-danger" title="Delete note">🗑 Delete</button>
           </div>
         </div>
 
@@ -268,6 +268,7 @@
             <div class="setting-row">
               <input type="text" id="watchFolderInput" placeholder="Choose a folder to watch…" spellcheck="false" aria-label="Watch folder">
               <button id="watchFolderBrowseBtn" type="button" class="chip-btn">Browse…</button>
+              <button id="watchFolderClearBtn" type="button" class="chip-btn">Clear</button>
             </div>
           </div>
 
@@ -327,6 +328,7 @@
           <!-- HF model browser -->
           <div class="setting-group">
             <h3>STT model browser</h3>
+            <p id="sttActiveModelStatus" class="setting-status" data-state="ok"></p>
 
             <!-- Installed models (always shown) -->
             <div id="hfInstalled" class="hf-installed"></div>
@@ -372,6 +374,7 @@
 
   <!-- Hidden file input for audio import -->
   <input type="file" id="fileInput" accept="audio/*" multiple hidden>
+  <input type="file" id="reTranscribeFileInput" accept="audio/*" hidden>
 
   <script src="marked.umd.js"></script>
   <script src="purify.min.js"></script>

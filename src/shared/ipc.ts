@@ -250,6 +250,7 @@ export interface NoteCreateRequest {
   source: NoteSource;
   folder?: string;
   transcript?: string;
+  audioPath?: string;
   words?: {word: string, start: number, end: number}[];
 }
 
@@ -260,6 +261,7 @@ export interface NoteUpdateRequest {
   transcript?: string;
   summary?: string;
   model?: string;
+  audioPath?: string;
   markSummaryStale?: boolean;
   clearSummaryStale?: boolean;
   words?: {word: string, start: number, end: number}[];

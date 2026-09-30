@@ -24,7 +24,7 @@ const STRING_KEYS = [
   'watchFolderDir',
 ] as const;
 
-const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled'] as const;
+const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled', 'meetingModeEnabled'] as const;
 
 export function settingsFilePath(userDataDir: string): string {
   return path.join(userDataDir, SETTINGS_FILE_NAME);
@@ -50,6 +50,7 @@ export function defaultSettings(
     activeModel: '',
     dictationEnabled: true,
     dictationPasteEnabled: true, // Stage 2: ON by default
+    meetingModeEnabled: false,
     watchFolderDir: '',
   };
 }

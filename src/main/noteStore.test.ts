@@ -258,6 +258,21 @@ describe('NoteStore: update', () => {
     expect(reloaded!.title).toBe('Persisted');
     expect(reloaded!.folder).toBe('Archive');
   });
+
+  it('attaches audio to an existing note when audioPath is provided', () => {
+    const audioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-update-audio-'));
+    const audioFile = path.join(audioDir, 'take2.wav');
+    fs.writeFileSync(audioFile, Buffer.alloc(16));
+    try {
+      const result = store.update(note.id, { audioPath: audioFile });
+      expect(result.success).toBe(true);
+      expect(result.data!.audio).toBeTruthy();
+      expect(fs.existsSync(result.data!.audio!)).toBe(true);
+      expect(path.basename(result.data!.audio!)).toBe('take2.wav');
+    } finally {
+      cleanup(audioDir);
+    }
+  });
 });
 
 describe('NoteStore: readContent', () => {

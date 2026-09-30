@@ -444,6 +444,10 @@ export class AudioRecorder extends EventEmitter {
   private cleanup(): void {
     const proc = this.process;
     this.process = null;
+    if (this.systemProcess) {
+      this.killSignal(this.systemProcess, 'SIGKILL');
+      this.systemProcess = null;
+    }
     if (!proc) {
       return;
     }

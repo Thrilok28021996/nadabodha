@@ -149,6 +149,7 @@ def test_classify_ctranslate2_repo():
     assert reason is None
     # id-only classification (used by the download guard) must agree
     assert adapter.classify_repo("Systran/faster-whisper-large-v3")[0] == "ctranslate2"
+    assert adapter.classify_repo("deepdml/faster-whisper-large-v3-turbo-ct2")[0] == "ctranslate2"
 
 
 def test_classify_pytorch_repo():
@@ -158,6 +159,7 @@ def test_classify_pytorch_repo():
     assert kind == "pytorch"
     assert reason is None
     assert adapter.classify_repo("openai/whisper-base")[0] == "pytorch"
+    assert adapter.classify_repo("openai/whisper-large-v3-turbo")[0] == "pytorch"
 
 
 def test_classify_unsupported_ggml_repo():

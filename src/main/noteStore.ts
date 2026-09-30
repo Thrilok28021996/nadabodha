@@ -82,6 +82,7 @@ export interface NoteUpdateOptions {
   summary?: string;
   model?: string;
   duration?: number;
+  audioPath?: string;
   markSummaryStale?: boolean;
   clearSummaryStale?: boolean;
   words?: {word: string, start: number, end: number}[];
@@ -456,6 +457,18 @@ export class NoteStore {
       const { fm: existingFm } = parsed;
       const body = options.transcript !== undefined ? options.transcript : parsed.body;
 
+      // Copy audio file if provided.
+      let audioBasename = existingFm.audio;
+      if (options.audioPath && fs.existsSync(options.audioPath)) {
+        try {
+          audioBasename = path.basename(options.audioPath);
+          const dest = path.join(record.noteDir, audioBasename);
+          fs.copyFileSync(options.audioPath, dest);
+        } catch (err) {
+          console.error(`[NoteStore] Audio copy failed: ${errorMsg(err)}`);
+        }
+      }
+
       // Rebuild frontmatter with updates.
       const fm: NoteFrontmatter = {
         id,
@@ -466,7 +479,7 @@ export class NoteStore {
         duration: options.duration ?? existingFm.duration ?? record.duration,
         model: options.model ?? existingFm.model ?? record.model,
         transcribed_at: options.transcript !== undefined ? iso() : existingFm.transcribed_at,
-        audio: existingFm.audio,
+        audio: audioBasename,
         summary_stale: options.markSummaryStale
           ? true
           : options.clearSummaryStale
@@ -492,6 +505,7 @@ export class NoteStore {
         duration: fm.duration,
         model: fm.model,
         transcribed_at: fm.transcribed_at ? new Date(fm.transcribed_at) : undefined,
+        audio: audioBasename ? path.join(record.noteDir, audioBasename) : undefined,
         summaryStale: fm.summary_stale,
       };
       this.index.set(id, updated);

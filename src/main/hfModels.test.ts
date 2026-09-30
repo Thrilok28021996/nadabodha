@@ -27,12 +27,14 @@ describe('classifyRepo', () => {
   it('classifies CTranslate2 (faster-whisper) repos', () => {
     expect(classifyRepo({ id: 'Systran/faster-whisper-base', tags: ['ctranslate2'] }).kind).toBe('ctranslate2');
     expect(classifyRepo({ id: 'Systran/faster-whisper-large-v3' }).kind).toBe('ctranslate2');
+    expect(classifyRepo({ id: 'deepdml/faster-whisper-large-v3-turbo-ct2' }).kind).toBe('ctranslate2');
     expect(classifyRepo({ id: 'some/model', tags: ['ct2'] }).kind).toBe('ctranslate2');
   });
 
   it('classifies PyTorch ASR repos', () => {
     expect(classifyRepo({ id: 'openai/whisper-tiny', pipelineTag: 'automatic-speech-recognition' }).kind).toBe('pytorch');
     expect(classifyRepo({ id: 'openai/whisper-base' }).kind).toBe('pytorch');
+    expect(classifyRepo({ id: 'openai/whisper-large-v3-turbo' }).kind).toBe('pytorch');
     expect(classifyRepo({ id: 'custom/asr-model', tags: ['automatic-speech-recognition'] }).kind).toBe('pytorch');
   });
 

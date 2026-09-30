@@ -475,6 +475,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   });
 
   ipcMain.handle(IpcChannel.StartRecording, async (_event: unknown, request?: StartRecordingRequest) => {
+    // If already recording, return the current output path safely instead of throwing
+    if (recorder.getState().status === 'recording' || recorder.getStream()) {
+      return { outputPath: recorder.getState().outputPath || '' };
+    }
     // Microphone permission first: a denial must never spawn ffmpeg (a
     // blocked capture device fails with a cryptic avfoundation error or a
     // hung device open). The guidance goes out on the same error-event route
@@ -633,6 +637,9 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       }
       if (typeof patch.dictationPasteEnabled === 'boolean') {
         accepted.dictationPasteEnabled = patch.dictationPasteEnabled;
+      }
+      if (typeof patch.meetingModeEnabled === 'boolean') {
+        accepted.meetingModeEnabled = patch.meetingModeEnabled;
       }
 
       try {
@@ -875,7 +882,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       // Without this the audio dies in os.tmpdir() and re-transcribe has
       // no bytes to read.
       const audioPath =
-        source === 'recording' ? transcriptionService.getCurrentFilePath() ?? undefined : undefined;
+        (typeof req.audioPath === 'string' && req.audioPath) ||
+        (source === 'recording' || source === 'dictation-log'
+          ? transcriptionService.getCurrentFilePath() ?? undefined
+          : undefined);
       const result = noteStore.create({
         title: typeof req.title === 'string' ? req.title : undefined,
         source,
@@ -906,6 +916,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         transcript: req.transcript,
         summary: req.summary,
         model: req.model,
+        audioPath: typeof req.audioPath === 'string' ? req.audioPath : undefined,
         markSummaryStale: req.markSummaryStale,
         clearSummaryStale: req.clearSummaryStale,
         words: req.words,
