@@ -19,11 +19,23 @@ export interface AudioRecorderOptions {
    * path without depending on the caller's environment.
    */
   ffmpegPath?: string;
+  /**
+   * System-audio (meeting) executable. Defaults to `catap` from PATH; point
+   * it at a path that cannot exist to exercise the missing-binary path
+   * without depending on the caller's environment (mirrors ffmpegPath).
+   */
+  catapPath?: string;
 }
 
 interface RecorderState {
   status: 'idle' | 'recording' | 'error';
   error?: string;
+  /**
+   * D3: system-audio (catap) capture failed while the microphone recording
+   * kept going. Surfaced as-is so meeting mode degrades to mic-only with a
+   * human-readable reason instead of taking the app down.
+   */
+  meetingError?: string;
   outputPath: string | null;
 }
 
@@ -101,11 +113,13 @@ export class AudioRecorder extends EventEmitter {
       
       if (options?.meetingMode) {
         this.systemOutputPath = path.join(this.tempDir, `system-${Date.now()}.wav`);
-        this.systemProcess = spawn('catap', [
+        const systemProc = spawn(this.options.catapPath || 'catap', [
           'record', '--system', '--mono', '-o', this.systemOutputPath
         ], {
           stdio: 'ignore'
         });
+        this.systemProcess = systemProc;
+        this.attachSystemProcessHandlers(systemProc);
       }
     } catch (err) {
       this._state = {
@@ -199,7 +213,12 @@ export class AudioRecorder extends EventEmitter {
         if (this.systemProcess) {
           this.killSignal(this.systemProcess, 'SIGINT');
           const sysEsc = setTimeout(() => this.systemProcess && this.killSignal(this.systemProcess, 'SIGTERM'), 1500);
-          const sysKill = setTimeout(() => { this.systemProcess && this.killSignal(this.systemProcess, 'SIGKILL'); this.systemProcess = null; }, 4000);
+          const sysKill = setTimeout(() => {
+            if (this.systemProcess) {
+              this.killSignal(this.systemProcess, 'SIGKILL');
+              this.systemProcess = null;
+            }
+          }, 4000);
           this.systemProcess.once('exit', () => { clearTimeout(sysEsc); clearTimeout(sysKill); this.systemProcess = null; });
         }
         this.stopping = false;
@@ -277,6 +296,37 @@ export class AudioRecorder extends EventEmitter {
     this.outputPath = null;
     this.systemOutputPath = undefined;
     return null;
+  }
+
+  /**
+   * D3: a ChildProcess 'error' (ENOENT when `catap` is not on PATH) has no
+   * synchronous catch — with no listener Node treats it as uncaught and the
+   * Electron main process dies. Meeting capture instead degrades to
+   * mic-only: the failure lands on the recorder state (and the
+   * 'meeting-error' event, which the IPC layer forwards to the renderer),
+   * the microphone process keeps recording, and the dead reference is
+   * cleared so stop()/cancel() never touch it. This handler never throws.
+   */
+  private attachSystemProcessHandlers(systemProc: ChildProcess): void {
+    systemProc.on('error', (err) => {
+      try {
+        const detail = err instanceof Error ? err.message : String(err);
+        const message = detail.includes('ENOENT')
+          ? `System audio not captured: \`catap\` was not found on PATH. Meeting mode recorded the microphone only.`
+          : `System audio capture failed: ${detail}`;
+        if (this.systemProcess === systemProc) {
+          // Safe even for a stale session: only clear when this process
+          // still owns the slot, and never leave a phantom system path for
+          // verifyRecording()/transcription to report.
+          this.systemProcess = null;
+          this.systemOutputPath = undefined;
+        }
+        this._state = { ...this._state, meetingError: message };
+        this.emit('meeting-error', message);
+      } catch {
+        // An 'error' listener must never throw, whatever happens above.
+      }
+    });
   }
 
   /**
