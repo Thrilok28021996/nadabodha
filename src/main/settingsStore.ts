@@ -21,6 +21,7 @@ const STRING_KEYS = [
   'dataDir',
   'sttCacheDir',
   'activeModel',
+  'watchFolderDir',
 ] as const;
 
 const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled'] as const;
@@ -46,6 +47,7 @@ export function defaultSettings(
     activeModel: '',
     dictationEnabled: true,
     dictationPasteEnabled: true, // Stage 2: ON by default
+    watchFolderDir: '',
   };
 }
 

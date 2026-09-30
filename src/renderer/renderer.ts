@@ -27,6 +27,15 @@ declare const marked: { parse(src: string): string | Promise<string> };
 // Electron API
 // ---------------------------------------------------------------------------
 
+interface ImportItem {
+  id: string;
+  filePath: string;
+  progress: number;
+  status: "pending" | "transcribing" | "completed" | "error" | "cancelled";
+  error?: string;
+  text?: string;
+}
+
 interface NoteInfo {
   id: string;
   title: string;
@@ -40,7 +49,7 @@ interface NoteInfo {
   summaryStale?: boolean;
 }
 
-interface NoteContent { transcript: string; summary: string; }
+interface NoteContent { transcript: string; summary: string; words?: {word: string, start: number, end: number}[]; }
 interface NoteListResult { notes: NoteInfo[]; folders: string[]; folderCounts: Record<string, number>; error?: string; }
 interface TranscriptionEvent {
   status: string;
@@ -70,6 +79,7 @@ interface AppSettings {
   dictationEnabled: boolean;
   dictationPasteEnabled?: boolean;
   meetingModeEnabled?: boolean;
+  watchFolderDir?: string;
 }
 interface DictationStatusInfo { supported: boolean; enabled: boolean; accessibilityTrusted: boolean; running: boolean; reason?: string; }
 interface HfModelInfo { id: string; downloads: number; pipelineTag: string | null; tags: string[]; kind: string; reason?: string; format: string; }
@@ -83,12 +93,17 @@ interface ElectronAPI {
   stopRecording(): Promise<{ outputPath: string | null }>;
   importAudio(fp: string): Promise<{ filePath: string }>;
   cancelTranscription(): Promise<{ cancelled: boolean }>;
-  saveTranscript(req: { filePath: string; text: string }): Promise<{ success: boolean; filePath?: string; error?: string }>;
+  saveTranscript(req: { filePath: string; text: string; format?: 'txt' | 'srt' | 'vtt'; words?: {word: string, start: number, end: number}[] }): Promise<{ success: boolean; filePath?: string; error?: string }>;
   copyTranscript(text: string): Promise<{ copied: boolean }>;
   requestStatus(): Promise<{ status: string; text: string; filePath: string | null }>;
   requestSavePath(): Promise<string | undefined>;
   onTranscriptionEvent(cb: (e: TranscriptionEvent) => void): void;
   removeTranscriptionListener(): void;
+  enqueueImports(paths: string[]): Promise<string[]>;
+  pickWatchFolder(): Promise<string | null>;
+  cancelImportItem(id: string): Promise<{cancelled: boolean}>;
+  onImportQueueEvent(cb: (queue: ImportItem[]) => void): void;
+  removeImportQueueListener?(): void;
   getSettings(): Promise<AppSettings>;
   updateSettings(patch: Partial<AppSettings>): Promise<SettingsUpdateResult>;
   validatePython(path: string): Promise<PythonValidation>;
@@ -138,6 +153,8 @@ const addFolderBtn      = document.getElementById('addFolderBtn') as HTMLButtonE
 const noteList          = document.getElementById('noteList') as HTMLUListElement;
 const noteListEmpty     = document.getElementById('noteListEmpty') as HTMLParagraphElement;
 const notesListLabel    = document.getElementById('notesListLabel') as HTMLSpanElement;
+const importQueueSection = document.getElementById('importQueueSection') as HTMLElement;
+const importQueueList   = document.getElementById('importQueueList') as HTMLElement;
 const settingsBtn       = document.getElementById('settingsBtn') as HTMLButtonElement;
 
 // Dictation strip (IDs preserved from cycle 2)
@@ -183,6 +200,8 @@ const summaryPanel      = document.getElementById('summaryPanel') as HTMLElement
 const transcriptArea    = document.getElementById('transcriptArea') as HTMLTextAreaElement;
 const copyBtn           = document.getElementById('copyBtn') as HTMLButtonElement;
 const saveBtn           = document.getElementById('saveBtn') as HTMLButtonElement;
+const saveSrtBtn        = document.getElementById('saveSrtBtn') as HTMLButtonElement;
+const saveVttBtn        = document.getElementById('saveVttBtn') as HTMLButtonElement;
 const summarizeBtn      = document.getElementById('summarizeBtn') as HTMLButtonElement;
 const cancelSummaryBtn  = document.getElementById('cancelSummaryBtn') as HTMLButtonElement;
 const summaryRawBtn     = document.getElementById('summaryRawBtn') as HTMLButtonElement;
@@ -218,6 +237,8 @@ const llmStatus         = document.getElementById('llmStatus') as HTMLParagraphE
 const dataDirInput      = document.getElementById('dataDirInput') as HTMLInputElement;
 const dataDirBrowseBtn  = document.getElementById('dataDirBrowseBtn') as HTMLButtonElement;
 const dataDirStatus     = document.getElementById('dataDirStatus') as HTMLParagraphElement;
+const watchFolderInput  = document.getElementById('watchFolderInput') as HTMLInputElement;
+const watchFolderBrowseBtn = document.getElementById('watchFolderBrowseBtn') as HTMLButtonElement;
 const cacheDirInput     = document.getElementById('cacheDirInput') as HTMLInputElement;
 const cacheDirBrowseBtn = document.getElementById('cacheDirBrowseBtn') as HTMLButtonElement;
 const cacheDirStatus    = document.getElementById('cacheDirStatus') as HTMLParagraphElement;
@@ -486,6 +507,8 @@ async function openNote(id: string): Promise<void> {
     transcriptArea.value = currentNoteContent.transcript;
     copyBtn.disabled = !currentNoteContent.transcript;
     saveBtn.disabled = !currentNoteContent.transcript;
+    saveSrtBtn.disabled = !currentNoteContent.transcript;
+    saveVttBtn.disabled = !currentNoteContent.transcript;
 
     // Summary
     summaryArea.value = currentNoteContent.summary;
@@ -772,6 +795,8 @@ async function handleTranscriptionCompleted(text: string, event: TranscriptionEv
   transcriptArea.value = text;
   copyBtn.disabled = !text;
   saveBtn.disabled = !text;
+  saveSrtBtn.disabled = !text;
+  saveVttBtn.disabled = !text;
   summarizeBtn.disabled = !text;
 
   // Scroll back to idle after a brief moment
@@ -797,6 +822,8 @@ async function appendDictationText(text: string): Promise<void> {
       transcriptArea.value = updated;
       copyBtn.disabled = false;
       saveBtn.disabled = false;
+      saveSrtBtn.disabled = false;
+      saveVttBtn.disabled = false;
     }
   } else {
     // Create new log note for today
@@ -926,6 +953,7 @@ async function loadSettings(): Promise<void> {
     llmBaseUrlInput.value = currentSettings.llmBaseUrl || '';
     llmApiKeyInput.value = currentSettings.llmApiKey || '';
     dataDirInput.value = currentSettings.dataDir || '';
+    watchFolderInput.value = currentSettings.watchFolderDir || '';
     cacheDirInput.value = currentSettings.sttCacheDir || '';
     summarizeEnabledChk.checked = currentSettings.summarizationEnabled;
     autoSummarizeChk.checked = currentSettings.autoSummarize;
@@ -946,6 +974,7 @@ async function saveSettings(): Promise<void> {
     llmModel: llmModelSelect.value,
     llmApiKey: llmApiKeyInput.value.trim(),
     dataDir: dataDirInput.value.trim(),
+    watchFolderDir: watchFolderInput.value.trim(),
     sttCacheDir: cacheDirInput.value.trim(),
     summarizationEnabled: summarizeEnabledChk.checked,
     autoSummarize: autoSummarizeChk.checked,
@@ -1139,16 +1168,18 @@ importBtn.addEventListener('click', importAudio);
 emptyImportBtn?.addEventListener('click', importAudio);
 
 fileInput.addEventListener('change', async () => {
-  const file = fileInput.files?.[0];
-  if (!file) return;
-  const filePath = api.getPathForFile ? api.getPathForFile(file) : (file as unknown as { path?: string }).path || '';
-  if (!filePath) { showError('Could not get file path'); return; }
+  const files = fileInput.files;
+  if (!files || files.length === 0) return;
+  const paths: string[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const filePath = api.getPathForFile ? api.getPathForFile(file) : (file as unknown as { path?: string }).path || '';
+    if (filePath) paths.push(filePath);
+  }
   fileInput.value = '';
+  if (paths.length === 0) { showError('Could not get file paths'); return; }
   try {
-    await api.importAudio(filePath);
-    // transcription will start; we'll create a note on completion
-    // Store the filename to use as the note title
-    pendingTranscriptNoteId = null;
+    await api.enqueueImports(paths);
   } catch (err) {
     showError(String(err));
   }
@@ -1171,6 +1202,32 @@ saveBtn.addEventListener('click', async () => {
   const filePath = await api.requestSavePath();
   if (!filePath) return;
   const result = await api.saveTranscript({ filePath, text: transcriptArea.value });
+  if (result.success) {
+    savedTranscriptPath.textContent = `Saved: ${result.filePath}`;
+    savedTranscriptPath.hidden = false;
+    savedPanel.hidden = false;
+  } else {
+    showError(result.error || 'Save failed');
+  }
+});
+
+saveSrtBtn.addEventListener('click', async () => {
+  const filePath = await api.requestSavePath();
+  if (!filePath) return;
+  const result = await api.saveTranscript({ filePath, text: transcriptArea.value, format: 'srt', words: currentNoteContent.words });
+  if (result.success) {
+    savedTranscriptPath.textContent = `Saved: ${result.filePath}`;
+    savedTranscriptPath.hidden = false;
+    savedPanel.hidden = false;
+  } else {
+    showError(result.error || 'Save failed');
+  }
+});
+
+saveVttBtn.addEventListener('click', async () => {
+  const filePath = await api.requestSavePath();
+  if (!filePath) return;
+  const result = await api.saveTranscript({ filePath, text: transcriptArea.value, format: 'vtt', words: currentNoteContent.words });
   if (result.success) {
     savedTranscriptPath.textContent = `Saved: ${result.filePath}`;
     savedTranscriptPath.hidden = false;
@@ -1262,6 +1319,11 @@ dataDirBrowseBtn.addEventListener('click', async () => {
   if (p) dataDirInput.value = p;
 });
 
+watchFolderBrowseBtn.addEventListener('click', async () => {
+  const p = await api.pickWatchFolder();
+  if (p) watchFolderInput.value = p;
+});
+
 cacheDirBrowseBtn.addEventListener('click', async () => {
   const p = await api.pickDirectory('Choose model cache directory');
   if (p) cacheDirInput.value = p;
@@ -1332,6 +1394,8 @@ async function init(): Promise<void> {
       transcriptArea.value = status.text;
       copyBtn.disabled = !status.text;
       saveBtn.disabled = !status.text;
+      saveSrtBtn.disabled = !status.text;
+      saveVttBtn.disabled = !status.text;
     }
   } catch { /* ignore */ }
 
@@ -1344,6 +1408,7 @@ async function init(): Promise<void> {
 
   // Listen for transcription events
   api.onTranscriptionEvent(handleTranscriptionEvent);
+  api.onImportQueueEvent(handleImportQueueEvent);
 
   // Pre-load settings (for LLM model list, etc.)
   try {
@@ -1352,6 +1417,63 @@ async function init(): Promise<void> {
       activeModel = currentSettings.activeModel || '';
     }
   } catch { /* ignore */ }
+}
+
+function handleImportQueueEvent(queue: any[]) {
+  if (!queue || queue.length === 0) {
+    importQueueSection.hidden = true;
+    importQueueList.innerHTML = '';
+    return;
+  }
+  importQueueSection.hidden = false;
+  importQueueList.innerHTML = '';
+
+  for (const item of queue) {
+    if (item.status === 'completed' || item.status === 'cancelled') continue;
+
+    const div = document.createElement('div');
+    div.className = 'hf-model-card';
+    
+    const title = document.createElement('h4');
+    title.className = 'hf-model-id';
+    title.textContent = item.filePath.split(/[/\\]/).pop();
+    div.appendChild(title);
+
+    const statusP = document.createElement('p');
+    statusP.className = 'hf-model-tags';
+    statusP.textContent = `Status: ${item.status}`;
+    div.appendChild(statusP);
+
+    if (item.status === 'transcribing') {
+      const prog = document.createElement('progress');
+      prog.max = 100;
+      prog.value = item.progress || 0;
+      div.appendChild(prog);
+    }
+    
+    if (item.error) {
+      const err = document.createElement('p');
+      err.className = 'error-text';
+      err.textContent = item.error;
+      div.appendChild(err);
+    }
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'chip-btn chip-danger';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => api.cancelImportItem(item.id);
+    
+    const acts = document.createElement('div');
+    acts.className = 'hf-actions';
+    acts.appendChild(cancelBtn);
+    div.appendChild(acts);
+
+    importQueueList.appendChild(div);
+  }
+  
+  if (importQueueList.children.length === 0) {
+    importQueueSection.hidden = true;
+  }
 }
 
 init().catch(console.error);

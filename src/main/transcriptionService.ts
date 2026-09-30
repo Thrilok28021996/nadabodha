@@ -123,6 +123,7 @@ export class TranscriptionService {
             }
           } else if (event.status === 'completed') {
             runTranscript = event.text || '';
+            const words = event.words;
             if (role === 'mic' && systemPath) {
               const formatted = runTranscript.split('\n').map(l => l.trim() ? `[You] ${l}` : l).join('\n');
               this.runBase = this.runBase ? joinTranscriptParts(this.runBase, formatted) : formatted;
@@ -131,11 +132,11 @@ export class TranscriptionService {
             } else if (role === 'system') {
               const formatted = runTranscript.split('\n').map(l => l.trim() ? `[Others] ${l}` : l).join('\n');
               this.transcript = this.runBase ? joinTranscriptParts(this.runBase, formatted) : formatted;
-              this.setState('completed', 100, undefined, this.transcript);
+              this.setState('completed', 100, undefined, this.transcript, words);
               this.cleanup();
             } else {
               this.transcript = this.runBase ? joinTranscriptParts(this.runBase, runTranscript) : runTranscript;
-              this.setState('completed', 100, undefined, this.transcript);
+              this.setState('completed', 100, undefined, this.transcript, words);
               this.cleanup();
             }
           } else if (event.status === 'error') {
@@ -259,12 +260,13 @@ export class TranscriptionService {
       }
     } else if (event.status === 'completed') {
       const fragment = event.text || '';
+      const words = event.words;
       // Append runs (dictation) keep everything dictated so far and add this
       // take; replace runs overwrite with the new text.
       this.transcript = this.runBase
         ? joinTranscriptParts(this.runBase, fragment)
         : fragment;
-      this.setState('completed', 100, undefined, this.transcript);
+      this.setState('completed', 100, undefined, this.transcript, words);
       this.cleanup();
     } else if (event.status === 'error') {
       this.setState('error', undefined, event.error);
@@ -279,7 +281,8 @@ export class TranscriptionService {
     state: ServiceState,
     progress?: number,
     error?: string,
-    text?: string
+    text?: string,
+    words?: {word: string, start: number, end: number}[]
   ): void {
     this.state = state;
     if (error !== undefined) this.lastError = error;
@@ -288,6 +291,7 @@ export class TranscriptionService {
       progress,
       error,
       text,
+      words,
       origin: this.currentOrigin,
     });
   }

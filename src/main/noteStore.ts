@@ -61,6 +61,7 @@ export interface NoteRecord {
 export interface NoteContent {
   transcript: string;
   summary: string;
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface NoteCreateOptions {
@@ -71,6 +72,7 @@ export interface NoteCreateOptions {
   model?: string;
   transcript?: string;
   audioPath?: string; // absolute path to audio to copy into the note dir
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface NoteUpdateOptions {
@@ -82,6 +84,7 @@ export interface NoteUpdateOptions {
   duration?: number;
   markSummaryStale?: boolean;
   clearSummaryStale?: boolean;
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface NoteStoreResult<T = void> {
@@ -331,7 +334,16 @@ export class NoteStore {
       if (fs.existsSync(record.summaryFile)) {
         summary = fs.readFileSync(record.summaryFile, 'utf8').trim();
       }
-      return { success: true, data: { transcript, summary } };
+      let words;
+      const wordsFile = path.join(record.noteDir, `${record.id}.words.json`);
+      if (fs.existsSync(wordsFile)) {
+        try {
+          words = JSON.parse(fs.readFileSync(wordsFile, 'utf8'));
+        } catch (err) {
+          console.error(`[NoteStore] Failed to read words file for note ${id}:`, err);
+        }
+      }
+      return { success: true, data: { transcript, summary, words } };
     } catch (err) {
       return { success: false, error: `Cannot read note: ${errorMsg(err)}` };
     }
@@ -387,6 +399,9 @@ export class NoteStore {
     const fileContents = serializeFrontmatter(fm) + (options.transcript ?? '');
     try {
       fs.writeFileSync(noteFile, fileContents, 'utf8');
+      if (options.words) {
+        fs.writeFileSync(path.join(noteDir, `${id}.words.json`), JSON.stringify(options.words), 'utf8');
+      }
     } catch (err) {
       return { success: false, error: `Cannot write note: ${errorMsg(err)}` };
     }
@@ -450,6 +465,10 @@ export class NoteStore {
 
       if (options.summary !== undefined) {
         fs.writeFileSync(record.summaryFile, options.summary, 'utf8');
+      }
+      
+      if (options.words !== undefined) {
+        fs.writeFileSync(path.join(record.noteDir, `${id}.words.json`), JSON.stringify(options.words), 'utf8');
       }
 
       // Refresh in-memory record.

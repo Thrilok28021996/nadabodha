@@ -34,8 +34,21 @@ export enum IpcChannel {
   ListFolders = 'list-folders',
   SearchNotes = 'search-notes',
   ReTranscribe = 're-transcribe',
+  EnqueueImports = 'enqueue-imports',
+  CancelImportItem = 'cancel-import-item',
+  RemoveImportItem = 'remove-import-item',
+  ImportQueueEvent = 'import-queue-event',
+  PickWatchFolder = 'pick-watch-folder',
 }
 
+export interface ImportItem {
+  id: string;
+  filePath: string;
+  progress: number;
+  status: 'pending' | 'transcribing' | 'completed' | 'error' | 'cancelled';
+  error?: string;
+  text?: string;
+}
 
 export type TranscriptionStatus =
   | 'idle'
@@ -73,6 +86,8 @@ export interface TranscriptionEvent {
   savedTranscriptPath?: string;
   savedSummaryPath?: string;
   saveError?: string;
+  // Word level timestamps
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface StartRecordingRequest {
@@ -86,6 +101,8 @@ export interface ImportAudioRequest {
 export interface SaveTranscriptRequest {
   filePath: string;
   text: string;
+  format?: 'txt' | 'srt' | 'vtt';
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface SaveTranscriptResult {
@@ -116,6 +133,7 @@ export interface AppSettings {
   /** Whether dictation pastes text at cursor. Default ON. OFF = append-in-app only. */
   dictationPasteEnabled?: boolean;
   meetingModeEnabled?: boolean;
+  watchFolderDir?: string;
 }
 
 /** Live state of the hold-Option dictation hook. */
@@ -202,6 +220,7 @@ export interface NoteInfo {
 export interface NoteContent {
   transcript: string;
   summary: string;
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface NoteListResult {
@@ -222,6 +241,7 @@ export interface NoteCreateRequest {
   source: NoteSource;
   folder?: string;
   transcript?: string;
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface NoteUpdateRequest {
@@ -233,6 +253,7 @@ export interface NoteUpdateRequest {
   model?: string;
   markSummaryStale?: boolean;
   clearSummaryStale?: boolean;
+  words?: {word: string, start: number, end: number}[];
 }
 
 export interface NoteActionResult {

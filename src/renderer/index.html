@@ -59,6 +59,14 @@
         </div>
       </div>
 
+      <!-- Import Queue -->
+      <div id="importQueueSection" class="sidebar-section" hidden>
+        <div class="section-header">
+          <span class="section-title">Import Queue</span>
+        </div>
+        <div id="importQueueList" class="folder-list"></div>
+      </div>
+
       <!-- Dictation enabled toggle (settings checkbox remnant kept for element IDs) -->
       <input type="checkbox" id="dictationEnabledChk" hidden>
       <p id="dictationStatus" hidden></p>
@@ -179,6 +187,8 @@
           <div class="panel-actions">
             <button id="copyBtn" type="button" class="chip-btn" disabled>Copy</button>
             <button id="saveBtn" type="button" class="chip-btn" disabled>Save as TXT</button>
+            <button id="saveSrtBtn" type="button" class="chip-btn" disabled>Save as SRT</button>
+            <button id="saveVttBtn" type="button" class="chip-btn" disabled>Save as VTT</button>
           </div>
           <textarea
             id="transcriptArea"
@@ -250,6 +260,15 @@
               <button id="dataDirBrowseBtn" type="button" class="chip-btn">Browse…</button>
             </div>
             <p id="dataDirStatus" class="setting-status"></p>
+          </div>
+
+          <!-- Watch folder -->
+          <div class="setting-group">
+            <h3>Watch folder</h3>
+            <div class="setting-row">
+              <input type="text" id="watchFolderInput" placeholder="Choose a folder to watch…" spellcheck="false" aria-label="Watch folder">
+              <button id="watchFolderBrowseBtn" type="button" class="chip-btn">Browse…</button>
+            </div>
           </div>
 
           <!-- STT model cache -->
@@ -337,7 +356,7 @@
   </div><!-- /#app -->
 
   <!-- Hidden file input for audio import -->
-  <input type="file" id="fileInput" accept="audio/*" hidden>
+  <input type="file" id="fileInput" accept="audio/*" multiple hidden>
 
   <script src="renderer.js"></script>
 </body>

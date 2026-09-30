@@ -40,7 +40,8 @@ import {
 } from './dictation';
 import { NoteStore, NoteRecord } from './noteStore';
 import { pasteTextAtCursor } from './paste';
-
+import { ImportQueue } from './importQueue';
+import { WatchFolder } from './watchFolder';
 
 export interface IpcSetupOptions {
   mainWindow: BrowserWindow;
@@ -122,6 +123,28 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     }
     mainWindow.webContents.send(IpcChannel.TranscriptionEvent, event);
   };
+
+  const importQueue = new ImportQueue(transcriptionService);
+  let watchFolder: WatchFolder | null = null;
+
+  importQueue.onEvent = (queue) => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IpcChannel.ImportQueueEvent, queue);
+    }
+  };
+
+  const applyWatchFolderSetting = () => {
+    const dir = settingsStore.get().watchFolderDir;
+    if (watchFolder) {
+      watchFolder.stop();
+      watchFolder = null;
+    }
+    if (dir) {
+      watchFolder = new WatchFolder(dir, importQueue);
+      watchFolder.start();
+    }
+  };
+  applyWatchFolderSetting();
 
   // ---- Summary orchestration -------------------------------------------------
 
@@ -526,6 +549,15 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         }
       }
 
+      if (typeof patch.watchFolderDir === 'string') {
+        const dir = patch.watchFolderDir.trim();
+        if (dir) {
+           accepted.watchFolderDir = dir;
+        } else {
+           accepted.watchFolderDir = '';
+        }
+      }
+
       if (typeof patch.sttCacheDir === 'string') {
         const dir = patch.sttCacheDir.trim();
         if (dir) {
@@ -563,6 +595,9 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
           // without restarting the app.
           applyDictationSetting();
         }
+        if (typeof patch.watchFolderDir === 'string') {
+          applyWatchFolderSetting();
+        }
         return { settings, errors, messages };
       } catch (err) {
         return {
@@ -587,6 +622,35 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       return null;
     }
     return result.filePaths[0];
+  });
+
+  ipcMain.handle(IpcChannel.PickWatchFolder, async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose Watch Folder',
+      properties: ['openDirectory'],
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+    return result.filePaths[0];
+  });
+
+  ipcMain.handle(IpcChannel.EnqueueImports, async (_event: unknown, filePaths: string[]) => {
+    const ids: string[] = [];
+    for (const p of filePaths) {
+      ids.push(importQueue.add(p));
+    }
+    return ids;
+  });
+
+  ipcMain.handle(IpcChannel.CancelImportItem, async (_event: unknown, id: string) => {
+    importQueue.cancel(id);
+    return { cancelled: true };
+  });
+
+  ipcMain.handle(IpcChannel.RemoveImportItem, async (_event: unknown, id: string) => {
+    importQueue.remove(id);
+    return { success: true };
   });
 
   ipcMain.handle(IpcChannel.PickFile, async () => {
@@ -746,6 +810,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         source: req.source || 'unknown',
         folder: typeof req.folder === 'string' ? req.folder : undefined,
         transcript: typeof req.transcript === 'string' ? req.transcript : undefined,
+        words: req.words,
       });
       return {
         success: result.success,
@@ -769,6 +834,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         model: req.model,
         markSummaryStale: req.markSummaryStale,
         clearSummaryStale: req.clearSummaryStale,
+        words: req.words,
       });
       return {
         success: result.success,

@@ -687,19 +687,27 @@ class FasterWhisperTranscriber(BaseTranscriber):
             return
 
         try:
-            segments, info = model.transcribe(file_path, beam_size=1)
+            segments, info = model.transcribe(file_path, beam_size=1, word_timestamps=True)
             duration = float(getattr(info, "duration", 0) or 0)
             parts: list[str] = []
+            words_list: list[dict] = []
             for segment in segments:
                 if self._cancelled:
                     self.on_event({"status": "cancelled"})
                     return
                 parts.append(segment.text or "")
+                if getattr(segment, "words", None):
+                    for w in segment.words:
+                        words_list.append({
+                            "word": w.word,
+                            "start": w.start,
+                            "end": w.end
+                        })
                 if duration > 0:
                     progress = int(min(95, max(5, segment.end / duration * 100)))
                     self.on_event({"status": "transcribing", "progress": progress})
             text = "".join(parts).strip()
-            self.on_event({"status": "completed", "text": text})
+            self.on_event({"status": "completed", "text": text, "words": words_list})
         except Exception as exc:
             self.on_event({"status": "error", "error": f"faster-whisper error: {exc}"})
 
