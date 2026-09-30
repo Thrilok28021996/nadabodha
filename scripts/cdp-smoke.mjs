@@ -1107,6 +1107,11 @@ async function main() {
       `(() => { const i = document.getElementById("hfSearchInput"); i.value = "faster-whisper"; ` +
         `i.dispatchEvent(new Event("input", { bubbles: true })); return i.value; })()`
     );
+    // NOTE: hfSearchInput has NO input-event listener in the Steno shell —
+    // search is triggered by the Search button (or Enter). The input event
+    // above is kept for older flows, but the button is what actually runs
+    // loadHfModels() (this was the run2 floor blocker).
+    await ev('document.getElementById("hfSearchBtn").click()');
     await waitFor(
       async () => (await ev('document.getElementById("hfResults").children.length')) > 0,
       { timeout: 45000, label: 'HF search results' }
@@ -1114,29 +1119,39 @@ async function main() {
     const rowCount = await ev('document.getElementById("hfResults").children.length');
     check(rowCount > 0, `search returned ${rowCount} row(s)`);
 
+    // D8 disposition (drift): the Steno shell's HF rows carry the repo id in
+    // a .hf-model-id span and the format in .hf-model-format — they never had
+    // a data-repo-id attribute or a download-count cell (the harness assumed
+    // the cycle-2 row markup). Target the implemented markup instead.
+    const hfRowExpr = (container) =>
+      `[...document.querySelectorAll('${container} .hf-model-item')].find(el => (el.querySelector('.hf-model-id') || {}).textContent === ${JSON.stringify(
+        HF_REPO
+      )})`;
     const targetRowText = await ev(
-      `(() => { const row = document.querySelector('#hfResults [data-repo-id=${JSON.stringify(HF_REPO)}]');` +
-        ' return row ? row.textContent : null; })()'
+      `(() => { const row = ${hfRowExpr('#hfResults')}; return row ? row.textContent : null; })()`
     );
     check(targetRowText !== null, `row for ${HF_REPO} is listed`);
     check(
       typeof targetRowText === 'string' && targetRowText.includes('CTranslate2'),
       `row shows format "CTranslate2": "${targetRowText}"`
     );
-    check(
-      typeof targetRowText === 'string' && targetRowText.includes('downloads'),
-      'row shows download count'
+    note(
+      'row download-count check dropped: Steno rows render repo id + format only (drift vs the cycle-2 markup)'
     );
 
     // --- download ----------------------------------------------------------
     step('Download model with live progress');
-    await ev(
-      `(() => { const row = document.querySelector('#hfResults [data-repo-id=${JSON.stringify(
-        HF_REPO
-      )}]'); row.click(); return row.classList.contains('selected'); })()`
+    const selectResult = await ev(
+      `(() => { const row = ${hfRowExpr('#hfResults')}; if (!row) return { row: false }; row.click(); return { row: true, selected: row.classList.contains('selected'), actions: !document.getElementById('hfActions').hidden, downloadVisible: !document.getElementById('hfDownloadBtn').hidden }; })()`
     );
-    const downloadEnabled = await ev('!document.getElementById("hfDownloadBtn").disabled');
-    check(downloadEnabled, 'selecting a supported model enables the Download button');
+    check(
+      selectResult && selectResult.row && selectResult.selected,
+      `selecting ${HF_REPO} marks the row selected (${JSON.stringify(selectResult)})`
+    );
+    check(
+      selectResult && selectResult.actions && selectResult.downloadVisible,
+      'selection enables the Download action (hfActions shown, Download visible)'
+    );
 
     let maxProgress = 0;
     const progressSampler = setInterval(() => {
@@ -1159,7 +1174,10 @@ async function main() {
         note(`downloadStatus: ${current}`);
         lastDownloadStatus = current;
       }
-      if (current.includes('Downloaded ')) {
+      // D8 disposition (drift): the app announces completion as
+      // "Download complete!" — the harness looked for a "Downloaded " prefix
+      // that no code emits (untested until this branch reached the floor).
+      if (current.includes('Downloaded ') || current.includes('Download complete')) {
         downloadDone = true;
         break;
       }
@@ -1197,44 +1215,52 @@ async function main() {
     check(downloadedBin !== null, `files landed in the chosen cache dir (${downloadedBin || 'missing'})`);
 
     // --- installed + active ------------------------------------------------
+    // D8 disposition (drift): installed/search rows in the Steno shell have
+    // no data-repo-id attribute (the repo id lives in the .hf-model-id span),
+    // the hint contract is different (no "Selected …" hfStatus text), and
+    // persistence needs a settings save — retarget to the implemented UX.
+    const hfInstalledRowExpr = `[...document.querySelectorAll('#hfInstalled .hf-model-item')].find(el => (el.querySelector('.hf-model-id') || {}).textContent === ${JSON.stringify(
+      HF_REPO
+    )})`;
+    const hfResultsRowExpr = `[...document.querySelectorAll('#hfResults .hf-model-item')].find(el => (el.querySelector('.hf-model-id') || {}).textContent === ${JSON.stringify(
+      HF_REPO
+    )})`;
     const installedHasModel = await waitFor(
-      async () =>
-        ev(
-          `Array.from(document.querySelectorAll('#hfInstalled [data-repo-id]')).some(el => el.dataset.repoId === ${JSON.stringify(
-            HF_REPO
-          )})`
-        ),
+      async () => await ev(`Boolean(${hfInstalledRowExpr})`),
       { timeout: 20000, label: 'installed row appears' }
     ).catch(() => false);
-    check(installedHasModel, 'downloaded model appears under Installed');
+    check(Boolean(installedHasModel), 'downloaded model appears under Installed');
 
-    // Selecting the model and clicking Set active can race the download's
-    // background refreshModels() re-render (the button can still be enabled
-    // while the selection was never registered), so verify the selection stuck
-    // and retry with diagnostics instead of failing blind.
+    // Selecting the model and clicking Use can race the download's
+    // background refreshModels() re-render, so verify the selection stuck
+    // and retry with diagnostics instead of failing blind. hfUseBtn sets the
+    // renderer-local activeModel; settingsSaveBtn is what persists it.
     let useEnabled = false;
     let activeSaved = false;
     let selectNote = '';
     for (let attempt = 1; attempt <= 4 && !activeSaved; attempt += 1) {
       const selected = await ev(
         `(() => {
-           const row = document.querySelector('#hfInstalled [data-repo-id=${JSON.stringify(HF_REPO)}]');
+           const row = ${hfInstalledRowExpr};
            if (row) row.click();
-           return { installedRow: Boolean(row), status: (document.getElementById('hfStatus').textContent || '').trim() };
+           return { installedRow: Boolean(row), selected: row ? row.classList.contains('selected') : false, useVisible: row ? !document.getElementById('hfUseBtn').hidden : false };
          })()`
       );
-      if (!String(selected.status).includes(`Selected ${HF_REPO}`)) {
+      if (!selected || !selected.selected) {
         // Fall back to the search-results row for the same repository.
         await ev(
-          `(() => { const r = document.querySelector('#hfResults [data-repo-id=${JSON.stringify(HF_REPO)}]'); if (r) r.click(); return true; })()`
+          `(() => { const r = ${hfResultsRowExpr}; if (r) r.click(); return Boolean(r); })()`
         );
       }
-      const statusAfter = (await textOf('hfStatus')).trim();
-      useEnabled = await ev('!document.getElementById("hfUseBtn").disabled');
+      const selectionState = await ev(
+        `({ selected: Boolean((${hfInstalledRowExpr}) && (${hfInstalledRowExpr}).classList.contains('selected')) || Boolean((${hfResultsRowExpr}) && (${hfResultsRowExpr}).classList.contains('selected')), useVisible: !document.getElementById('hfUseBtn').hidden, status: (document.getElementById('hfStatus').textContent || '').trim() })`
+      );
+      useEnabled = Boolean(selectionState && selectionState.useVisible);
       let statusAfterClick = '';
-      if (statusAfter.includes(`Selected ${HF_REPO}`) && useEnabled) {
+      if (useEnabled) {
         await ev('document.getElementById("hfUseBtn").click()');
-        await sleep(700); // catch the handler's own hint before any re-render
+        await sleep(500); // hfUseBtn sets renderer-local activeModel …
+        await ev('document.getElementById("settingsSaveBtn").click()'); // … and this persists it
         statusAfterClick = (await textOf('hfStatus')).trim();
         activeSaved = Boolean(
           await waitFor(async () => (await getSettings()).activeModel === HF_REPO, {
@@ -1243,15 +1269,15 @@ async function main() {
           }).catch(() => false)
         );
       }
-      selectNote = `installedRow=${selected.installedRow} status=${JSON.stringify(
-        statusAfter
-      )} useEnabled=${useEnabled} afterClick=${JSON.stringify(statusAfterClick)}`;
+      selectNote = `installedRow=${Boolean(
+        selected && selected.installedRow
+      )} selection=${JSON.stringify(selectionState)} afterClick=${JSON.stringify(statusAfterClick)}`;
       if (!activeSaved) {
         note(`set-active attempt ${attempt}: ${selectNote}`);
         await sleep(1500);
       }
     }
-    check(useEnabled, 'installed row enables the Set active button');
+    check(useEnabled, `installed row enables the Use button (${selectNote})`);
     check(
       activeSaved,
       `active model = ${HF_REPO}` +
@@ -1259,10 +1285,8 @@ async function main() {
     );
     const activeBadge = await waitFor(
       async () =>
-        ev(
-          `(() => { const row = document.querySelector('#hfInstalled [data-repo-id=${JSON.stringify(
-            HF_REPO
-          )}]'); return row ? row.textContent.includes('active') : false; })()`
+        await ev(
+          `(() => { const row = ${hfInstalledRowExpr}; return row ? /Active/i.test(row.textContent) : false; })()`
         ),
       { timeout: 20000, label: 'active badge rendered' }
     ).catch(() => false);
@@ -1287,7 +1311,9 @@ async function main() {
       transcriptPathShown.includes('transcripts/transcript_') && transcriptPathShown.endsWith('.txt'),
       `saved transcript path surfaced: "${transcriptPathShown}"`
     );
-    const transcriptFile = transcriptPathShown.replace(/^Transcript:\s*/, '');
+    // The shell labels the fields "Saved: …"/"Summary: …" (renderer 818/823,
+    // 907 may prefix "Summary saved:") — accept either spelling.
+    const transcriptFile = transcriptPathShown.replace(/^(?:Transcript|Saved):\s*/, '');
     check(fs.existsSync(transcriptFile), `auto-saved .txt exists (${transcriptFile})`);
     check(
       fs.readFileSync(transcriptFile, 'utf8') === transcript,
@@ -1348,7 +1374,7 @@ async function main() {
       summaryPathShown.includes('summaries/summary_') && summaryPathShown.endsWith('.md'),
       `saved summary path surfaced: "${summaryPathShown}"`
     );
-    const summaryFile = summaryPathShown.replace(/^Summary:\s*/, '');
+    const summaryFile = summaryPathShown.replace(/^(?:Summary saved|Summary):\s*/, '');
     check(fs.existsSync(summaryFile), `auto-saved .md exists (${summaryFile})`);
     check(
       fs.readFileSync(summaryFile, 'utf8') === summary,
@@ -1779,7 +1805,7 @@ async function main() {
       ),
       status: await textOf('statusText'),
       disabled: await ev('document.getElementById("recordBtn").disabled'),
-      pipeline: (await reqStatus()).status,
+      pipeline: await reqStatus(),
     };
     check(
       recordOutcome === 'completed',
@@ -2364,7 +2390,7 @@ async function main() {
         );
         const takeStatus = await statusText();
         note(
-          `dictation take ${attempt}/5: outcome=${outcome} appended="${appendedSoFar.trim().slice(0, 80) || '(none)'}" status="${takeStatus}" err="${takeErr}" pipeline=${(await reqStatus()).status} — retrying`
+          `dictation take ${attempt}/5: outcome=${outcome} appended="${appendedSoFar.trim().slice(0, 80) || '(none)'}" status="${takeStatus}" err="${takeErr}" pipeline=${await reqStatus()} — retrying`
         );
       }
       if (!take) await sleep(1500);
@@ -2716,8 +2742,10 @@ async function main() {
   console.log(appStdout.split('\n').slice(-40).join('\n'));
   console.log('--- app stderr (tail) ---');
   console.log(appStderr.split('\n').slice(-40).join('\n'));
+  const exitCode = failures.length > 0 ? 1 : 0;
   console.log('===============================================');
-  process.exit(failures.length > 0 ? 1 : 0);
+  console.log(`SMOKE_EXIT=${exitCode}`);
+  process.exit(exitCode);
 }
 
 main().catch((err) => {
