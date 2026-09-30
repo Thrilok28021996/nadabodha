@@ -10,8 +10,9 @@ let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
+    // Plan-fixed default window (v3 plan / test plan §3): 1180x760.
+    width: 1180,
+    height: 760,
     minWidth: 960,
     minHeight: 640,
     webPreferences: {

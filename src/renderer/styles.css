@@ -44,6 +44,14 @@
   padding: 0;
 }
 
+/*
+ * The UA `[hidden]` rule is `display: none` WITHOUT !important, so author
+ * `display: flex` rules (.note-detail, .recording-pill, .settings-panel,
+ * .empty-content, tab panels…) silently overrode it and "hidden" panels
+ * stayed visible (D8: real UI bug). Keep this first so hidden wins.
+ */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   overflow: hidden;
@@ -181,7 +189,9 @@ ul { list-style: none; }
 
 .action-record {
   background: var(--bg-active);
-  color: var(--accent);
+  /* #9db4ff clears WCAG AA (>=4.5:1) on --bg-active (6.1:1) and on the
+     hover shade (4.7:1); --accent #6c8cff only reached 4:1 (D8). */
+  color: #9db4ff;
 }
 
 .action-record:hover { background: #384080; }
@@ -202,7 +212,8 @@ ul { list-style: none; }
 
 .dictation-hint {
   font-size: 11px;
-  color: var(--text-hint);
+  /* --text-dim reaches 5.7:1 on the sidebar; --text-hint was 2.88:1 (D8). */
+  color: var(--text-dim);
   text-align: center;
 }
 

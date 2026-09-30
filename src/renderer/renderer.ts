@@ -9,9 +9,13 @@
  * All existing element IDs are preserved or explicitly updated together with
  * the harness (check-ids.js).  Vendored libraries (DOMPurify, marked) are
  * loaded via the copy-assets script and accessed through window globals.
+ *
+ * This file is loaded by index.html as a classic <script>, NOT as a module:
+ * it must contain no top-level import/export. TypeScript would otherwise emit
+ * the CommonJS `Object.defineProperty(exports, ...)` prologue and `exports` is
+ * undefined in the page, which aborts the whole script before a single
+ * listener is registered (D8 root cause: settings/banner/hint went dead).
  */
-
-export {};
 
 // ---------------------------------------------------------------------------
 // Vendored library types (set by copy-assets.js, loaded before this script)
@@ -65,6 +69,11 @@ interface TranscriptionEvent {
   file?: string;
   bytesDone?: number;
   bytesTotal?: number;
+  /** D3: system-audio (catap) capture failed; the mic recording continues. */
+  meetingError?: string;
+  /** D4: run token — completion routing prefers this over the local slot. */
+  reTranscribeNoteId?: string;
+  reTranscribeRunId?: number;
 }
 interface AppSettings {
   pythonPath: string;
@@ -87,6 +96,16 @@ interface HfModelListResult { models: HfModelInfo[]; installed: string[]; partia
 interface LlmConnectionResult { ok: boolean; models: string[]; message: string; }
 interface PythonValidation { ok: boolean; blocking: boolean; message: string; }
 interface SettingsUpdateResult { settings: AppSettings; errors: Partial<Record<string, string>>; messages?: Partial<Record<string, string>>; }
+
+// Script-file global augmentation (this file is a classic script, not a
+// module — see the header comment). False-positive disable: the interface
+// merges with the DOM lib's Window, so the name is "used" by lib.dom.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+interface Window {
+  electronAPI: ElectronAPI;
+  /** Set once init() has fully registered its listeners (harness tripwire). */
+  __nadabodhaReady?: boolean;
+}
 
 interface ElectronAPI {
   startRecording(options?: { meetingMode?: boolean }): Promise<{ outputPath: string }>;
@@ -126,11 +145,7 @@ interface ElectronAPI {
   readNoteContent(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
   listFolders(): Promise<{ folders: string[]; counts: Record<string, number> }>;
   searchNotes(q: string): Promise<NoteListResult>;
-  reTranscribe(noteId: string): Promise<{ started: boolean; error?: string }>;
-}
-
-declare global {
-  interface Window { electronAPI: ElectronAPI; }
+  reTranscribe(noteId: string): Promise<{ started: boolean; error?: string; runId?: number }>;
 }
 
 const api = window.electronAPI;
@@ -164,7 +179,6 @@ const dictationNotice   = document.getElementById('dictationNotice') as HTMLPara
 const dictationBanner   = document.getElementById('dictationBanner') as HTMLElement;
 const dictationGrantBtn = document.getElementById('dictationGrantBtn') as HTMLButtonElement;
 const dictationEnabledChk = document.getElementById('dictationEnabledChk') as HTMLInputElement;
-const dictationStatusHint = document.getElementById('dictationStatus') as HTMLParagraphElement;
 
 // Main content
 const emptyState        = document.getElementById('emptyState') as HTMLElement;
@@ -276,15 +290,18 @@ let currentSettings: AppSettings | null = null;
 let summaryView: SummaryView = 'preview';
 let selectedModelId: string | null = null;
 let installedModels: string[] = [];
-let partialModels: string[] = [];
 let activeModel = '';
-let hfLoaded = false;
 let hfSearchTimer: number | undefined;
 let llmLoadTimer: number | undefined;
 let isRecording = false;
 let recordingInterval: number | undefined;
 let recordingStartTime = 0;
 let pendingTranscriptNoteId: string | null = null; // note to update after re-transcribe
+/**
+ * D4: true while a re-transcribe run is in flight. The button stays disabled
+ * (and a second trigger is ignored) until the run reaches a terminal event.
+ */
+let retranscribeInFlight = false;
 
 /** Exact hint string required by the approved plan. */
 const DICTATION_HINT = 'Hold the Option key anywhere to dictate';
@@ -497,11 +514,14 @@ async function openNote(id: string): Promise<void> {
     refreshFolderSelect(note.folder);
     noteFolderSelect.value = note.folder || '';
 
-    // Re-transcribe button
-    reTranscribeBtn.disabled = !note.hasAudio;
-    reTranscribeBtn.title = note.hasAudio
-      ? 'Re-transcribe using the current model'
-      : 'No audio stored — re-transcribe is not available for this note';
+    // Re-transcribe button (D4: disabled with an explanatory tooltip when
+    // the note has no audio, or while a run is already in flight).
+    reTranscribeBtn.disabled = !note.hasAudio || retranscribeInFlight;
+    reTranscribeBtn.title = !note.hasAudio
+      ? 'No audio stored — re-transcribe is not available for this note'
+      : retranscribeInFlight
+        ? 'A re-transcribe run is already in progress'
+        : 'Re-transcribe using the current model';
 
     // Transcript
     transcriptArea.value = currentNoteContent.transcript;
@@ -728,6 +748,22 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
     return;
   }
 
+  // D3: system-audio (catap) capture failed while the microphone keeps
+  // recording — surface the failure in the status bar WITHOUT tearing down
+  // the recording UI (stopRecordingUI here would hide the Stop button).
+  if (event.meetingError) {
+    if (!isRecording) startRecordingUI();
+    updateStatusBar({ status: 'recording', error: event.meetingError });
+    return;
+  }
+
+  // D4: the run ends on a terminal status — release the re-transcribe
+  // guard so the button reflects the open note again.
+  if (status === 'completed' || status === 'error' || status === 'cancelled') {
+    retranscribeInFlight = false;
+    syncReTranscribeButton();
+  }
+
   // Transcription events
   updateStatusBar({ status, text, progress, error });
 
@@ -754,10 +790,13 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
 }
 
 async function handleTranscriptionCompleted(text: string, event: TranscriptionEvent): Promise<void> {
-  // If we have a pending note to update (from re-transcribe or recording)
-  if (pendingTranscriptNoteId) {
-    const noteId = pendingTranscriptNoteId;
-    pendingTranscriptNoteId = null;
+  // D4: the run token main stamped on the event wins over the renderer's
+  // single slot, so a completion can never land on a different note even if
+  // the slot was overwritten by a second trigger.
+  const routedNoteId = event.reTranscribeNoteId ?? pendingTranscriptNoteId;
+  pendingTranscriptNoteId = null;
+  if (routedNoteId) {
+    const noteId = routedNoteId;
     await api.updateNote({ id: noteId, transcript: text, markSummaryStale: true });
     await loadNotes();
     if (selectedNoteId === noteId) {
@@ -1017,7 +1056,6 @@ async function loadHfModels(query = ''): Promise<void> {
   try {
     const result = await api.listHfModels(query);
     installedModels = result.installed || [];
-    partialModels = result.partial || [];
     activeModel = result.activeModel || activeModel;
 
     if (result.error) {
@@ -1047,7 +1085,6 @@ async function loadHfModels(query = ''): Promise<void> {
       hfResults.appendChild(el);
     }
 
-    hfLoaded = true;
     renderHfSelection();
   } catch (err) {
     setHint(hfStatus, String(err), 'error');
@@ -1269,14 +1306,42 @@ noteFolderSelect.addEventListener('change', async () => {
   await loadNotes();
 });
 
+/**
+ * D4: single source of truth for the re-transcribe button state — disabled
+ * when the open note has no audio, and while a run is in flight (tooltip
+ * explains which of the two applies).
+ */
+function syncReTranscribeButton(): void {
+  const note = notes.find((n) => n.id === selectedNoteId);
+  const hasAudio = Boolean(note && note.hasAudio);
+  reTranscribeBtn.disabled = !hasAudio || retranscribeInFlight;
+  reTranscribeBtn.title = !hasAudio
+    ? 'No audio stored — re-transcribe is not available for this note'
+    : retranscribeInFlight
+      ? 'A re-transcribe run is already in progress'
+      : 'Re-transcribe using the current model';
+}
+
 reTranscribeBtn.addEventListener('click', async () => {
-  if (!selectedNoteId) return;
-  const result = await api.reTranscribe(selectedNoteId);
+  // D4 guard (a): a second trigger while a run is in flight is a no-op —
+  // the button is disabled too, this is belt-and-braces for keyboard/programmatic clicks.
+  if (!selectedNoteId || retranscribeInFlight) return;
+  const requestedNoteId = selectedNoteId;
+  retranscribeInFlight = true;
+  syncReTranscribeButton();
+  let result: { started: boolean; error?: string; runId?: number };
+  try {
+    result = await api.reTranscribe(requestedNoteId);
+  } catch (err) {
+    result = { started: false, error: String(err) };
+  }
   if (!result.started) {
+    retranscribeInFlight = false;
+    syncReTranscribeButton();
     showError(result.error || 'Re-transcribe failed to start');
     return;
   }
-  pendingTranscriptNoteId = selectedNoteId;
+  pendingTranscriptNoteId = requestedNoteId;
   updateStatusBar({ status: 'transcribing' });
 });
 
@@ -1417,9 +1482,14 @@ async function init(): Promise<void> {
       activeModel = currentSettings.activeModel || '';
     }
   } catch { /* ignore */ }
+
+  // Harness tripwire (D7.2): reaches true only when this script evaluated
+  // AND init() ran to completion — a CommonJS prologue, a thrown top-level
+  // statement, or a hung await all leave it undefined.
+  window.__nadabodhaReady = true;
 }
 
-function handleImportQueueEvent(queue: any[]) {
+function handleImportQueueEvent(queue: ImportItem[]) {
   if (!queue || queue.length === 0) {
     importQueueSection.hidden = true;
     importQueueList.innerHTML = '';
@@ -1436,7 +1506,7 @@ function handleImportQueueEvent(queue: any[]) {
     
     const title = document.createElement('h4');
     title.className = 'hf-model-id';
-    title.textContent = item.filePath.split(/[/\\]/).pop();
+    title.textContent = item.filePath.split(/[/\\]/).pop() || item.filePath;
     div.appendChild(title);
 
     const statusP = document.createElement('p');
