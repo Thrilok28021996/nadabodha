@@ -1664,19 +1664,36 @@ async function main() {
         await sleep(700);
         id = await activeNoteId();
       }
-      if (!id) return false;
+      if (!id) {
+        note(
+          `seedNoteSummary: no note id (list children=${await ev('document.getElementById("noteList").children.length')})`
+        );
+        return false;
+      }
       const res = await ev(
         `window.electronAPI.updateNote({ id: ${JSON.stringify(id)}, summary: ${JSON.stringify(
           summary
         )}, markSummaryStale: false })`
       );
-      if (!res || !res.success) return false;
+      if (!res || !res.success) {
+        note(`seedNoteSummary: updateNote rejected for ${id}: ${JSON.stringify(res)}`);
+        return false;
+      }
       await ev(
         `(() => { const li = document.querySelector('#noteList li.active'); if (li) li.click(); return true; })()`
       );
       await sleep(700);
       const val = await ev('document.getElementById("summaryArea").value');
-      return val === summary;
+      // The store strips the trailing newline on save (probe-verified:
+      // textarea holds the full fixture minus the final \n) — compare
+      // end-trimmed, not byte-identical.
+      if (String(val).trimEnd() !== String(summary).trimEnd()) {
+        note(
+          `seedNoteSummary: textarea mismatch after reopen (${val.length} vs ${summary.length} chars)`
+        );
+        return false;
+      }
+      return true;
     };
     const fixtureSeeded = await seedNoteSummary(MARKDOWN_FIXTURE);
     check(fixtureSeeded, 'fixture summary seeded into the open note (updateNote + reopen)');
