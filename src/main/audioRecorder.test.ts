@@ -43,22 +43,23 @@ describe('AudioRecorder', () => {
     const errors: Error[] = [];
     recorder.on('error', (err: Error) => errors.push(err));
 
-    const outputPath = recorder.start();
+    const { micPath: outputPath } = recorder.start();
     expect(typeof outputPath).toBe('string');
     expect(path.isAbsolute(outputPath)).toBe(true);
     expect(recorder.getState().status).toBe('recording');
 
-    const stoppedPath = await recorder.stop();
+    const stoppedResult = await recorder.stop();
     // Process should have exited.
     expect(recorder.getState().status).not.toBe('recording');
 
-    if (stoppedPath === null) {
+    if (stoppedResult === null) {
       // Host has no usable microphone (N-F2/F11): stop must fail loudly
       // instead of handing transcription a phantom path.
       expect(recorder.getState().status).toBe('error');
       expect(errors.length).toBeGreaterThan(0);
       expect(errors[errors.length - 1].message).toContain('Recording failed:');
     } else {
+      const stoppedPath = stoppedResult.micPath;
       expect(stoppedPath).toBe(outputPath);
       expect(fs.existsSync(stoppedPath)).toBe(true);
       expect(fs.statSync(stoppedPath).size).toBeGreaterThan(0);
@@ -68,7 +69,7 @@ describe('AudioRecorder', () => {
 
   it('cleans up temp file on cancel', async () => {
     const recorder = new AudioRecorder();
-    const outputPath = recorder.start();
+    const { micPath: outputPath } = recorder.start();
     const tempDir = path.dirname(outputPath);
     try {
       // ffmpeg creates the file only after it opens the output, on a later
@@ -99,13 +100,13 @@ describe('AudioRecorder', () => {
       recorder.on('error', (err: Error) => errors.push(err));
 
       recorder.start();
-      const stoppedPath = await recorder.stop();
+      const stoppedResult = await recorder.stop();
 
       expect(errors.length).toBeGreaterThan(0);
       expect(errors[0].message).toContain('ENOENT');
       expect(recorder.getState().status).toBe('error');
       // stop() must settle even though the process never spawned (F5).
-      expect(stoppedPath).toBeNull();
+      expect(stoppedResult).toBeNull();
     } finally {
       fs.rmSync(emptyBin, { recursive: true, force: true });
     }
@@ -122,7 +123,7 @@ describe('AudioRecorder', () => {
       const errors: Error[] = [];
       recorder.on('error', (err: Error) => errors.push(err));
 
-      const outputPath = recorder.start();
+      const { micPath: outputPath } = recorder.start();
       expect(recorder.getState().status).toBe('recording');
 
       const stoppedPath = await recorder.stop();
@@ -158,7 +159,7 @@ describe('AudioRecorder', () => {
       const errors: Error[] = [];
       recorder.on('error', (err: Error) => errors.push(err));
 
-      const outputPath = recorder.start();
+      const { micPath: outputPath } = recorder.start();
       // Let the fake ffmpeg write stderr and exit; a small extra delay
       // ensures the piped stderr has been drained by this process.
       await waitFor(() => fs.existsSync(marker), 5000);
@@ -254,15 +255,15 @@ describe('AudioRecorder', () => {
     const errors: Error[] = [];
     recorder.on('error', (err: Error) => errors.push(err));
 
-    const outputPath = recorder.start();
+    const { micPath: outputPath } = recorder.start();
     const tempDir = path.dirname(outputPath);
 
     expect(recorder.cancel()).toBeNull();
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(fs.existsSync(tempDir)).toBe(false);
 
-    const stoppedPath = await recorder.stop();
-    expect(stoppedPath).toBeNull();
+    const stoppedResult = await recorder.stop();
+    expect(stoppedResult).toBeNull();
     expect(recorder.getState().status).toBe('idle');
     // Nothing failed; cancel/stop must not fabricate recording errors.
     expect(errors).toHaveLength(0);
@@ -277,6 +278,59 @@ describe('AudioRecorder', () => {
     expect(recorder.getState().status).toBe('idle');
   });
 
+  it('catap ENOENT degrades meeting capture to mic-only — no crash, error surfaced (D3)', async () => {
+    const { binDir, ffmpegPath } = makeFakeFfmpegDir();
+    const emptyCatapDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nadabodha-no-catap-'));
+    try {
+      // Mic process stays alive until signalled (the mic must keep rolling
+      // after the system-audio spawn fails), never writes a WAV.
+      writeFakeScript(ffmpegPath, "trap 'exit 1' INT TERM\nwhile true; do :; done\n");
+
+      // Jest sandboxes process.env, so stripping PATH does not reach
+      // spawn(); an explicit catapPath that cannot exist produces the same
+      // ENOENT 'error' event that a PATH without conda bin would.
+      const recorder = new AudioRecorder({
+        ffmpegPath,
+        catapPath: path.join(emptyCatapDir, 'catap'),
+      });
+      const errors: Error[] = [];
+      const meetingErrors: string[] = [];
+      recorder.on('error', (err: Error) => errors.push(err));
+      recorder.on('meeting-error', (message: string) => meetingErrors.push(message));
+
+      recorder.start({ meetingMode: true });
+
+      // Without a listener, this ChildProcess 'error' would be uncaught and
+      // take the Electron main process down; the test reaching here at all
+      // proves the handler exists.
+      await waitFor(() => meetingErrors.length > 0, 5000);
+      expect(meetingErrors).toHaveLength(1);
+      expect(meetingErrors[0]).toContain('catap');
+      expect(meetingErrors[0]).toMatch(/System audio (not captured|capture failed)/);
+      expect(meetingErrors[0]).toMatch(/microphone only|not found on PATH/);
+
+      // Degraded state: mic recording continues, no recorder-level error,
+      // the failure is visible on the state the renderer reads.
+      const state = recorder.getState();
+      expect(state.status).toBe('recording');
+      expect(state.meetingError).toBeDefined();
+      expect(state.meetingError).toContain('catap');
+      expect(errors).toHaveLength(0);
+
+      // stop() must still settle (system process reference was nulled).
+      const stopped = await recorder.stop();
+      // The fake ffmpeg never wrote the mic WAV — mic-capture failure path,
+      // unrelated to catap; what matters is stop() settles without hanging.
+      expect(stopped).toBeNull();
+      expect(recorder.getState().status).toBe('error');
+      // The meeting failure was surfaced once, never re-emitted by stop().
+      expect(meetingErrors).toHaveLength(1);
+    } finally {
+      fs.rmSync(emptyCatapDir, { recursive: true, force: true });
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
   it('stop twice: the second stop never replays the previous session path (N-F4)', async () => {
     const recorder = new AudioRecorder();
     const errors: Error[] = [];
@@ -287,9 +341,9 @@ describe('AudioRecorder', () => {
     const secondStop = await recorder.stop();
 
     expect(secondStop).toBeNull();
-    if (firstStop !== null) {
-      expect(fs.existsSync(firstStop)).toBe(true);
-      expect(fs.statSync(firstStop).size).toBeGreaterThan(0);
+    if (firstStop) {
+      expect(fs.existsSync(firstStop.micPath)).toBe(true);
+      expect(fs.statSync(firstStop.micPath).size).toBeGreaterThan(0);
     }
   });
 });

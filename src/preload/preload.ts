@@ -25,7 +25,25 @@ enum IpcChannel {
   CancelDownload = 'cancel-download',
   Summarize = 'summarize',
   CancelSummary = 'cancel-summary',
+  DictationStatus = 'dictation-status',
+  DictationRequestAccess = 'dictation-request-access',
+  // Stage 1: Note store
+  ListNotes = 'list-notes',
+  GetNote = 'get-note',
+  CreateNote = 'create-note',
+  UpdateNote = 'update-note',
+  DeleteNote = 'delete-note',
+  ReadNoteContent = 'read-note-content',
+  ListFolders = 'list-folders',
+  SearchNotes = 'search-notes',
+  ReTranscribe = 're-transcribe',
+  EnqueueImports = 'enqueue-imports',
+  CancelImportItem = 'cancel-import-item',
+  RemoveImportItem = 'remove-import-item',
+  ImportQueueEvent = 'import-queue-event',
+  PickWatchFolder = 'pick-watch-folder',
 }
+
 
 type TranscriptionStatus =
   | 'idle'
@@ -37,7 +55,7 @@ type TranscriptionStatus =
   | 'downloading'
   | 'summarizing';
 
-type EventOrigin = 'transcription' | 'download' | 'summary';
+type EventOrigin = 'transcription' | 'download' | 'summary' | 'dictation';
 
 interface TranscriptionEvent {
   status: TranscriptionStatus;
@@ -45,6 +63,7 @@ interface TranscriptionEvent {
   progress?: number;
   error?: string;
   origin?: EventOrigin;
+  dictationNotice?: string;
   repoId?: string;
   path?: string;
   file?: string;
@@ -53,11 +72,14 @@ interface TranscriptionEvent {
   savedTranscriptPath?: string;
   savedSummaryPath?: string;
   saveError?: string;
+  partial?: boolean;
 }
 
 interface SaveTranscriptRequest {
   filePath: string;
   text: string;
+  format?: 'txt' | 'srt' | 'vtt';
+  words?: {word: string, start: number, end: number}[];
 }
 
 interface SaveTranscriptResult {
@@ -76,6 +98,27 @@ interface AppSettings {
   summarizationEnabled: boolean;
   autoSummarize: boolean;
   activeModel: string;
+  dictationEnabled: boolean;
+  dictationPasteEnabled?: boolean;
+  meetingModeEnabled?: boolean;
+  watchFolderDir?: string;
+}
+
+interface ImportItem {
+  id: string;
+  filePath: string;
+  progress: number;
+  status: 'pending' | 'transcribing' | 'completed' | 'error' | 'cancelled';
+  error?: string;
+  text?: string;
+}
+
+interface DictationStatusInfo {
+  supported: boolean;
+  enabled: boolean;
+  accessibilityTrusted: boolean;
+  running: boolean;
+  reason?: string;
 }
 
 interface PythonValidation {
@@ -113,8 +156,67 @@ interface HfModelListResult {
   error?: string;
 }
 
+// Stage 1: Note store types (mirrored from shared/ipc.ts)
+type NoteSource = 'recording' | 'import' | 'dictation-log' | 'unknown';
+
+interface NoteInfo {
+  id: string;
+  title: string;
+  created: string;
+  source: NoteSource;
+  folder: string;
+  duration: number;
+  model: string;
+  transcribed_at?: string;
+  hasAudio: boolean;
+  summaryStale?: boolean;
+}
+
+interface NoteContent {
+  transcript: string;
+  summary: string;
+  words?: {word: string, start: number, end: number}[];
+}
+
+interface NoteListResult {
+  notes: NoteInfo[];
+  folders: string[];
+  folderCounts: Record<string, number>;
+  error?: string;
+}
+
+interface NoteGetResult {
+  note?: NoteInfo;
+  content?: NoteContent;
+  error?: string;
+}
+
+interface NoteCreateRequest {
+  title?: string;
+  source: NoteSource;
+  folder?: string;
+  transcript?: string;
+}
+
+interface NoteUpdateRequest {
+  id: string;
+  title?: string;
+  folder?: string;
+  transcript?: string;
+  summary?: string;
+  model?: string;
+  markSummaryStale?: boolean;
+  clearSummaryStale?: boolean;
+}
+
+interface NoteActionResult {
+  success: boolean;
+  note?: NoteInfo;
+  error?: string;
+}
+
 export interface ElectronApi {
-  startRecording: () => Promise<{ outputPath: string }>;
+  startRecording: (options?: { meetingMode?: boolean }) => Promise<{ outputPath: string }>;
   stopRecording: () => Promise<{ outputPath: string | null }>;
   importAudio: (filePath: string) => Promise<{ filePath: string }>;
   cancelTranscription: () => Promise<{ cancelled: boolean }>;
@@ -141,10 +243,30 @@ export interface ElectronApi {
   cancelDownload: () => Promise<{ cancelled: boolean }>;
   summarize: (text?: string) => Promise<{ started: boolean; error?: string }>;
   cancelSummary: () => Promise<{ cancelled: boolean }>;
+  // Dictation (hold Option)
+  getDictationStatus: () => Promise<DictationStatusInfo>;
+  requestDictationAccess: () => Promise<DictationStatusInfo>;
+  // Stage 1: Note store
+  listNotes: () => Promise<NoteListResult>;
+  getNote: (id: string) => Promise<NoteGetResult>;
+  createNote: (req: NoteCreateRequest) => Promise<NoteActionResult>;
+  updateNote: (req: NoteUpdateRequest) => Promise<NoteActionResult>;
+  deleteNote: (id: string) => Promise<NoteActionResult>;
+  readNoteContent: (id: string) => Promise<NoteGetResult>;
+  listFolders: () => Promise<{ folders: string[]; counts: Record<string, number> }>;
+  searchNotes: (query: string) => Promise<NoteListResult>;
+  reTranscribe: (noteId: string) => Promise<{ started: boolean; error?: string; runId?: number }>;
+  // Stage 5
+  pickWatchFolder: () => Promise<string | null>;
+  enqueueImports: (filePaths: string[]) => Promise<string[]>;
+  cancelImportItem: (id: string) => Promise<{cancelled: boolean}>;
+  removeImportItem: (id: string) => Promise<{success: boolean}>;
+  onImportQueueEvent: (callback: (queue: ImportItem[]) => void) => void;
+  removeImportQueueListener: () => void;
 }
 
 const api: ElectronApi = {
-  startRecording: () => ipcRenderer.invoke(IpcChannel.StartRecording),
+  startRecording: (options) => ipcRenderer.invoke(IpcChannel.StartRecording, options),
   stopRecording: () => ipcRenderer.invoke(IpcChannel.StopRecording),
   importAudio: (filePath: string) => ipcRenderer.invoke(IpcChannel.ImportAudio, filePath),
   cancelTranscription: () => ipcRenderer.invoke(IpcChannel.CancelTranscription),
@@ -180,6 +302,31 @@ const api: ElectronApi = {
   cancelDownload: () => ipcRenderer.invoke(IpcChannel.CancelDownload),
   summarize: (text) => ipcRenderer.invoke(IpcChannel.Summarize, { text }),
   cancelSummary: () => ipcRenderer.invoke(IpcChannel.CancelSummary),
+  getDictationStatus: () => ipcRenderer.invoke(IpcChannel.DictationStatus),
+  requestDictationAccess: () => ipcRenderer.invoke(IpcChannel.DictationRequestAccess),
+  listNotes: () => ipcRenderer.invoke(IpcChannel.ListNotes),
+  getNote: (id) => ipcRenderer.invoke(IpcChannel.GetNote, id),
+  createNote: (req) => ipcRenderer.invoke(IpcChannel.CreateNote, req),
+  updateNote: (req) => ipcRenderer.invoke(IpcChannel.UpdateNote, req),
+  deleteNote: (id) => ipcRenderer.invoke(IpcChannel.DeleteNote, id),
+  readNoteContent: (id) => ipcRenderer.invoke(IpcChannel.ReadNoteContent, id),
+  listFolders: () => ipcRenderer.invoke(IpcChannel.ListFolders),
+  searchNotes: (query) => ipcRenderer.invoke(IpcChannel.SearchNotes, query),
+  reTranscribe: (noteId) => ipcRenderer.invoke(IpcChannel.ReTranscribe, { noteId }),
+  pickWatchFolder: () => ipcRenderer.invoke(IpcChannel.PickWatchFolder),
+  enqueueImports: (filePaths) => ipcRenderer.invoke(IpcChannel.EnqueueImports, filePaths),
+  cancelImportItem: (id) => ipcRenderer.invoke(IpcChannel.CancelImportItem, id),
+  removeImportItem: (id) => ipcRenderer.invoke(IpcChannel.RemoveImportItem, id),
+  onImportQueueEvent: (callback) => {
+    ipcRenderer.removeAllListeners(IpcChannel.ImportQueueEvent);
+    ipcRenderer.on(IpcChannel.ImportQueueEvent, (_event: unknown, queue: ImportItem[]) => {
+      callback(queue);
+    });
+  },
+  removeImportQueueListener: () => {
+    ipcRenderer.removeAllListeners(IpcChannel.ImportQueueEvent);
+  },
 };
 
 contextBridge.exposeInMainWorld('electronAPI', api);
+

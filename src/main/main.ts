@@ -4,13 +4,17 @@ import { setupIpcHandlers } from './ipcHandlers';
 import { AudioRecorder } from './audioRecorder';
 import { TranscriptionService } from './transcriptionService';
 import { SettingsStore, resolvePythonExecutable, settingsFilePath } from './settingsStore';
+import { NoteStore } from './noteStore';
 
 let mainWindow: BrowserWindow | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
+    // Plan-fixed default window (v3 plan / test plan §3): 1180x760.
+    width: 1180,
+    height: 760,
+    minWidth: 960,
+    minHeight: 640,
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
@@ -43,16 +47,41 @@ app.whenReady().then(() => {
     },
   });
 
+  // Note store: initialize with the configured data directory.
+  // On first run (or when no dataDir is set) we use userData/notes as a safe
+  // default so the app is always usable without additional setup.
+  const resolveDataDir = (): string => {
+    const settings = settingsStore.get();
+    return settings.dataDir || path.join(app.getPath('userData'), 'nadabodha-data');
+  };
+  const noteStore = new NoteStore(resolveDataDir());
+  const reindexResult = noteStore.reindex();
+  if (!reindexResult.success) {
+    console.error(`[NoteStore] reindex failed: ${reindexResult.error}`);
+  }
+  // One-time migration: import any pre-existing transcript/summary files.
+  noteStore.migrateFromLegacy();
+
   if (!mainWindow) {
     throw new Error('Main window not created');
   }
 
-  setupIpcHandlers({
+  const { dictation } = setupIpcHandlers({
     mainWindow,
     transcriptionService,
     recorder,
     settingsStore,
+    noteStore,
   });
+
+
+  // The global Option hook must never outlive the app (approved plan,
+  // workstream 3: "Stop the hook on app quit").
+  if (dictation) {
+    app.on('will-quit', () => {
+      dictation.stop();
+    });
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

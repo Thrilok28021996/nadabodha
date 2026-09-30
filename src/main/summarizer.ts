@@ -89,6 +89,14 @@ export interface SummarizeOptions {
   transcript: string;
   template: string;
   timeoutMs?: number;
+  /** Optional system-level instruction (kept separate from the user template). */
+  systemPrompt?: string;
+  /**
+   * Upper bound on generated tokens. Local reasoning models otherwise keep
+   * emitting hidden reasoning until the context is exhausted, which pushes a
+   * single summary past the summarizer's own 300s timeout.
+   */
+  maxTokens?: number;
 }
 
 export interface SummarizeOutcome {
@@ -178,6 +186,8 @@ export class Summarizer {
         model,
         apiKey: opts.apiKey,
         userPrompt: buildUserPrompt(opts.template, opts.transcript),
+        systemPrompt: opts.systemPrompt,
+        maxTokens: opts.maxTokens,
       });
 
       timeoutHandle = setTimeout(() => {

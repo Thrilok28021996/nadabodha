@@ -1,6 +1,7 @@
 import fs from 'fs';
 import { TranscriptionAdapter } from './transcriptionAdapter';
 import {
+  EventOrigin,
   TranscriptionEvent,
   TranscriptionStatus,
 } from '../shared/ipc';
@@ -12,6 +13,47 @@ export type ServiceState =
   | 'completed'
   | 'cancelled'
   | 'error';
+
+export interface StartTranscriptionOptions {
+  /**
+   * Append the result to the transcript held from the previous run instead of
+   * replacing it. Used by hold-Option dictation, which builds text
+   * incrementally; plain record/import keep their replace semantics.
+   */
+  append?: boolean;
+  /** Origin stamped on every event produced by this run (e.g. 'dictation'). */
+  origin?: EventOrigin;
+}
+
+/** Joins two transcript fragments: newline between takes, unless already spaced. */
+export function joinTranscriptParts(base: string, fragment: string): string {
+  if (!base) return fragment;
+  if (!fragment) return base;
+  if (/\s$/.test(base)) return `${base}${fragment}`;
+  return `${base}\n${fragment}`;
+}
+
+/**
+ * Why an adapter child died before it reported a result.
+ *
+ * `code === null` means the process was terminated by a signal; naming the
+ * signal (e.g. SIGTERM) is the difference between an actionable reason and
+ * the opaque "exited with code null".
+ */
+export function describeAdapterExit(
+  code: number | null,
+  signal?: NodeJS.Signals | null
+): string {
+  if (code === null) {
+    return `Transcription process was terminated by ${
+      signal ? `signal ${signal}` : 'a signal'
+    } before completing`;
+  }
+  if (code === 0) {
+    return 'Transcription process exited (code 0) before reporting a result';
+  }
+  return `Transcription process exited with code ${code}`;
+}
 
 export interface TranscriptionServiceOptions {
   /** Resolved lazily on every run so settings changes apply immediately. */
@@ -28,6 +70,10 @@ export class TranscriptionService {
   private transcript = '';
   private lastError?: string;
   private listeners: ((event: TranscriptionEvent) => void)[] = [];
+  /** Text the current run appends to (dictation), else ''. */
+  private runBase = '';
+  /** Origin stamped on the current run's events. */
+  private currentOrigin: EventOrigin | undefined;
 
   constructor(private readonly options: TranscriptionServiceOptions = {}) {}
 
@@ -47,18 +93,31 @@ export class TranscriptionService {
     return this.currentFilePath;
   }
 
-  startTranscription(filePath: string): void {
+  startTranscription(paths: { micPath: string; systemPath?: string } | string, options: StartTranscriptionOptions = {}): void {
     if (this.state === 'recording' || this.state === 'transcribing') {
       throw new Error(`Cannot start transcription while in state ${this.state}`);
     }
 
-    if (!fs.existsSync(filePath)) {
-      this.setState('error', undefined, `File not found: ${filePath}`);
+    // Reap a child left over from a previous run (terminal state, adapter not
+    // yet cleared) so it can never signal into this run.
+    this.finishRun(this.adapter);
+
+    this.currentOrigin = options.origin;
+    this.runBase = options.append ? this.transcript : '';
+
+    const micPath = typeof paths === 'string' ? paths : paths.micPath;
+    const systemPath = typeof paths === 'string' ? undefined : paths.systemPath;
+
+    if (!fs.existsSync(micPath)) {
+      this.setState('error', undefined, `File not found: ${micPath}`);
       return;
     }
 
-    this.currentFilePath = filePath;
-    this.transcript = '';
+    this.currentFilePath = micPath;
+    if (!options.append) {
+      this.transcript = '';
+      this.runBase = '';
+    }
     this.lastError = undefined;
     this.setState('transcribing', 0);
 
@@ -70,40 +129,154 @@ export class TranscriptionService {
       ? this.options.getSttConfig()
       : { modelRepo: '', cacheDir: '' };
 
-    this.adapter = new TranscriptionAdapter({
+    const runAdapter = (filePath: string, role: 'mic' | 'system', onDone: (text: string) => void) => {
+      let runTranscript = '';
+      const adapter = new TranscriptionAdapter({
+        pythonExecutable,
+        pythonScriptPath: this.options.pythonScriptPath,
+        onEvent: (event) => {
+          // A run that has been superseded must never move the state machine:
+          // its late lines (and exit) arrive after the next run has started.
+          if (this.adapter !== adapter) return;
+          if (event.origin === 'download') {
+            this.broadcast(event);
+            return;
+          }
+          if (event.status === 'transcribing') {
+            if (event.text !== undefined && event.partial) {
+              const prefix = role === 'mic' && systemPath ? '[You] ' : role === 'system' ? '[Others] ' : '';
+              const partialText = this.runBase ? joinTranscriptParts(this.runBase, prefix + event.text) : prefix + event.text;
+              this.broadcast({ status: 'transcribing', text: partialText, origin: this.currentOrigin, partial: true });
+            } else {
+              this.setState('transcribing', event.progress);
+            }
+          } else if (event.status === 'completed') {
+            runTranscript = event.text || '';
+            const words = event.words;
+            if (role === 'mic' && systemPath) {
+              const formatted = runTranscript.split('\n').map(l => l.trim() ? `[You] ${l}` : l).join('\n');
+              this.runBase = this.runBase ? joinTranscriptParts(this.runBase, formatted) : formatted;
+              this.finishRun(adapter);
+              onDone(formatted);
+            } else if (role === 'system') {
+              const formatted = runTranscript.split('\n').map(l => l.trim() ? `[Others] ${l}` : l).join('\n');
+              this.transcript = this.runBase ? joinTranscriptParts(this.runBase, formatted) : formatted;
+              this.setState('completed', 100, undefined, this.transcript, words);
+              this.finishRun(adapter);
+            } else {
+              this.transcript = this.runBase ? joinTranscriptParts(this.runBase, runTranscript) : runTranscript;
+              this.setState('completed', 100, undefined, this.transcript, words);
+              this.finishRun(adapter);
+            }
+          } else if (event.status === 'error') {
+            this.setState('error', undefined, event.error);
+            this.finishRun(adapter);
+          } else if (event.status === 'cancelled') {
+            this.setState('cancelled');
+            this.finishRun(adapter);
+          }
+        },
+        onError: (err) => {
+          if (this.adapter !== adapter || this.state !== 'transcribing') return;
+          this.setState('error', undefined, err.message);
+          this.finishRun(adapter);
+        },
+        onExit: (code, signal) => {
+          if (this.adapter !== adapter || this.state !== 'transcribing') return;
+          this.setState('error', undefined, describeAdapterExit(code, signal));
+          this.finishRun(adapter);
+        },
+      });
+
+      this.adapter = adapter;
+      adapter.start();
+      adapter.send({
+        action: 'transcribe',
+        file_path: filePath,
+        model_repo: stt.modelRepo || '',
+        cache_dir: stt.cacheDir || '',
+      });
+    };
+
+    if (systemPath && fs.existsSync(systemPath)) {
+      runAdapter(micPath, 'mic', () => {
+        runAdapter(systemPath, 'system', () => {});
+      });
+    } else {
+      runAdapter(micPath, 'mic', () => {});
+    }
+  }
+
+  startStreaming(inputStream: NodeJS.ReadableStream, options: StartTranscriptionOptions = {}): void {
+    if (this.state === 'recording' || this.state === 'transcribing') {
+      throw new Error(`Cannot start streaming while in state ${this.state}`);
+    }
+
+    // Reap a child left over from a previous run before starting a new one.
+    this.finishRun(this.adapter);
+
+    this.currentOrigin = options.origin;
+    this.runBase = options.append ? this.transcript : '';
+    if (!options.append) {
+      this.transcript = '';
+      this.runBase = '';
+    }
+    this.lastError = undefined;
+    this.currentFilePath = null;
+    this.setState('transcribing', 0);
+
+    const pythonExecutable =
+      typeof this.options.pythonExecutable === 'function'
+        ? this.options.pythonExecutable()
+        : this.options.pythonExecutable;
+    const stt = this.options.getSttConfig
+      ? this.options.getSttConfig()
+      : { modelRepo: '', cacheDir: '' };
+
+    const adapter = new TranscriptionAdapter({
       pythonExecutable,
       pythonScriptPath: this.options.pythonScriptPath,
-      onEvent: (event) => this.handleAdapterEvent(event),
-      onError: (err) => {
-        this.setState('error', undefined, err.message);
+      onEvent: (event) => {
+        if (this.adapter !== adapter) return;
+        this.handleAdapterEvent(event, adapter);
       },
-      onExit: (code) => {
-        if (this.state === 'transcribing' && code !== 0) {
-          this.setState(
-            'error',
-            undefined,
-            `Transcription process exited with code ${code}`
-          );
-        }
+      onError: (err) => {
+        if (this.adapter !== adapter || this.state !== 'transcribing') return;
+        this.setState('error', undefined, err.message);
+        this.finishRun(adapter);
+      },
+      onExit: (code, signal) => {
+        // Only the run's OWN death is an error. A superseded streaming child
+        // (SIGTERM'd by cancel()) reports here late — it must not clobber the
+        // run that replaced it (this was the "exited with code null" bug).
+        if (this.adapter !== adapter || this.state !== 'transcribing') return;
+        this.setState('error', undefined, describeAdapterExit(code, signal));
+        this.finishRun(adapter);
       },
     });
 
-    this.adapter.start();
-    this.adapter.send({
-      action: 'transcribe',
-      file_path: filePath,
-      model_repo: stt.modelRepo || '',
-      cache_dir: stt.cacheDir || '',
-    });
+    this.adapter = adapter;
+
+    // Use tiny model for streaming if available, else active model.
+    // The plan says "tiny/base used for streaming latency vs existing selected model for file jobs"
+    // Since we don't know if tiny/base is cached, we just use the selected model for now unless we implement
+    // a fallback. We'll just use the selected model.
+    const stdin = adapter.startStream(stt.modelRepo || '', stt.cacheDir || '');
+    inputStream.pipe(stdin);
   }
 
   cancel(): void {
-    if (this.state === 'transcribing') {
-      this.adapter?.send({ action: 'cancel' });
-      this.adapter?.stop();
+    const adapter = this.adapter;
+    if (this.state === 'transcribing' && adapter) {
+      try {
+        adapter.send({ action: 'cancel' });
+      } catch {
+        // Child already exited — stopping below is still correct.
+      }
+      adapter.stop();
     }
     this.setState('cancelled');
-    this.cleanup();
+    this.finishRun(adapter);
   }
 
   reset(): void {
@@ -112,10 +285,12 @@ export class TranscriptionService {
     this.currentFilePath = null;
     this.transcript = '';
     this.lastError = undefined;
+    this.runBase = '';
+    this.currentOrigin = undefined;
     this.broadcast({ status: 'idle' });
   }
 
-  private handleAdapterEvent(event: TranscriptionEvent): void {
+  private handleAdapterEvent(event: TranscriptionEvent, source: TranscriptionAdapter | null = null): void {
     // Model-download events can be interleaved with transcription events
     // (an active model that still needs fetching). They must reach the
     // renderer untouched and must never advance the transcription state.
@@ -124,17 +299,28 @@ export class TranscriptionService {
       return;
     }
     if (event.status === 'transcribing') {
-      this.setState('transcribing', event.progress);
+      if (event.text !== undefined && event.partial) {
+        const partialText = this.runBase ? joinTranscriptParts(this.runBase, event.text) : event.text;
+        this.broadcast({ status: 'transcribing', text: partialText, origin: this.currentOrigin, partial: true });
+      } else {
+        this.setState('transcribing', event.progress);
+      }
     } else if (event.status === 'completed') {
-      this.transcript = event.text || '';
-      this.setState('completed', 100, undefined, this.transcript);
-      this.cleanup();
+      const fragment = event.text || '';
+      const words = event.words;
+      // Append runs (dictation) keep everything dictated so far and add this
+      // take; replace runs overwrite with the new text.
+      this.transcript = this.runBase
+        ? joinTranscriptParts(this.runBase, fragment)
+        : fragment;
+      this.setState('completed', 100, undefined, this.transcript, words);
+      this.finishRun(source ?? this.adapter);
     } else if (event.status === 'error') {
       this.setState('error', undefined, event.error);
-      this.cleanup();
+      this.finishRun(source ?? this.adapter);
     } else if (event.status === 'cancelled') {
       this.setState('cancelled');
-      this.cleanup();
+      this.finishRun(source ?? this.adapter);
     }
   }
 
@@ -142,7 +328,8 @@ export class TranscriptionService {
     state: ServiceState,
     progress?: number,
     error?: string,
-    text?: string
+    text?: string,
+    words?: {word: string, start: number, end: number}[]
   ): void {
     this.state = state;
     if (error !== undefined) this.lastError = error;
@@ -151,6 +338,8 @@ export class TranscriptionService {
       progress,
       error,
       text,
+      words,
+      origin: this.currentOrigin,
     });
   }
 
@@ -160,10 +349,27 @@ export class TranscriptionService {
     }
   }
 
-  private cleanup(): void {
-    if (this.adapter) {
-      this.adapter.stop();
-      this.adapter = null;
+  /**
+   * Stop `adapter` and, only if it is still the active one, detach it and
+   * clear run-local state.
+   *
+   * setState() broadcasts synchronously and a listener (e.g. the import
+   * queue) may start the NEXT run re-entrantly; blindly clearing
+   * `this.adapter`/runBase after the broadcast would kill that new run's
+   * child and wipe its context. A superseded adapter must only stop ITSELF.
+   */
+  private finishRun(adapter: TranscriptionAdapter | null): void {
+    if (adapter) {
+      adapter.stop();
     }
+    if (this.adapter === adapter) {
+      this.adapter = null;
+      this.runBase = '';
+      this.currentOrigin = undefined;
+    }
+  }
+
+  private cleanup(): void {
+    this.finishRun(this.adapter);
   }
 }

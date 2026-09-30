@@ -21,9 +21,10 @@ const STRING_KEYS = [
   'dataDir',
   'sttCacheDir',
   'activeModel',
+  'watchFolderDir',
 ] as const;
 
-const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize'] as const;
+const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled'] as const;
 
 export function settingsFilePath(userDataDir: string): string {
   return path.join(userDataDir, SETTINGS_FILE_NAME);
@@ -37,13 +38,19 @@ export function defaultSettings(
   return {
     pythonPath: '',
     llmBaseUrl: DEFAULT_LLM_BASE_URL,
-    llmModel: '',
+    // Out-of-the-box auto-summarize against LM Studio: this model is loaded
+    // and served at 127.0.0.1:1234/v1 (a saved user value still wins —
+    // mergeSettings applies on top of these defaults).
+    llmModel: 'mistralai/ministral-3-3b',
     llmApiKey: '',
     dataDir: '',
     sttCacheDir: hfHome,
     summarizationEnabled: true,
     autoSummarize: true,
     activeModel: '',
+    dictationEnabled: true,
+    dictationPasteEnabled: true, // Stage 2: ON by default
+    watchFolderDir: '',
   };
 }
 

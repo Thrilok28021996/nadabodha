@@ -8,147 +8,358 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';">
 </head>
 <body>
-  <div class="app">
-    <header class="app-header">
-      <div>
-        <h1>Nadabodha</h1>
-        <p>Local speech-to-text for macOS</p>
-      </div>
-      <button id="settingsBtn" type="button" class="gear" title="Settings" aria-label="Settings" aria-expanded="false">&#9881;</button>
-    </header>
+  <div class="app" id="app">
 
-    <section class="controls">
-      <button id="recordBtn" type="button">Start Recording</button>
-      <button id="stopRecordBtn" type="button" disabled>Stop Recording</button>
-      <button id="importBtn" type="button">Import Audio</button>
-      <button id="cancelBtn" type="button" disabled>Cancel</button>
-    </section>
+    <!-- ================================================================== -->
+    <!-- SIDEBAR                                                              -->
+    <!-- ================================================================== -->
+    <aside class="sidebar" id="sidebar" aria-label="Navigation">
 
-    <section class="status">
-      <p id="statusText">Status: idle</p>
-      <progress id="progressBar" value="0" max="100" hidden></progress>
-      <p id="errorText" class="error" hidden></p>
-    </section>
-
-    <section class="tabs" role="tablist">
-      <button id="tabTranscript" type="button" class="tab active" role="tab" aria-selected="true">Transcript</button>
-      <button id="tabSummary" type="button" class="tab" role="tab" aria-selected="false">Summary</button>
-      <span class="tab-spacer"></span>
-      <button id="summarizeBtn" type="button" disabled>Summarize</button>
-      <button id="cancelSummaryBtn" type="button" class="danger" hidden>Cancel Summary</button>
-    </section>
-
-    <section class="transcript" id="transcriptPanel">
-      <label for="transcriptArea">Transcript</label>
-      <textarea id="transcriptArea" readonly rows="12" placeholder="Transcript will appear here…"></textarea>
-    </section>
-
-    <section class="transcript" id="summaryPanel" hidden>
-      <label for="summaryArea">Summary</label>
-      <p id="summaryStatus" class="hint"></p>
-      <p id="summaryError" class="error" hidden></p>
-      <textarea id="summaryArea" readonly rows="12" placeholder="Summary will appear here…"></textarea>
-    </section>
-
-    <section class="actions">
-      <button id="copyBtn" type="button" disabled>Copy</button>
-      <button id="saveBtn" type="button" disabled>Save as Text</button>
-    </section>
-
-    <section class="saved" id="savedPanel" hidden>
-      <h3>Saved files</h3>
-      <p id="savedTranscriptPath" class="saved-path" hidden></p>
-      <p id="savedSummaryPath" class="saved-path" hidden></p>
-      <p id="saveErrorText" class="error" hidden></p>
-    </section>
-
-    <section class="settings" id="settingsPanel" hidden>
-      <h2>Settings</h2>
-
-      <div class="setting-group" id="pythonGroup">
-        <h3>Python interpreter</h3>
-        <div class="row">
-          <input type="text" id="pythonPathInput" placeholder="/path/to/python3" spellcheck="false" aria-label="Python interpreter path">
-          <button id="pythonBrowseBtn" type="button">Browse…</button>
-          <button id="pythonValidateBtn" type="button" class="secondary">Validate</button>
-        </div>
-        <p id="pythonStatus" class="hint" data-state=""></p>
+      <!-- Brand -->
+      <div class="sidebar-brand">
+        <div class="brand-mark" aria-hidden="true">N</div>
+        <span class="brand-name">Nadabodha</span>
       </div>
 
-      <div class="setting-group" id="llmGroup">
-        <h3>Local LLM (OpenAI-compatible)</h3>
-        <div class="row">
-          <label for="llmBaseUrlInput">Base URL</label>
-          <input type="text" id="llmBaseUrlInput" spellcheck="false" placeholder="http://127.0.0.1:1234/v1">
+      <!-- ⌘K Search -->
+      <div class="search-row">
+        <div class="search-box" id="searchBox" role="search">
+          <span class="search-icon" aria-hidden="true">⌘K</span>
+          <input
+            type="text"
+            id="searchInput"
+            class="search-input"
+            placeholder="Search notes…"
+            aria-label="Search notes"
+            autocomplete="off"
+            spellcheck="false"
+          >
+          <button id="searchClearBtn" class="search-clear" hidden aria-label="Clear search">✕</button>
         </div>
-        <div class="row">
-          <label for="llmModelSelect">Model</label>
-          <select id="llmModelSelect" aria-label="LLM model">
-            <option value="">— none —</option>
-          </select>
-          <button id="llmRefreshBtn" type="button" class="secondary">Load models</button>
-        </div>
-        <div class="row">
-          <label for="llmApiKeyInput">API key</label>
-          <input type="password" id="llmApiKeyInput" autocomplete="off" placeholder="optional">
-          <button id="llmTestBtn" type="button" class="secondary">Test Connection</button>
-        </div>
-        <p id="llmStatus" class="hint"></p>
       </div>
 
-      <div class="setting-group" id="dataDirGroup">
-        <h3>Data directory</h3>
-        <div class="row">
-          <input type="text" id="dataDirInput" spellcheck="false" placeholder="Folder holding transcripts/, summaries/, scripts/">
-          <button id="dataDirBrowseBtn" type="button">Choose…</button>
+      <!-- Primary Actions -->
+      <div class="sidebar-actions">
+        <button id="recordBtn" class="action-btn action-record" type="button">
+          <span class="action-icon" aria-hidden="true">⏺</span> Record
+        </button>
+        <button id="importBtn" class="action-btn action-import" type="button">
+          <span class="action-icon" aria-hidden="true">⬆</span> Import
+        </button>
+      </div>
+
+      <!-- Dictation status strip -->
+      <div class="dictation-strip" id="dictationStrip">
+        <p id="dictationHint" class="dictation-hint">Hold ⌥ anywhere to dictate</p>
+        <p id="dictationBadge" class="dictation-badge" hidden>● Listening — release ⌥ to transcribe</p>
+        <p id="dictationNotice" class="dictation-notice" hidden></p>
+        <div id="dictationBanner" class="dictation-banner" hidden role="alert">
+          <p class="banner-text">Grant Accessibility to enable dictation</p>
+          <button id="dictationGrantBtn" type="button" class="chip-btn">Grant Access</button>
         </div>
-        <p id="dataDirStatus" class="hint"></p>
-        <p class="hint">Created on save: <code>transcripts/</code> (auto-saved .txt), <code>summaries/</code> (auto-saved .md), <code>scripts/summarize-prompt.md</code> (editable prompt).</p>
       </div>
 
-      <div class="setting-group" id="cacheDirGroup">
-        <h3>STT model cache directory</h3>
-        <div class="row">
-          <input type="text" id="cacheDirInput" spellcheck="false" placeholder="Where Hugging Face models are stored">
-          <button id="cacheDirBrowseBtn" type="button">Choose…</button>
+      <!-- Import Queue -->
+      <div id="importQueueSection" class="sidebar-section" hidden>
+        <div class="section-header">
+          <span class="section-title">Import Queue</span>
         </div>
-        <p id="cacheDirStatus" class="hint"></p>
+        <div id="importQueueList" class="folder-list"></div>
       </div>
 
-      <div class="setting-group" id="summarizationGroup">
-        <h3>Summarization</h3>
-        <label class="check"><input type="checkbox" id="summarizeEnabledChk"> Enable summarization</label>
-        <label class="check"><input type="checkbox" id="autoSummarizeChk"> Summarize automatically when a transcription completes</label>
-        <p id="promptPathStatus" class="hint"></p>
-      </div>
+      <!-- Dictation enabled toggle (settings checkbox remnant kept for element IDs) -->
+      <input type="checkbox" id="dictationEnabledChk" hidden>
+      <p id="dictationStatus" hidden></p>
 
-      <div class="setting-group" id="modelBrowserGroup">
-        <h3>Hugging Face speech-to-text models</h3>
-        <div class="row">
-          <input type="search" id="hfSearchInput" spellcheck="false" placeholder="Search ASR models (empty = top by downloads)" aria-label="Search models">
-          <button id="hfSearchBtn" type="button" class="secondary">Search</button>
+      <!-- Navigation -->
+      <nav class="sidebar-nav" aria-label="Notes navigation">
+        <button id="navHome" class="nav-btn active" type="button" data-view="home">
+          <span class="nav-icon" aria-hidden="true">⌂</span> Home
+        </button>
+        <button id="navAll" class="nav-btn" type="button" data-view="all">
+          <span class="nav-icon" aria-hidden="true">◉</span>
+          All notes <span id="allCount" class="nav-count">0</span>
+        </button>
+        <button id="navDictation" class="nav-btn" type="button" data-view="dictation">
+          <span class="nav-icon" aria-hidden="true">◎</span> Dictation log
+        </button>
+      </nav>
+
+      <!-- Folders section -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span class="section-title">Folders</span>
+          <button id="addFolderBtn" class="icon-btn" type="button" title="New folder" aria-label="New folder">+</button>
         </div>
-        <p id="hfStatus" class="hint"></p>
-        <div id="hfResults" class="model-list" role="list" aria-label="Search results"></div>
-        <div class="row">
-          <button id="hfDownloadBtn" type="button" disabled>Download selected</button>
-          <button id="hfUseBtn" type="button" class="secondary" disabled>Set active</button>
-          <button id="hfCancelDownloadBtn" type="button" class="danger" hidden>Cancel download</button>
+        <ul id="folderList" class="folder-list" aria-label="Folders" role="list"></ul>
+      </div>
+
+      <!-- Recent notes list -->
+      <div class="sidebar-section sidebar-notes">
+        <div class="section-header">
+          <span class="section-title" id="notesListLabel">Recent</span>
         </div>
-        <progress id="downloadProgress" value="0" max="100" hidden></progress>
-        <p id="downloadStatus" class="hint"></p>
-        <h4>Installed</h4>
-        <div id="hfInstalled" class="model-list" role="list" aria-label="Installed models"></div>
+        <ul id="noteList" class="note-list" aria-label="Notes" role="list"></ul>
+        <p id="noteListEmpty" class="empty-state" hidden>No notes yet.<br>Record, import, or dictate to create one.</p>
       </div>
 
-      <div class="row settings-actions">
-        <button id="settingsSaveBtn" type="button">Save settings</button>
-        <p id="settingsStatus" class="hint"></p>
+      <!-- Settings gear -->
+      <div class="sidebar-footer">
+        <button id="settingsBtn" type="button" class="footer-btn" aria-label="Settings" aria-expanded="false">
+          <span aria-hidden="true">⚙</span> Settings
+        </button>
       </div>
-    </section>
+    </aside>
 
-    <input type="file" id="fileInput" accept="audio/*" hidden>
-  </div>
+    <!-- ================================================================== -->
+    <!-- MAIN CONTENT                                                         -->
+    <!-- ================================================================== -->
+    <main class="main-content" id="mainContent" aria-label="Note detail">
+
+      <!-- Empty / home state -->
+      <div id="emptyState" class="empty-content">
+        <div class="empty-icon" aria-hidden="true">🎙</div>
+        <h2>Welcome to Nadabodha</h2>
+        <p>Your local, private speech-to-text workspace.</p>
+        <div class="empty-actions">
+          <button id="emptyRecordBtn" type="button" class="btn-primary">⏺ Start Recording</button>
+          <button id="emptyImportBtn" type="button" class="btn-secondary">⬆ Import Audio</button>
+        </div>
+        <p class="empty-hint">Or hold <kbd>⌥</kbd> anywhere to dictate</p>
+      </div>
+
+      <!-- Note detail (hidden until a note is selected) -->
+      <div id="noteDetail" class="note-detail" hidden>
+
+        <!-- Note header -->
+        <div class="note-header">
+          <div class="note-meta">
+            <input
+              id="noteTitle"
+              class="note-title-input"
+              type="text"
+              placeholder="Note title"
+              aria-label="Note title"
+              spellcheck="true"
+            >
+            <div class="note-meta-row">
+              <span id="noteDate" class="note-date"></span>
+              <span id="noteDuration" class="note-duration"></span>
+              <span id="noteSource" class="note-source-badge"></span>
+            </div>
+          </div>
+          <div class="note-header-actions">
+            <select id="noteFolderSelect" class="folder-select" aria-label="Note folder">
+              <option value="">Unfiled</option>
+            </select>
+            <button id="reTranscribeBtn" type="button" class="chip-btn" title="Re-transcribe using the current model" disabled>Re-transcribe</button>
+            <button id="deleteNoteBtn" type="button" class="chip-btn chip-danger" title="Delete note">Delete</button>
+          </div>
+        </div>
+
+        <!-- Recording pill (shown while capturing) -->
+        <div id="recordingPill" class="recording-pill" hidden role="status" aria-live="polite">
+          <span class="pill-dot" aria-hidden="true"></span>
+          <span class="pill-label" id="pillLabel">Recording</span>
+          <span class="pill-timer" id="pillTimer">00:00</span>
+          <button id="stopRecordBtn" type="button" class="pill-stop">Stop</button>
+          <button id="cancelBtn" type="button" class="pill-cancel">Cancel</button>
+        </div>
+
+        <!-- Status/progress bar -->
+        <div id="statusBar" class="status-bar" hidden>
+          <p id="statusText" class="status-text" aria-live="polite">Status: idle</p>
+          <progress id="progressBar" value="0" max="100" hidden></progress>
+          <p id="errorText" class="error-text" hidden aria-live="assertive"></p>
+        </div>
+
+        <!-- Tabs -->
+        <div class="tabs-row" role="tablist" aria-label="Note content">
+          <button id="tabTranscript" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="transcriptPanel">Transcript</button>
+          <button id="tabSummary" type="button" class="tab" role="tab" aria-selected="false" aria-controls="summaryPanel">Summary</button>
+          <span class="tab-spacer"></span>
+          <button id="summarizeBtn" type="button" class="chip-btn" disabled>Summarize</button>
+          <button id="cancelSummaryBtn" type="button" class="chip-btn chip-danger" hidden>Cancel Summary</button>
+        </div>
+
+        <!-- Transcript panel -->
+        <section id="transcriptPanel" class="panel-content" role="tabpanel" aria-labelledby="tabTranscript">
+          <div class="panel-actions">
+            <button id="copyBtn" type="button" class="chip-btn" disabled>Copy</button>
+            <button id="saveBtn" type="button" class="chip-btn" disabled>Save as TXT</button>
+            <button id="saveSrtBtn" type="button" class="chip-btn" disabled>Save as SRT</button>
+            <button id="saveVttBtn" type="button" class="chip-btn" disabled>Save as VTT</button>
+          </div>
+          <textarea
+            id="transcriptArea"
+            class="transcript-area"
+            readonly
+            placeholder="Transcript will appear here…"
+            aria-label="Transcript"
+          ></textarea>
+        </section>
+
+        <!-- Summary panel -->
+        <section id="summaryPanel" class="panel-content" role="tabpanel" aria-labelledby="tabSummary" hidden>
+          <div class="panel-actions">
+            <div class="view-toggle" role="group" aria-label="Summary view">
+              <button id="summaryRawBtn" type="button" class="chip-btn" aria-pressed="false">Raw</button>
+              <button id="summaryPreviewBtn" type="button" class="chip-btn active" aria-pressed="true">Preview</button>
+            </div>
+            <button id="copySummaryBtn" type="button" class="chip-btn" disabled>Copy Markdown</button>
+            <span id="summaryStaleHint" class="stale-hint" hidden>Summary may be out of date</span>
+          </div>
+          <p id="summaryStatus" class="summary-status" aria-live="polite"></p>
+          <p id="summaryError" class="error-text" hidden aria-live="assertive"></p>
+          <div id="summaryPreview" class="markdown-body" aria-live="polite"></div>
+          <textarea
+            id="summaryArea"
+            class="transcript-area"
+            readonly
+            placeholder="Summary will appear here…"
+            aria-label="Summary (raw Markdown)"
+            hidden
+          ></textarea>
+        </section>
+
+        <!-- Saved files info -->
+        <section id="savedPanel" class="saved-section" hidden>
+          <p id="savedTranscriptPath" class="saved-path" hidden></p>
+          <p id="savedSummaryPath" class="saved-path" hidden></p>
+          <p id="saveErrorText" class="error-text" hidden></p>
+        </section>
+      </div><!-- /.note-detail -->
+
+      <!-- ================================================================ -->
+      <!-- SETTINGS SLIDE-OVER                                               -->
+      <!-- ================================================================ -->
+      <aside id="settingsPanel" class="settings-panel" hidden aria-label="Settings">
+        <div class="settings-header">
+          <h2>Settings</h2>
+          <button id="settingsCloseBtn" type="button" class="icon-btn" aria-label="Close settings">✕</button>
+        </div>
+
+        <div class="settings-body">
+
+          <!-- Python interpreter -->
+          <div class="setting-group" id="pythonGroup">
+            <h3>Python interpreter</h3>
+            <div class="setting-row">
+              <input type="text" id="pythonPathInput" placeholder="/path/to/python3" spellcheck="false" aria-label="Python interpreter path">
+              <button id="pythonBrowseBtn" type="button" class="chip-btn">Browse…</button>
+              <button id="pythonValidateBtn" type="button" class="chip-btn">Validate</button>
+            </div>
+            <p id="pythonStatus" class="setting-status"></p>
+          </div>
+
+          <!-- Data directory -->
+          <div class="setting-group">
+            <h3>Data directory</h3>
+            <div class="setting-row">
+              <input type="text" id="dataDirInput" placeholder="Choose a folder…" spellcheck="false" aria-label="Data directory">
+              <button id="dataDirBrowseBtn" type="button" class="chip-btn">Browse…</button>
+            </div>
+            <p id="dataDirStatus" class="setting-status"></p>
+          </div>
+
+          <!-- Watch folder -->
+          <div class="setting-group">
+            <h3>Watch folder</h3>
+            <div class="setting-row">
+              <input type="text" id="watchFolderInput" placeholder="Choose a folder to watch…" spellcheck="false" aria-label="Watch folder">
+              <button id="watchFolderBrowseBtn" type="button" class="chip-btn">Browse…</button>
+            </div>
+          </div>
+
+          <!-- STT model cache -->
+          <div class="setting-group">
+            <h3>Model cache directory</h3>
+            <div class="setting-row">
+              <input type="text" id="cacheDirInput" placeholder="~/.cache/huggingface" spellcheck="false" aria-label="Model cache directory">
+              <button id="cacheDirBrowseBtn" type="button" class="chip-btn">Browse…</button>
+            </div>
+            <p id="cacheDirStatus" class="setting-status"></p>
+          </div>
+
+          <!-- Summarization -->
+          <div class="setting-group">
+            <h3>Summarization</h3>
+            <label class="toggle-label">
+              <input type="checkbox" id="summarizeEnabledChk"> Enable summarization
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="autoSummarizeChk"> Auto-summarize after transcription
+            </label>
+          </div>
+
+          <!-- Local LLM -->
+          <div class="setting-group">
+            <h3>Local LLM (for summaries)</h3>
+            <div class="setting-row">
+              <input type="text" id="llmBaseUrlInput" placeholder="http://127.0.0.1:1234/v1" spellcheck="false" aria-label="LLM base URL">
+            </div>
+            <div class="setting-row">
+              <select id="llmModelSelect" aria-label="LLM model"><option value="">— select model —</option></select>
+              <input type="text" id="llmApiKeyInput" placeholder="API key (optional)" spellcheck="false" aria-label="LLM API key">
+            </div>
+            <div class="setting-row">
+              <button id="llmRefreshBtn" type="button" class="chip-btn">Refresh models</button>
+              <button id="llmTestBtn" type="button" class="chip-btn">Test connection</button>
+            </div>
+            <p id="llmStatus" class="setting-status"></p>
+          </div>
+
+          <!-- Dictation toggle -->
+          <div class="setting-group">
+            <h3>Dictation</h3>
+            <label class="toggle-label">
+              <input type="checkbox" id="settingsDictationChk"> Enable hold-⌥ dictation
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="meetingModeChk"> Meeting Mode (record mic + system audio)
+            </label>
+            <label class="toggle-label">
+              <input type="checkbox" id="dictationPasteChk"> Paste at cursor (Cmd+V) on release
+            </label>
+            <p id="promptPathStatus" class="setting-status"></p>
+          </div>
+
+          <!-- HF model browser -->
+          <div class="setting-group">
+            <h3>STT model browser</h3>
+            <div class="setting-row">
+              <input type="text" id="hfSearchInput" placeholder="Search Hugging Face…" spellcheck="false" aria-label="Search Hugging Face models">
+              <button id="hfSearchBtn" type="button" class="chip-btn">Search</button>
+            </div>
+            <p id="hfStatus" class="setting-status"></p>
+            <div id="hfResults" class="hf-results"></div>
+            <div id="hfInstalled" class="hf-installed"></div>
+            <div class="setting-row hf-actions" id="hfActions" hidden>
+              <button id="hfDownloadBtn" type="button" class="chip-btn">Download</button>
+              <button id="hfUseBtn" type="button" class="chip-btn">Use</button>
+              <button id="hfCancelDownloadBtn" type="button" class="chip-btn chip-danger" hidden>Cancel download</button>
+            </div>
+            <progress id="downloadProgress" value="0" max="100" hidden></progress>
+            <p id="downloadStatus" class="setting-status"></p>
+          </div>
+
+          <div class="setting-group">
+            <button id="settingsSaveBtn" type="button" class="btn-primary">Save settings</button>
+            <p id="settingsStatus" class="setting-status"></p>
+          </div>
+
+        </div><!-- /.settings-body -->
+      </aside><!-- /#settingsPanel -->
+
+    </main><!-- /.main-content -->
+
+  </div><!-- /#app -->
+
+  <!-- Hidden file input for audio import -->
+  <input type="file" id="fileInput" accept="audio/*" multiple hidden>
+
+  <script src="marked.umd.js"></script>
+  <script src="purify.min.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

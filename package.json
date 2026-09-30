@@ -25,5 +25,9 @@
     "ts-jest": "^29.2.5",
     "typescript": "^5.7.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "marked": "^18.0.14",
+    "uiohook-napi": "1.5.5"
+  }
 }

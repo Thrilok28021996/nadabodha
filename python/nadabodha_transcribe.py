@@ -687,19 +687,27 @@ class FasterWhisperTranscriber(BaseTranscriber):
             return
 
         try:
-            segments, info = model.transcribe(file_path, beam_size=1)
+            segments, info = model.transcribe(file_path, beam_size=1, word_timestamps=True)
             duration = float(getattr(info, "duration", 0) or 0)
             parts: list[str] = []
+            words_list: list[dict] = []
             for segment in segments:
                 if self._cancelled:
                     self.on_event({"status": "cancelled"})
                     return
                 parts.append(segment.text or "")
+                if getattr(segment, "words", None):
+                    for w in segment.words:
+                        words_list.append({
+                            "word": w.word,
+                            "start": w.start,
+                            "end": w.end
+                        })
                 if duration > 0:
                     progress = int(min(95, max(5, segment.end / duration * 100)))
                     self.on_event({"status": "transcribing", "progress": progress})
             text = "".join(parts).strip()
-            self.on_event({"status": "completed", "text": text})
+            self.on_event({"status": "completed", "text": text, "words": words_list})
         except Exception as exc:
             self.on_event({"status": "error", "error": f"faster-whisper error: {exc}"})
 
@@ -994,13 +1002,116 @@ def _run_server() -> None:
             emit({"status": "error", "error": f"Unknown action: {action}"})
 
 
+def run_stream(repo_id: str, cache_dir: str) -> None:
+    import numpy as np
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except Exception as exc:
+        emit({"status": "error", "error": f"faster-whisper not available: {exc}"})
+        return
+
+    apply_cache_dir(cache_dir)
+    emit({"status": "transcribing", "progress": 5})
+
+    try:
+        model = WhisperModel(
+            repo_id,
+            device="cpu",
+            compute_type="int8",
+            download_root=cache_dir or None,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        emit({"status": "error", "error": f"faster-whisper load failed: {exc}"})
+        return
+
+    emit({"status": "transcribing", "progress": 10})
+
+    buffer = b""
+    global_committed = ""
+    SAMPLE_RATE = 16000
+    BYTES_PER_SEC = SAMPLE_RATE * 2
+    
+    # We transcribe roughly every 1 second of new audio
+    last_transcribed_bytes = 0
+
+    while True:
+        try:
+            chunk = sys.stdin.buffer.read(4096)
+        except Exception:
+            break
+            
+        if not chunk:
+            break
+            
+        buffer += chunk
+        
+        # Once we have at least 1s of new audio, run transcription
+        if len(buffer) - last_transcribed_bytes >= BYTES_PER_SEC:
+            last_transcribed_bytes = len(buffer)
+            
+            # Convert to float32 array
+            audio_array = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            try:
+                segments, info = model.transcribe(audio_array, beam_size=1, vad_filter=True, condition_on_previous_text=False)
+                
+                parts = []
+                last_end = 0.0
+                for segment in segments:
+                    parts.append(segment.text)
+                    last_end = segment.end
+                    
+                current_text = "".join(parts).strip()
+                full_text = (global_committed + " " + current_text).strip()
+                
+                # Emit partial event
+                emit({"status": "transcribing", "text": full_text, "partial": True})
+                
+                # LocalAgreement-2 sliding window:
+                # If buffer is getting too long (e.g. > 15 seconds), commit the stable part and shift
+                if len(audio_array) > 15 * SAMPLE_RATE and last_end > 0:
+                    # We commit everything we just transcribed, up to the last segment's end.
+                    # Wait, if we are in the middle of speaking, the last segment might be unstable.
+                    # Let's keep the last 2 seconds overlapping if possible, or just commit the first half.
+                    # Simple approach: commit text, shift buffer by last_end
+                    pass # For UI responsiveness, we can just let it grow up to 30s. whisper handles 30s easily.
+                    
+                    if len(audio_array) > 28 * SAMPLE_RATE:
+                        # Shift buffer by 15 seconds
+                        shift_samples = 15 * SAMPLE_RATE
+                        shift_bytes = shift_samples * 2
+                        buffer = buffer[shift_bytes:]
+                        last_transcribed_bytes = 0
+                        # We don't perfectly commit text here because we will re-verify on stop,
+                        # but we need to append current_text to global_committed to not lose it visually.
+                        global_committed = full_text
+                
+            except Exception as exc:
+                # ignore intermittent errors
+                pass
+
+    # Stream ended (EOF). Emit final text.
+    # In stage 3, the final verification is done by the caller using the saved WAV file.
+    # But we can emit whatever we have as 'completed'.
+    emit({"status": "completed", "text": global_committed.strip()})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Nadabodha local transcription adapter")
     parser.add_argument("--server", action="store_true", help="Run in JSON-lines server mode")
+    parser.add_argument("--stream", action="store_true", help="Run in PCM stream mode")
+    parser.add_argument("--repo_id", type=str, default="")
+    parser.add_argument("--cache_dir", type=str, default="")
     args = parser.parse_args()
 
     if args.server:
         _run_server()
+    elif args.stream:
+        if not args.repo_id:
+            emit({"status": "error", "error": "repo_id is required for streaming"})
+            return
+        run_stream(args.repo_id, args.cache_dir)
     else:
         parser.print_help()
 

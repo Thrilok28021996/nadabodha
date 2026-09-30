@@ -18,12 +18,23 @@ export const DEFAULT_PROMPT_TEMPLATE = `# Summarization prompt
 You are a careful assistant summarizing a speech-to-text transcript.
 Write in the same language as the transcript.
 
-Produce:
-1. A one-paragraph overview.
-2. "Key points" as a short bullet list.
-3. "Action items" as a bullet list with owners if mentioned (or "-" when unknown).
+Answer with valid Markdown only, using exactly these sections:
 
-Do not invent facts. If the transcript is empty or meaningless, say so.
+## Overview
+One paragraph summarizing what was said.
+
+## Key points
+- A short bullet list of the most important points.
+
+## Action items
+- A bullet list of things to do. Give each item an owner when one was
+  mentioned in the transcript, otherwise write "-".
+
+Rules:
+- Do not invent facts: only use what the transcript actually says.
+- Keep headings, lists and paragraphs as valid Markdown (## headings,
+  "- " bullets).
+- If the transcript is empty or meaningless, say so in the Overview.
 
 Transcript:
 {{transcript}}

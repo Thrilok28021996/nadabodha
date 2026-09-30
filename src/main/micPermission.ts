@@ -26,9 +26,9 @@ export interface MicrophonePermissionResult {
  * `askForMediaAccess` is macOS-only.
  */
 interface MediaAccessSystemPreferences {
-  getCurrentApplicationMediaAccessState?: (mediaType: 'microphone' | 'camera') => string;
+  getCurrentApplicationMediaAccessState?: (mediaType: 'microphone' | 'camera' | 'screen') => string;
   getMediaAccessStatus?: (mediaType: 'microphone' | 'camera' | 'screen') => string;
-  askForMediaAccess?: (mediaType: 'microphone' | 'camera') => Promise<boolean>;
+  askForMediaAccess?: (mediaType: 'microphone' | 'camera' | 'screen') => Promise<boolean>;
 }
 
 /** Current app-level microphone state, or undefined when no API exists. */
@@ -117,4 +117,29 @@ export function friendlyRecordingFailure(message: string, stderr: string): strin
     return message;
   }
   return `${MICROPHONE_DENIED_MESSAGE} ${message}`;
+}
+
+export const SCREEN_DENIED_MESSAGE =
+  'Screen & System Audio Recording access denied. Allow it in System Settings > Privacy & Security > Screen Recording, then try again.';
+
+export async function ensureScreenPermission(): Promise<{ granted: boolean }> {
+  const sp = systemPreferences as MediaAccessSystemPreferences | undefined;
+  if (!sp) {
+    return { granted: true };
+  }
+  try {
+    const state = typeof sp.getMediaAccessStatus === 'function' ? sp.getMediaAccessStatus('screen') : undefined;
+    if (state === 'granted') {
+      return { granted: true };
+    }
+    if (state === 'denied' || state === 'restricted') {
+      return { granted: false };
+    }
+    if (typeof sp.askForMediaAccess === 'function') {
+      return { granted: (await sp.askForMediaAccess('screen')) === true };
+    }
+    return { granted: true };
+  } catch {
+    return { granted: false };
+  }
 }
