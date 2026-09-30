@@ -2559,18 +2559,28 @@ async function main() {
     const offOn = await dictationStatus();
     check(offOn.enabled && offOn.running, 'dictationEnabled is ON before the toggle-off check');
     await ev('document.getElementById("settingsBtn").click()');
-    await sleep(500); // openSettings/loadSettings refresh the form
+    // openSettings kicks off an async form load (getSettings +
+    // getDictationStatus + LLM models) which rewrites the toggle when it
+    // lands — run5 proved 500ms was not enough (the load arrived AFTER the
+    // set-false and the save then persisted ON). Wait for the form to settle
+    // on the current ON state first.
+    await waitFor(
+      async () => (await ev('document.getElementById("settingsDictationChk").checked')) === true,
+      { timeout: 15000, label: 'settings form loaded (toggle reflects ON)' }
+    ).catch(() => undefined);
     // The section re-enabled dictation via updateSettings at its start, so
     // drive the toggle explicitly to OFF here — the contract under test is
-    // "saving OFF stops the hook", not a stale parked-form state (D8
-    // disposition: the old parked-state assertion contradicted the re-enable
-    // two steps above it).
+    // "saving OFF stops the hook" (D8 disposition: the old parked-state
+    // assertion contradicted the re-enable two steps above it).
     await ev('document.getElementById("settingsDictationChk").checked = false');
     await ev('document.getElementById("settingsSaveBtn").click()');
-    check(
-      (await getSettings()).dictationEnabled === false,
-      'saving the settings toggle OFF persists dictationEnabled=false'
+    const offPersisted = Boolean(
+      await waitFor(async () => (await getSettings()).dictationEnabled === false, {
+        timeout: 10000,
+        label: 'dictationEnabled persisted OFF',
+      }).catch(() => false)
     );
+    check(offPersisted, 'saving the settings toggle OFF persists dictationEnabled=false');
     await waitFor(async () => (await dictationStatus()).running === false, {
       timeout: 15000,
       label: 'hook stopped after saving dictationEnabled=OFF',
