@@ -1283,6 +1283,17 @@ async function main() {
       `active model = ${HF_REPO}` +
         `${activeSaved ? '' : ` [${selectNote} activeModel="${(await getSettings()).activeModel}"]`}`
     );
+    // D8 disposition (drift): hfUseBtn sets local state but does not re-render
+    // the lists — the "✓ Active" badge only appears after the next list load
+    // (loadHfModels refreshes both lists and re-reads activeModel). Re-run the
+    // search to refresh, then assert the badge.
+    if (activeSaved) {
+      await ev('document.getElementById("hfSearchBtn").click()');
+      await waitFor(
+        async () => (await ev('document.getElementById("hfResults").children.length')) > 0,
+        { timeout: 20000, label: 'list refreshed after Use' }
+      ).catch(() => undefined);
+    }
     const activeBadge = await waitFor(
       async () =>
         await ev(
@@ -1469,7 +1480,9 @@ async function main() {
     // Measure the default view: transcript tab active, settings folded away.
     await ev('document.getElementById("tabTranscript").click()');
     if (!(await ev('document.getElementById("settingsPanel").hidden'))) {
-      await ev('document.getElementById("settingsBtn").click()');
+      // D8 disposition (drift): settingsBtn only OPENS the section
+      // (openSettings); the fold control is settingsCloseBtn (closeSettings).
+      await ev('document.getElementById("settingsCloseBtn").click()');
       // closeSettings may await async work — wait for the fold instead of
       // sampling one round-trip after the click.
       await waitFor(async () => await ev('document.getElementById("settingsPanel").hidden'), {
@@ -1641,7 +1654,16 @@ async function main() {
         `(() => { const li = document.querySelector('#noteList li.active'); return li ? li.dataset.id : null; })()`
       );
     const seedNoteSummary = async (summary) => {
-      const id = await activeNoteId();
+      // Ensure a note is open first — the fixture phases may run with no
+      // active note (floor only opens one on its own render path).
+      let id = await activeNoteId();
+      if (!id) {
+        await ev(
+          `(() => { const li = document.querySelector('#noteList li'); if (li) li.click(); return Boolean(li); })()`
+        );
+        await sleep(700);
+        id = await activeNoteId();
+      }
       if (!id) return false;
       const res = await ev(
         `window.electronAPI.updateNote({ id: ${JSON.stringify(id)}, summary: ${JSON.stringify(
@@ -1741,7 +1763,11 @@ async function main() {
         summaryClipboard === llmSourceBeforeFixture,
         `summary Copy puts the RAW markdown on the clipboard (${summaryClipboard.length}/${llmSourceBeforeFixture.length} chars)`
       );
-      const savedSummaryPathText = (await textOf('savedSummaryPath')).trim().replace(/^Summary:\s*/, '');
+      // The shell writes either "Summary: …" or "Summary saved: …" — strip
+      // either prefix so the fs check sees a bare absolute path.
+      const savedSummaryPathText = (await textOf('savedSummaryPath'))
+        .trim()
+        .replace(/^(?:Summary saved|Summary):\s*/, '');
       check(
         savedSummaryPathText.startsWith('/') && savedSummaryPathText.endsWith('.md'),
         `saved summary path surfaced: "${savedSummaryPathText}"`
@@ -2204,6 +2230,21 @@ async function main() {
     )
       .then(() => true)
       .catch(() => false);
+    if (!queueDrained) {
+      // Diagnose a stuck queue: pipeline state + row states say whether the
+      // queue is waiting on a transcription that never finishes.
+      const drainDiag = {
+        pipeline: await reqStatus(),
+        status: await textOf('statusText'),
+        rows: await ev(
+          `Array.from(document.querySelectorAll('#importQueueList .queue-row, #importQueueList li, #importQueueSection .queue-item')).map(r => r.textContent.slice(0, 80))`
+        ),
+        err: await ev(
+          `(() => { const e = document.getElementById('errorText'); return e.hidden ? '' : e.textContent.slice(0, 200); })()`
+        ),
+      };
+      note(`queue-not-drained diagnostics: ${JSON.stringify(drainDiag)}`);
+    }
     check(queueDrained, 'import queue drains to empty (both files processed)');
     const listAfterBatch = await openNoteCount();
     check(
@@ -2501,15 +2542,22 @@ async function main() {
     const offOn = await dictationStatus();
     check(offOn.enabled && offOn.running, 'dictationEnabled is ON before the toggle-off check');
     await ev('document.getElementById("settingsBtn").click()');
-    check(
-      !(await ev('document.getElementById("settingsDictationChk").checked')),
-      'settings toggle reflects the parked (off) state'
-    );
+    await sleep(500); // openSettings/loadSettings refresh the form
+    // The section re-enabled dictation via updateSettings at its start, so
+    // drive the toggle explicitly to OFF here — the contract under test is
+    // "saving OFF stops the hook", not a stale parked-form state (D8
+    // disposition: the old parked-state assertion contradicted the re-enable
+    // two steps above it).
+    await ev('document.getElementById("settingsDictationChk").checked = false');
     await ev('document.getElementById("settingsSaveBtn").click()');
+    check(
+      (await getSettings()).dictationEnabled === false,
+      'saving the settings toggle OFF persists dictationEnabled=false'
+    );
     await waitFor(async () => (await dictationStatus()).running === false, {
       timeout: 15000,
       label: 'hook stopped after saving dictationEnabled=OFF',
-    });
+    }).catch(() => undefined);
     const offStatus = await dictationStatus();
     check(offStatus.enabled === false && offStatus.running === false, 'dictationEnabled=OFF stops the hook');
     // The plan's hint contract lives on the sidebar hint: OFF hides it.
