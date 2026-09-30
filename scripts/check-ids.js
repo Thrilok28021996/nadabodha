@@ -3,6 +3,12 @@
  * ID contract check: every element id referenced by src/renderer/renderer.ts
  * or scripts/cdp-smoke.mjs must still exist in src/renderer/index.html after
  * the two-column restructure (approved plan, workstream 1 hard constraint).
+ *
+ * CSS-only ID exemptions (D7.6): `sidebar` and `searchBox` are referenced by
+ * the CSS (and by the smoke harness's layout probe) but NOT by renderer.ts —
+ * they are still declared in index.html, so they pass the declared-vs-used
+ * contract either way. No other exemption list exists: anything referenced
+ * above must be declared in the HTML.
  */
 const fs = require('fs');
 const path = require('path');

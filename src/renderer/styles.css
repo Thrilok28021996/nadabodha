@@ -7,6 +7,10 @@
 
 /* ----- Custom properties ------------------------------------------------- */
 :root {
+  /* Single dark theme (v3 plan): declare it so UA widgets/scrollbars match
+     the canvas instead of defaulting to light (computed color-scheme was
+     'normal' — real gap vs the plan's dark theme, D8 disposition). */
+  color-scheme: dark;
   /* Colors */
   --bg:         #0f1117;   /* app background */
   --bg-sidebar: #161820;   /* sidebar */

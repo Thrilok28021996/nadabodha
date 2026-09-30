@@ -79,6 +79,16 @@ const MARKDOWN_FIXTURE = [
 ].join('\n');
 const DEFAULT_WINDOW = { width: 1180, height: 760 };
 const MIN_WINDOW = { width: 960, height: 640 };
+/**
+ * D7.4 global watchdog: the whole run must finish (or fail) inside this
+ * budget; on expiry the harness dumps the report + captured app output and
+ * exits non-zero instead of hanging.
+ */
+const GLOBAL_TIMEOUT_MS = 60 * 60 * 1000;
+/** D7.4: how often the renderer CDP target is re-checked for loss (D10). */
+const TARGET_LOSS_POLL_MS = 8000;
+/** D10: renderer-process-loss diagnostics state. */
+let rendererTargetLoss = null;
 
 // HF endpoints sit behind rotating pools (CloudFront + AWS Global Accelerator for
 // huggingface.co, regional EC2 for the XET cas-server). Snapshot every resolution
@@ -150,6 +160,9 @@ function tlsServesHuggingFace(ip) {
 const failures = [];
 const notes = [];
 let passCount = 0;
+let skipCount = 0;
+/** True once LM Studio answered the warm-up (summary steps are labeled). */
+let llmWarm = false;
 
 function pass(msg) {
   passCount += 1;
@@ -158,6 +171,11 @@ function pass(msg) {
 function fail(msg) {
   failures.push(msg);
   console.error(`  FAIL  ${msg}`);
+}
+/** Not automatable in this harness — reported, never counted as PASS. */
+function skip(msg) {
+  skipCount += 1;
+  console.log(`  SKIP  ${msg}`);
 }
 function check(cond, msg) {
   if (cond) pass(msg);
@@ -424,12 +442,17 @@ const LAYOUT_PROBE = `(() => {
     return Math.round(ratio(fg, backdrop(el)) * 100) / 100;
   };
   const rect = (el) => { const r = el.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; };
-  const left = document.querySelector('.col-left');
-  const right = document.querySelector('.col-right');
+  // Steno shell panes (v3 plan): left sidebar + main note detail. The old
+  // two-column (.col-left/.col-right) probe was drift from the retired shell.
+  const sidebar = document.getElementById('sidebar');
+  const main = document.getElementById('mainContent');
   const visible = {};
   for (const id of ['recordBtn', 'stopRecordBtn', 'importBtn', 'cancelBtn', 'statusText', 'dictationHint', 'tabTranscript', 'tabSummary', 'transcriptArea', 'copyBtn', 'saveBtn']) {
     const el = document.getElementById(id);
-    if (!el) { visible[id] = null; continue; }
+    if (!el) { visible[id] = 'missing'; continue; }
+    // Hidden-at-rest elements (status bar, recording pill, parked hint) are
+    // not "clipped" — only elements actually rendered right now count.
+    if (el.getClientRects().length === 0) { visible[id] = 'not-rendered'; continue; }
     const r = el.getBoundingClientRect();
     visible[id] = r.width > 0 && r.height > 0 && r.top >= -0.5 && r.left >= -0.5 && r.bottom <= innerHeight + 0.5 && r.right <= innerWidth + 0.5;
   }
@@ -437,7 +460,7 @@ const LAYOUT_PROBE = `(() => {
     outer: { w: outerWidth, h: outerHeight },
     inner: { w: innerWidth, h: innerHeight },
     doc: { sw: document.documentElement.scrollWidth, sh: document.documentElement.scrollHeight },
-    columns: left && right ? { left: rect(left), right: rect(right) } : null,
+    panes: sidebar && main ? { sidebar: rect(sidebar), main: rect(main) } : null,
     visible,
     contrast: {
       body: contrastOf('statusText'),
@@ -454,17 +477,6 @@ const LAYOUT_PROBE = `(() => {
     colorScheme: getComputedStyle(document.documentElement).colorScheme,
   };
 })()`;
-
-/** True when the layout probe shows no overflow and no column overlap. */
-function layoutHealthy(probe) {
-  if (!probe || !probe.columns) return false;
-  const { left, right } = probe.columns;
-  if (left.x + left.w > right.x + 1) return false; // columns overlap / wrap
-  if (left.y > right.y + right.h + 1) return false; // stacked, not side by side
-  if (probe.doc.sw > probe.inner.w + 1) return false; // horizontal overflow
-  if (probe.doc.sh > probe.inner.h + 1) return false; // vertical overflow
-  return Object.entries(probe.visible).every(([, ok]) => ok === true);
-}
 
 /**
  * Launches a second app instance whose accessibility guard is forced to fail
@@ -524,8 +536,15 @@ async function runAccessibilityGuardProbe() {
       `(() => { const b = document.getElementById('dictationBanner');` +
         ` return { exists: !!b, hidden: b ? b.hidden : null, text: b ? b.textContent.replace(/\\s+/g, ' ').trim() : '' }; })()`
     );
+    // D8 disposition: the harness used to demand the v2 plan's verbatim line
+    // ("Enable dictation: grant Accessibility to Nadabodha"). The v3 plan
+    // does not fix banner copy — drift. Assert the real contract: banner is
+    // visible, names Accessibility, and offers a grant action.
     check(banner.exists && banner.hidden === false, 'accessibility banner is visible');
-    check(banner.text.includes(ACCESSIBILITY_BANNER), `banner copy: "${banner.text}"`);
+    check(
+      banner.text.toLowerCase().includes('accessibility'),
+      `banner copy names Accessibility: "${banner.text}"`
+    );
 
     const button = await ev(
       `(() => { const b = document.getElementById('dictationGrantBtn');` +
@@ -666,8 +685,19 @@ async function main() {
   });
   const rootPid = child.pid;
   const mainLog = [];
-  child.stdout.on('data', (buf) => mainLog.push(buf.toString()));
-  child.stderr.on('data', (buf) => mainLog.push(buf.toString()));
+  // D7.4: capture Electron stdout/stderr for the report (and abort dumps).
+  let appStdout = '';
+  let appStderr = '';
+  child.stdout.on('data', (buf) => {
+    const text = buf.toString();
+    appStdout += text;
+    mainLog.push(text);
+  });
+  child.stderr.on('data', (buf) => {
+    const text = buf.toString();
+    appStderr += text;
+    mainLog.push(text);
+  });
   child.on('exit', (code, signal) => mainLog.push(`\n[electron exited code=${code} signal=${signal}]\n`));
 
   let appAlive = true;
@@ -764,6 +794,83 @@ async function main() {
   const textOf = (id) => ev(`document.getElementById(${JSON.stringify(id)}).textContent || ''`);
   const stateOf = (id) => ev(`document.getElementById(${JSON.stringify(id)}).getAttribute('data-state') || ''`);
   const getSettings = () => ev('window.electronAPI.getSettings()');
+  /** Ground-truth pipeline status over IPC (transcriptionService state). */
+  const reqStatus = async () => (await ev('window.electronAPI.requestStatus()')).status;
+  /**
+   * #statusText shows presentation copy ('Recording…', 'Done: …'), never the
+   * raw event name — match case-insensitively on the semantic keyword.
+   */
+  const statusShows = async (needle) =>
+    (await ev('document.getElementById("statusText").textContent || ""')).toLowerCase().includes(needle);
+  /** True once THIS run has reached a terminal state (stale text cannot pass). */
+  const pipelineDone = async () =>
+    (await reqStatus()) === 'completed' || (await statusShows('done'));
+
+  // --- D7.4: global watchdog + renderer-target-loss monitor ---------------
+  const dumpAppOutput = (label = 'app output') => {
+    console.error(`--- ${label}: stdout tail ---`);
+    console.error(appStdout.split('\n').slice(-40).join('\n'));
+    console.error(`--- ${label}: stderr tail ---`);
+    console.error(appStderr.split('\n').slice(-40).join('\n'));
+  };
+  // On any abort: report what we know, restore settings, kill the app tree,
+  // exit non-zero. Never hang (the base run hung ~10 min after the renderer
+  // target vanished mid-dictation-take — D10).
+  const abortRun = async (reason) => {
+    clearInterval(targetMonitor);
+    clearTimeout(watchdog);
+    fail(reason);
+    console.error(`\nSMOKE_ABORT: ${reason}`);
+    console.error(`partial counts: passed=${passCount} failed=${failures.length} skipped=${skipCount}`);
+    dumpAppOutput(reason);
+    try {
+      if (cdpHolder.client) cdpHolder.client.close();
+    } catch { /* already closed */ }
+    killTree(rootPid);
+    await sleep(800);
+    for (const pid of appPids()) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ }
+    }
+    const restoredAbort = restoreSettings();
+    note(`settings.json restored on abort: ${restoredAbort}`);
+    console.log('\n================ SMOKE REPORT (aborted) ================');
+    console.log(`passed : ${passCount}`);
+    console.log(`failed : ${failures.length}`);
+    console.log(`skipped: ${skipCount}`);
+    for (const msg of failures) console.log(`  FAIL: ${msg}`);
+    for (const msg of notes) console.log(`  note: ${msg}`);
+    console.log('========================================================');
+    console.log('SMOKE_EXIT 1');
+    process.exit(1);
+  };
+  const watchdog = setTimeout(() => {
+    void abortRun(`global watchdog fired: run exceeded ${GLOBAL_TIMEOUT_MS / 60000} min`);
+  }, GLOBAL_TIMEOUT_MS);
+  let sawPageTarget = false;
+  const targetMonitor = setInterval(() => {
+    if (!appAlive) return;
+    void (async () => {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/json/list`);
+        const list = await res.json();
+        if (!Array.isArray(list)) return;
+        const hasPage = list.some((t) => t.type === 'page');
+        if (hasPage) { sawPageTarget = true; return; }
+        if (!sawPageTarget) return; // still booting; the ready-wait owns this
+        // D10: renderer page target gone while Electron main is alive.
+        // Confirm once after 2s so a transient reconnect never aborts a good run.
+        await sleep(2000);
+        const retry = await fetch(`http://127.0.0.1:${port}/json/list`).catch(() => null);
+        const retryList = retry ? await retry.json().catch(() => null) : null;
+        const stillGone = !Array.isArray(retryList) || !retryList.some((t) => t.type === 'page');
+        if (stillGone && appAlive) {
+          await abortRun(
+            'renderer target lost while Electron main is alive (D10) — /json/list has no page target'
+          );
+        }
+      } catch { /* the monitor never throws into the run */ }
+    })();
+  }, 10000);
 
   try {
     // --- boot --------------------------------------------------------------
@@ -775,14 +882,65 @@ async function main() {
     );
     pass('renderer ready with electronAPI exposed');
 
+    // --- D7.2 fail-fast prereqs -------------------------------------------
+    // These must abort the run HERE, naming the missing script tag, instead
+    // of surfacing as a dozen rendering FAILs ten minutes later.
+    step('Fail-fast prereqs (vendored libs + renderer init)');
+    // electronAPI exists from the preload — it does not prove renderer.js ran.
+    // Wait (bounded) for init() to reach its end; then the lib probes below
+    // are meaningful and a dead renderer aborts in seconds, not minutes.
+    const bootReady = await waitFor(
+      async () => (await ev('window.__nadabodhaReady === true')) === true,
+      { timeout: 25000, label: 'renderer init() completes (__nadabodhaReady)' }
+    )
+      .then(() => true)
+      .catch(() => false);
+    const boot = await ev(
+      '({ ready: window.__nadabodhaReady === true,' +
+        ' marked: typeof (window.marked && window.marked.parse),' +
+        ' purify: typeof (window.DOMPurify && window.DOMPurify.sanitize),' +
+        ' addHook: typeof (window.DOMPurify && window.DOMPurify.addHook) })'
+    );
+    if (!check(bootReady && boot.ready, 'renderer.js evaluated fully (window.__nadabodhaReady set after init())')) {
+      throw new Error(
+        'prereq failed: renderer.js aborted before init() completed — a top-level ' +
+          'exception (e.g. CommonJS prologue in a classic <script>) or a hung await left ' +
+          'window.__nadabodhaReady undefined'
+      );
+    }
+    const missingLibs = [];
+    if (boot.marked !== 'function') missingLibs.push('<script src="marked.umd.js"></script>');
+    if (boot.purify !== 'function') missingLibs.push('<script src="purify.min.js"></script>');
+    if (boot.addHook !== 'function') missingLibs.push('<script src="purify.min.js"></script> (addHook)');
+    if (missingLibs.length > 0) {
+      fail(`missing vendored library support: ${missingLibs.join(', ')}`);
+      throw new Error(
+        `prereq failed: window.marked/window.DOMPurify not loaded — index.html is missing ${[
+          ...new Set(missingLibs),
+        ].join(', ')} before <script src="renderer.js"></script>`
+      );
+    }
+    check(boot.marked === 'function', 'prereq: window.marked.parse is a function');
+    check(boot.purify === 'function', 'prereq: window.DOMPurify.sanitize is a function');
+    check(boot.addHook === 'function', 'prereq: window.DOMPurify.addHook is a function');
+
     // --- open settings -----------------------------------------------------
     // The pre-existing floor from earlier cycles is wrapped so that one failing
     // floor step still lets the layout / markdown / dictation sections below
     // run. Failures are still recorded and the process still exits non-zero.
     try {
-    step('Open Settings panel');
+    step('Open Settings section');
     await ev('document.getElementById("settingsBtn").click()');
-    check(!(await ev('document.getElementById("settingsPanel").hidden')), 'settings panel opens from the gear button');
+    const settingsSection = await ev(
+      `(() => { const p = document.getElementById('settingsPanel');` +
+        ` return { hidden: p.hidden, tag: p.tagName, role: p.getAttribute('role') }; })()`
+    );
+    check(!settingsSection.hidden, 'settings section opens from the settings button');
+    // v3 plan: settings is a section of the shell, never a modal dialog.
+    check(
+      settingsSection.tag === 'ASIDE' && settingsSection.role !== 'dialog',
+      `settings renders as an <aside> section, not a dialog (tag=${settingsSection.tag}, role=${settingsSection.role})`
+    );
 
     // Wait until the stored settings reached the form (loadSettings is async).
     await waitFor(
@@ -796,12 +954,13 @@ async function main() {
     );
     pass('settings form hydrated from settings.json');
 
-    // Dictation defaults to ON in settingsStore. Park it through the real
-    // toggle (uncheck the persisted checkbox) so the later settings saves in
-    // this e2e keep it parked, then stop the hook over IPC.
+    // Dictation defaults to ON in settingsStore. Park it through the REAL
+    // settings toggle (#settingsDictationChk — #dictationEnabledChk is a
+    // hidden ID remnant that save() never reads) so the later settings saves
+    // in this e2e keep it parked, then stop the hook over IPC.
     const bootSettings = await getSettings();
     check(bootSettings.dictationEnabled === true, 'dictationEnabled defaults to ON');
-    await ev('document.getElementById("dictationEnabledChk").checked = false');
+    await ev('document.getElementById("settingsDictationChk").checked = false');
     await ev('window.electronAPI.updateSettings({ dictationEnabled: false })');
     await waitFor(
       async () => (await ev('window.electronAPI.getDictationStatus()')).running === false,
@@ -862,10 +1021,11 @@ async function main() {
       });
       await warmRes.text();
       warmNote = `http ${warmRes.status} in ${((Date.now() - warmStartedAt) / 1000).toFixed(1)}s`;
+      llmWarm = warmRes.ok;
     } catch (err) {
       warmNote = `failed after ${((Date.now() - warmStartedAt) / 1000).toFixed(1)}s: ${err.message}`;
     }
-    note(`LLM warm-up: ${warmNote}`);
+    note(`LLM warm-up [${llmWarm ? 'warm' : 'cold'}]: ${warmNote}`);
 
     // --- bogus python ------------------------------------------------------
     step('Bogus Python interpreter is rejected');
@@ -1093,9 +1253,8 @@ async function main() {
     await ev(`window.electronAPI.importAudio(${JSON.stringify(SPEECH_WAV)})`);
     await waitFor(
       async () => {
-        const status = await textOf('statusText');
         const text = await ev('document.getElementById("transcriptArea").value');
-        return status.includes('completed') && text.length > 0;
+        return (await pipelineDone()) && text.length > 0;
       },
       { timeout: 240000, interval: 500, label: 'transcription completed' }
     );
@@ -1154,10 +1313,14 @@ async function main() {
     const summaryErrorText = (await textOf('summaryError')).trim();
     check(
       autoSummaryState === 'ok' && summary.length > 0,
-      `auto summary produced (${summary.length} chars): "${summary.slice(0, 100)}"` +
+      `auto summary produced (${summary.length} chars) [LLM ${llmWarm ? 'warm' : 'cold'}]: "${summary.slice(0, 100)}"` +
         `${autoSummaryState === 'ok' ? '' : ` [state=${autoSummaryState} status="${summaryStatusText}" error="${summaryErrorText}"]`}`
     );
-    check(summaryStatusText.includes('Summary ready'), `summary status: "${summaryStatusText}"`);
+    // D8 disposition: nothing in the app ever sets a "Summary ready" hint —
+    // the renderer clears #summaryStatus on success. The old assertion was
+    // drift; the observable contract is: status cleared, no error, summary
+    // content present (asserted above), saved path present (below).
+    check(summaryStatusText === '', `summary status cleared on success: "${summaryStatusText}"`);
     check((await textOf('summaryError')).trim() === '', 'no summary error shown');
 
     const summaryPathShown = (await textOf('savedSummaryPath')).trim();
@@ -1205,8 +1368,58 @@ async function main() {
       note('continuing with the layout / markdown / dictation sections');
     }
 
-    // --- two-column dark layout -------------------------------------------
-    step('Two-column dark layout (workstream 1)');
+    // --- Steno shell structure + plan-fixed layout values ------------------
+    step('Steno shell structure (v3 plan)');
+    const shell = await ev(
+      `(() => { const q = (id) => document.getElementById(id);
+         const exists = (id) => Boolean(q(id));
+         const nav = ['navHome', 'navAll'].every(exists);
+         const detail = q('noteDetail');
+         const pill = q('recordingPill');
+         return {
+           sidebar: exists('sidebar'),
+           nav,
+           search: exists('searchInput'),
+           noteList: exists('noteList'),
+           noteListItems: q('noteList') ? q('noteList').children.length : 0,
+           detailOpen: detail ? !detail.hidden : false,
+           title: exists('noteTitle'),
+           folderSelect: exists('noteFolderSelect'),
+           tabs: exists('tabTranscript') && exists('tabSummary'),
+           staleHint: exists('summaryStaleHint'),
+           reTranscribe: exists('reTranscribeBtn'),
+           pillExists: Boolean(pill),
+           pillHiddenWhenIdle: pill ? pill.hidden === true : false,
+         }; })()`
+    );
+    check(shell.sidebar, '#sidebar present');
+    check(shell.nav, 'nav present (#navHome + #navAll)');
+    check(shell.search, '#searchInput present');
+    check(shell.noteList, '#noteList present');
+    check(
+      shell.noteListItems >= 1,
+      `note list has items after the floor import (${shell.noteListItems} item(s))`
+    );
+    check(
+      shell.detailOpen,
+      'note detail opens after the floor import (title/folder/tabs reachable)'
+    );
+    check(shell.title && shell.folderSelect, 'note detail has title + folder select');
+    check(shell.tabs, 'transcript + summary tabs present');
+    check(shell.staleHint, '#summaryStaleHint present');
+    check(shell.reTranscribe, '#reTranscribeBtn present');
+    check(shell.pillExists && shell.pillHiddenWhenIdle, 'recording pill exists and is hidden at rest');
+
+    // ⌘K focus (synthetic key — same-library injection, labeled synthetic).
+    // The renderer listens on `document`, so dispatch there.
+    await ev('document.activeElement && document.activeElement.blur()');
+    await ev(
+      `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }))`
+    );
+    const searchFocused = await ev('document.activeElement === document.getElementById("searchInput")');
+    check(searchFocused, '[synthetic] ⌘K focuses #searchInput');
+
+    step('Steno shell layout + plan values (workstream 1)');
     // Measure the default view: transcript tab active, settings folded away.
     await ev('document.getElementById("tabTranscript").click()');
     if (!(await ev('document.getElementById("settingsPanel").hidden'))) {
@@ -1233,22 +1446,26 @@ async function main() {
     for (const id of missingIds) fail(`missing element id: #${id}`);
 
     const layout = await ev(LAYOUT_PROBE);
-    const cols = layout.columns || { left: { x: 0, w: 0 }, right: { x: 1e9, w: 0 } };
+    const panes = layout.panes || { sidebar: { x: 0, w: 0 }, main: { x: 1e9, w: 0 } };
     check(
       Math.abs(layout.outer.w - DEFAULT_WINDOW.width) <= 2 &&
         Math.abs(layout.outer.h - DEFAULT_WINDOW.height) <= 2,
       `window default ${DEFAULT_WINDOW.width}x${DEFAULT_WINDOW.height} (outer ${layout.outer.w}x${layout.outer.h})`
     );
-    check(layout.columns !== null, 'two columns (.col-left / .col-right) present');
-    check(cols.left.x + cols.left.w <= cols.right.x + 1, 'columns sit side by side with no overlap');
+    check(layout.panes !== null, 'Steno shell panes present (#sidebar + #mainContent)');
+    check(
+      panes.sidebar.x + panes.sidebar.w <= panes.main.x + 1,
+      'sidebar sits left of main content with no overlap'
+    );
     check(
       layout.doc.sw <= layout.inner.w + 1 && layout.doc.sh <= layout.inner.h + 1,
       `no page-level overflow at ${layout.inner.w}x${layout.inner.h}`
     );
-    const clipped = Object.entries(layout.visible).filter(([, ok]) => ok !== true).map(([id]) => id);
+    const clipped = Object.entries(layout.visible).filter(([, ok]) => ok === false).map(([id]) => id);
+    const unrendered = Object.entries(layout.visible).filter(([, ok]) => ok === 'not-rendered').map(([id]) => id);
     check(
       clipped.length === 0,
-      `key controls fully inside the viewport (${clipped.length ? `clipped: ${clipped.join(', ')}` : 'none clipped'})`
+      `key controls fully inside the viewport (${clipped.length ? `clipped: ${clipped.join(', ')}` : 'none clipped'}; not-rendered at rest: ${unrendered.join(', ') || 'none'})`
     );
     check(layout.hintText.trim() === DICTATION_HINT_TEXT, `dictation hint copy: "${layout.hintText.trim()}"`);
     check(layout.colorScheme === 'dark', `single dark theme (color-scheme: ${layout.colorScheme})`);
@@ -1296,7 +1513,7 @@ async function main() {
       Math.abs(minLayout.inner.w - MIN_WINDOW.width) <= 2,
       `content measured at the minimum window size (${minLayout.inner.w}x${minLayout.inner.h} content of ${MIN_WINDOW.width}x${MIN_WINDOW.height})`
     );
-    const minClipped = Object.entries(minLayout.visible).filter(([, ok]) => ok !== true).map(([id]) => id);
+    const minClipped = Object.entries(minLayout.visible).filter(([, ok]) => ok === false).map(([id]) => id);
     check(
       minClipped.length === 0,
       `no clipped content at min size ${MIN_WINDOW.width}x${MIN_WINDOW.height}` +
@@ -1306,10 +1523,10 @@ async function main() {
       minLayout.doc.sw <= minLayout.inner.w + 1 && minLayout.doc.sh <= minLayout.inner.h + 1,
       `no page overflow at min size (${minLayout.doc.sw}x${minLayout.doc.sh} vs ${minLayout.inner.w}x${minLayout.inner.h})`
     );
-    const minCols = minLayout.columns || { left: { x: 0, w: 0 }, right: { x: 1e9, w: 0 } };
+    const minPanes = minLayout.panes || { sidebar: { x: 0, w: 0 }, main: { x: 1e9, w: 0 } };
     check(
-      minCols.left.x + minCols.left.w <= minCols.right.x + 1,
-      'columns stay side by side at min size'
+      minPanes.sidebar.x + minPanes.sidebar.w <= minPanes.main.x + 1,
+      'sidebar stays left of main content at min size'
     );
     await cdp.send('Emulation.clearDeviceMetricsOverride');
     await sleep(700);
@@ -1460,6 +1677,493 @@ async function main() {
       note('no summary source in the DOM (floor failed before summarization) — Copy/.md checks skipped');
     }
 
+    // --- note library lifecycle (test plan §3.3) ---------------------------
+    step('Note library lifecycle: record → note appears → opens');
+    const openNoteCount = () => ev('document.getElementById("noteList").children.length');
+    const listBeforeRecord = await openNoteCount();
+    await ev('document.getElementById("recordBtn").click()');
+    const pillUp = await waitFor(
+      async () => !(await ev('document.getElementById("recordingPill").hidden')),
+      { timeout: 12000, label: 'recording pill appears' }
+    )
+      .then(() => true)
+      .catch(() => false);
+    check(pillUp, 'record button starts a recording (pill shown)');
+    let recordAudio = null;
+    if (pillUp) {
+      recordAudio = spawn('afplay', ['-v', '1.0', SPEECH_WAV], { stdio: 'ignore' });
+    }
+    // Streaming contract: partial text must land in the transcript WHILE the
+    // pill is up, BEFORE stop is clicked (partial-then-final ordering).
+    const transcriptBeforeRecord = await ev('document.getElementById("transcriptArea").value');
+    let partialSeenAt = null;
+    const recordDeadline = Date.now() + 14000;
+    while (Date.now() < recordDeadline) {
+      const value = await ev('document.getElementById("transcriptArea").value');
+      if (value !== transcriptBeforeRecord && partialSeenAt === null) partialSeenAt = Date.now();
+      await sleep(400);
+    }
+    const stopClickedAt = Date.now();
+    await ev('document.getElementById("stopRecordBtn").click()');
+    if (recordAudio) recordAudio.kill();
+    const recordOutcome = await waitFor(
+      async () => {
+        const status = await reqStatus();
+        return status === 'completed' || status === 'error' ? status : null;
+      },
+      { timeout: 240000, interval: 500, label: 'record → transcribe completes' }
+    ).catch(() => 'timeout');
+    check(recordOutcome === 'completed', `recording transcribes to completion (outcome=${recordOutcome})`);
+    const listAfterRecord = await openNoteCount();
+    check(
+      listAfterRecord >= listBeforeRecord + 1,
+      `new note appears in #noteList (${listBeforeRecord} → ${listAfterRecord})`
+    );
+    check(
+      !(await ev('document.getElementById("noteDetail").hidden')),
+      'the new note opens in the detail pane'
+    );
+    check(
+      partialSeenAt !== null && partialSeenAt < stopClickedAt,
+      partialSeenAt !== null
+        ? `streaming partial arrived while recording, before stop (${stopClickedAt - partialSeenAt}ms before stop click)`
+        : 'streaming partial text arrived while recording (partial-then-final ordering)'
+    );
+
+    // --- folder create + move (test plan §3.3) -----------------------------
+    step('Folder seed + note move');
+    // addFolderBtn calls window.prompt(), which Electron does not implement —
+    // seed the folder through the same IPC a note move uses instead.
+    const seed = await ev(
+      `window.electronAPI.createNote({ title: 'Smoke folder anchor', source: 'import', folder: 'SmokeFolder', transcript: 'anchor transcript' })`
+    );
+    check(Boolean(seed && seed.success), 'anchor note seeding folder "SmokeFolder" created');
+    // Refresh renderer state: a title blur round-trip is a UI path that
+    // re-runs loadNotes() (lists + folder registry) without a reload.
+    await ev(
+      `(() => { const t = document.getElementById('noteTitle'); t.dispatchEvent(new Event('blur', { bubbles: true })); return true; })()`
+    );
+    await sleep(700);
+    await ev(
+      `(() => { const li = document.querySelector('#noteList li.active'); if (li) li.click(); return Boolean(li); })()`
+    );
+    await sleep(500);
+    const folderOpts = await ev(
+      `[...document.getElementById('noteFolderSelect').options].map(o => o.value)`
+    );
+    check(
+      Array.isArray(folderOpts) && folderOpts.includes('SmokeFolder'),
+      `folder select lists the seeded folder (${(folderOpts || []).join(', ')})`
+    );
+    const movableId = await ev(
+      `(() => { const li = document.querySelector('#noteList li.active'); return li ? li.dataset.id : null; })()`
+    );
+    check(Boolean(movableId), 'a note is active and ready to move');
+    if (movableId) {
+      await ev(
+        `(() => { const s = document.getElementById('noteFolderSelect'); s.value = 'SmokeFolder'; s.dispatchEvent(new Event('change', { bubbles: true })); return s.value; })()`
+      );
+      await sleep(800);
+      const moved = await ev(
+        `window.electronAPI.readNoteContent(${JSON.stringify(movableId)})`
+      );
+      check(
+        moved && moved.note && moved.note.folder === 'SmokeFolder',
+        `note moves into the folder (folder=${moved && moved.note ? moved.note.folder : 'n/a'})`
+      );
+    }
+
+    // --- ⌘K offline search filters (test plan §3.3) ------------------------
+    step('⌘K search filters the list (offline)');
+    await ev(
+      `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true, bubbles: true }))`
+    );
+    const focusedForSearch = await ev(
+      'document.activeElement === document.getElementById("searchInput")'
+    );
+    check(focusedForSearch, '[synthetic] ⌘K focuses search before filtering');
+    await ev(
+      `(() => { const i = document.getElementById('searchInput'); i.value = 'zzz-no-such-note-xyz'; i.dispatchEvent(new Event('input', { bubbles: true })); return i.value; })()`
+    );
+    const emptyFiltered = await waitFor(
+      async () => (await openNoteCount()) === 0,
+      { timeout: 8000, label: 'search filters to zero matches' }
+    )
+      .then(() => true)
+      .catch(() => false);
+    check(emptyFiltered, 'nonsense query filters the list to zero items');
+    await ev(
+      `(() => { const i = document.getElementById('searchInput'); i.value = 'Smoke folder anchor'; i.dispatchEvent(new Event('input', { bubbles: true })); return i.value; })()`
+    );
+    const anchorMatches = await waitFor(
+      async () => (await openNoteCount()) >= 1,
+      { timeout: 8000, label: 'search matches the anchor note' }
+    )
+      .then(() => openNoteCount())
+      .catch(() => 0);
+    check(anchorMatches >= 1, `query "Smoke folder anchor" matches the note (${anchorMatches} item(s))`);
+    await ev('document.getElementById("searchClearBtn").click()');
+    await sleep(600);
+    const clearedCount = await openNoteCount();
+    check(clearedCount >= listAfterRecord, `clearing search restores the full list (${clearedCount} item(s))`);
+
+    // --- re-transcribe: D4 guards + replace-on-success ---------------------
+    step('Re-transcribe (D4 guards, failure keeps bytes, success swaps)');
+    const allNotes = await ev('window.electronAPI.searchNotes("")');
+    const audioNote = (allNotes.notes || []).find((n) => n.hasAudio);
+    check(Boolean(audioNote), 'a note with stored audio exists for re-transcribe');
+    const seedAudioless = await ev(
+      `window.electronAPI.createNote({ title: 'No-audio retranscribe probe', source: 'import', transcript: 'STATIC TRANSCRIPT WITHOUT AUDIO' })`
+    );
+    check(Boolean(seedAudioless && seedAudioless.success), 'audio-less note created');
+    await ev(
+      `(() => { const t = document.getElementById('noteTitle'); t.dispatchEvent(new Event('blur', { bubbles: true })); return true; })()`
+    );
+    await sleep(700);
+    await ev(
+      `(() => { const li = [...document.querySelectorAll('#noteList li')].find(el => el.textContent.includes('No-audio retranscribe probe')); if (li) li.click(); return Boolean(li); })()`
+    );
+    await sleep(600);
+    const audiolessBtn = await ev(
+      `(() => { const b = document.getElementById('reTranscribeBtn'); return { disabled: b.disabled, title: b.title }; })()`
+    );
+    check(audiolessBtn.disabled, 're-transcribe is DISABLED on an audio-less note');
+    check(
+      String(audiolessBtn.title).toLowerCase().includes('no audio'),
+      `tooltip explains why: "${audiolessBtn.title}"`
+    );
+
+    if (audioNote) {
+      await ev(
+        `(() => { const li = document.querySelector('#noteList li[data-id="${audioNote.id}"]'); if (li) li.click(); return Boolean(li); })()`
+      );
+      await sleep(600);
+      const audioBtn = await ev(
+        `(() => { const b = document.getElementById('reTranscribeBtn'); return { disabled: b.disabled, title: b.title }; })()`
+      );
+      check(audioBtn.disabled === false, 're-transcribe is enabled on a note with audio');
+
+      // Replace-on-success guard: seed a SENTINEL transcript so the failure
+      // run has something byte-identical to preserve.
+      const SENTINEL = `SENTINEL-OLD-TRANSCRIPT-${Date.now()}`;
+      await ev(
+        `window.electronAPI.updateNote({ id: ${JSON.stringify(audioNote.id)}, transcript: ${JSON.stringify(SENTINEL)}, markSummaryStale: false })`
+      );
+      await ev(
+        `(() => { const li = document.querySelector('#noteList li[data-id="${audioNote.id}"]'); if (li) li.click(); return Boolean(li); })()`
+      );
+      await sleep(600);
+      const seeded = await ev('document.getElementById("transcriptArea").value');
+      check(seeded === SENTINEL, 'sentinel transcript loaded into the pane');
+
+      // (b) FAILURE: kill the transcription adapter mid-run (the plan's own
+      // failure injection) — old transcript must stay byte-identical.
+      await ev('document.getElementById("reTranscribeBtn").click()');
+      const failureStarted = await waitFor(
+        async () => (await statusShows('transcribing')) || (await reqStatus()) === 'transcribing',
+        { timeout: 15000, label: 're-transcribe starts' }
+      )
+        .then(() => true)
+        .catch(() => false);
+      check(failureStarted, 're-transcribe run starts (status shows transcribing)');
+      const adapterPids = pidsForPattern(`${ROOT}/python/nadabodha_transcribe.py`);
+      check(adapterPids.length >= 1, `transcription adapter process running (pids: ${adapterPids.join(', ') || 'none'})`);
+      const errorSeen = { at: null, how: null };
+      for (const pid of adapterPids) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      const killAt = Date.now();
+      while (Date.now() - killAt < 30000) {
+        const status = await reqStatus();
+        const errShown = await ev(
+          `(() => { const e = document.getElementById('errorText'); return !e.hidden && e.textContent.length > 0; })()`
+        );
+        const statusTextNow = await ev('document.getElementById("statusText").textContent || ""');
+        if (errShown) { errorSeen.at = Date.now(); errorSeen.how = 'errorText'; break; }
+        if (status === 'error') { errorSeen.at = Date.now(); errorSeen.how = 'reqStatus=error'; break; }
+        if (/fail|exited|error/i.test(statusTextNow)) { errorSeen.at = Date.now(); errorSeen.how = `statusText="${statusTextNow.slice(0, 60)}"`; break; }
+        if (status === 'idle' && Date.now() - killAt > 4000) { errorSeen.at = Date.now(); errorSeen.how = 'pipeline settled after kill'; break; }
+        await sleep(250);
+      }
+      check(errorSeen.at !== null, `adapter kill surfaces an error (${errorSeen.how || 'NOTHING SEEN'})`);
+      // Wait for the pipeline to fully settle before asserting bytes.
+      await waitFor(
+        async () => {
+          const status = await reqStatus();
+          return status !== 'transcribing' && status !== 'recording';
+        },
+        { timeout: 20000, label: 'pipeline settles after adapter kill' }
+      ).catch(() => undefined);
+      const afterFailure = await ev('document.getElementById("transcriptArea").value');
+      check(
+        afterFailure === SENTINEL,
+        `failed re-transcribe leaves the transcript BYTE-IDENTICAL (${afterFailure === SENTINEL ? 'unchanged' : `CHANGED to ${JSON.stringify(String(afterFailure).slice(0, 60))}`})`
+      );
+      const btnAfterFailure = await ev(
+        `(() => { const b = document.getElementById('reTranscribeBtn'); return { disabled: b.disabled, title: b.title }; })()`
+      );
+      check(btnAfterFailure.disabled === false, 're-transcribe button re-enabled after the failed run (D4 release)');
+
+      // (c) SUCCESS: same audio, adapter healthy → transcript swaps, summary
+      // marked stale, run token released.
+      const errHiddenBefore = await ev(
+        `document.getElementById('errorText').hidden || document.getElementById('errorText').textContent === ''`
+      );
+      await ev('document.getElementById("reTranscribeBtn").click()');
+      // D4 in-flight: the click handler disables the button synchronously.
+      const inFlight = await ev(
+        `(() => { const b = document.getElementById('reTranscribeBtn'); return { disabled: b.disabled, title: b.title }; })()`
+      );
+      check(inFlight.disabled, 're-transcribe button DISABLED while a run is in flight (D4 guard a)');
+      check(
+        String(inFlight.title).toLowerCase().includes('in progress'),
+        `in-flight tooltip: "${inFlight.title}"`
+      );
+      // A second (programmatic) trigger must be a no-op: dispatch click on
+      // the disabled button and prove no error/save-path side effects.
+      await ev(
+        `(() => { const b = document.getElementById('reTranscribeBtn'); b.dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; })()`
+      );
+      const secondTriggerState = await ev(
+        `(() => { const e = document.getElementById('errorText'); return { errHidden: e.hidden || e.textContent === '' }; })()`
+      );
+      check(
+        secondTriggerState.errHidden === true,
+        'second in-flight trigger is ignored (no error surfaced from a rejected duplicate run)'
+      );
+      const successOutcome = await waitFor(
+        async () => {
+          const status = await reqStatus();
+          return status === 'completed' || status === 'error' ? status : null;
+        },
+        { timeout: 300000, interval: 500, label: 're-transcribe completes' }
+      ).catch(() => 'timeout');
+      check(successOutcome === 'completed', `re-transcribe completes successfully (outcome=${successOutcome})`);
+      const afterSuccess = await ev('document.getElementById("transcriptArea").value');
+      check(
+        afterSuccess !== SENTINEL && afterSuccess.length > 10,
+        `successful re-transcribe REPLACES the transcript (${afterSuccess === SENTINEL ? 'UNCHANGED' : `${SENTINEL.length} → ${afterSuccess.length} chars`})`
+      );
+      const staleShown = await ev(
+        `!document.getElementById('summaryStaleHint').hidden`
+      );
+      check(staleShown, 'summary marked stale after re-transcribe (#summaryStaleHint shown)');
+      const modelInfo = await ev(`window.electronAPI.readNoteContent(${JSON.stringify(audioNote.id)})`);
+      check(
+        modelInfo && modelInfo.note && modelInfo.note.model === HF_REPO,
+        `frontmatter model recorded (${modelInfo && modelInfo.note ? modelInfo.note.model : 'n/a'})`
+      );
+      const btnAfterSuccess = await ev(
+        `(() => { const b = document.getElementById('reTranscribeBtn'); return { disabled: b.disabled, title: b.title }; })()`
+      );
+      check(
+        btnAfterSuccess.disabled === false,
+        `re-transcribe button re-enabled after completion (title="${btnAfterSuccess.title}")`
+      );
+    } else {
+      fail('no audio-backed note available — re-transcribe success/failure cases not exercised');
+    }
+
+    // --- meeting mode (D3 runtime) -----------------------------------------
+    step('Meeting mode (fail-closed UI + PATH-stripped catap probe)');
+    // Screen TCC is 'denied' on this host (verified with a getMediaAccessStatus
+    // probe — no dialog is ever raised from 'denied'): the plan's acceptance is
+    // fail-closed with a clear error and no crash.
+    await ev('document.getElementById("meetingModeChk").checked = true');
+    await ev('document.getElementById("recordBtn").click()');
+    const meetingErrShown = await waitFor(
+      async () => {
+        const err = await ev(
+          `(() => { const e = document.getElementById('errorText'); return !e.hidden ? e.textContent : ''; })()`
+        );
+        return err || null;
+      },
+      { timeout: 20000, label: 'screen-permission error surfaced' }
+    ).catch(() => '');
+    check(
+      String(meetingErrShown).includes('Screen & System Audio Recording'),
+      `meeting mode fails closed with a clear error: "${String(meetingErrShown).slice(0, 90)}"`
+    );
+    check(
+      await ev('document.getElementById("recordingPill").hidden'),
+      'no recording pill after the screen denial (nothing was spawned)'
+    );
+    check(appAlive, 'app alive after the meeting-mode denial (no crash)');
+    const catapPids = pidsForPattern('catap record');
+    check(catapPids.length === 0, `catap never spawned after the denial (pids: ${catapPids.join(', ') || 'none'})`);
+    await ev('document.getElementById("meetingModeChk").checked = false');
+
+    // L3 runtime probe: PATH without the conda bin dir → `catap` is ENOENT
+    // while ffmpeg (homebrew) still resolves. The D3 acceptance: the Electron
+    // main process must survive the spawn 'error' and surface it.
+    const probeDir = path.join(scratch, 'catap-probe');
+    fs.mkdirSync(probeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(probeDir, 'package.json'),
+      JSON.stringify({ name: 'catap-probe', main: 'main.js' })
+    );
+    fs.writeFileSync(
+      path.join(probeDir, 'main.js'),
+      [
+        "const { app } = require('electron');",
+        "const path = require('path');",
+        'const ROOT = process.env.SMOKE_ROOT;',
+        "const { AudioRecorder } = require(path.join(ROOT, 'dist', 'main', 'audioRecorder.js'));",
+        'const out = { meetingErr: null, state: null, startErr: null };',
+        '(async () => {',
+        '  const rec = new AudioRecorder();',
+        "  rec.on('meeting-error', (m) => { out.meetingErr = String(m); });",
+        '  try { rec.start({ meetingMode: true }); } catch (e) { out.startErr = String((e && e.message) || e); }',
+        '  await new Promise((r) => setTimeout(r, 3500));',
+        '  const st = rec.getState();',
+        "  out.state = { status: st.status, meetingError: st.meetingError || null, error: st.error || null };",
+        '  try { rec.cancel(); } catch {}',
+        "  console.log('PROBE_RESULT=' + JSON.stringify(out));",
+        '  app.exit(0);',
+        "})().catch((e) => { console.log('PROBE_RESULT=' + JSON.stringify({ fatal: String((e && e.stack) || e) })); app.exit(1); });",
+        '',
+      ].join('\n')
+    );
+    const strippedPath = (process.env.PATH || '')
+      .split(':')
+      .filter((entry) => entry && !entry.includes('conda_envs/misc'))
+      .join(':');
+    const probeChild = spawn(electronBinary, [probeDir], {
+      cwd: ROOT,
+      env: { ...process.env, PATH: strippedPath, SMOKE_ROOT: ROOT },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let probeOut = '';
+    let probeErrOut = '';
+    probeChild.stdout.on('data', (b) => { probeOut += b.toString(); });
+    probeChild.stderr.on('data', (b) => { probeErrOut += b.toString(); });
+    const probeCode = await new Promise((resolve) => {
+      const t = setTimeout(() => { try { probeChild.kill('SIGKILL'); } catch { /* */ } resolve('timeout'); }, 60000);
+      probeChild.once('exit', (code) => { clearTimeout(t); resolve(code); });
+    });
+    const probeLine = probeOut.split('\n').find((l) => l.startsWith('PROBE_RESULT='));
+    let probeResult = null;
+    try { probeResult = probeLine ? JSON.parse(probeLine.slice('PROBE_RESULT='.length)) : null; } catch { probeResult = null; }
+    check(
+      probeCode === 0 && Boolean(probeResult),
+      `PATH-stripped probe: Electron main stayed alive and exited cleanly (code=${probeCode}${probeResult ? '' : `, stderr=${probeErrOut.slice(-300)}`})`
+    );
+    if (probeResult) {
+      check(
+        Boolean(probeResult.meetingErr) && probeResult.meetingErr.includes('catap'),
+        `catap ENOENT surfaced as a human-readable meetingError: "${probeResult.meetingErr}"`
+      );
+      check(
+        probeResult.state && probeResult.state.status === 'recording',
+        `mic kept recording after the catap failure — degraded to mic-only (state=${probeResult.state && probeResult.state.status}${probeResult.state && probeResult.state.error ? `, error=${probeResult.state.error}` : ''})`
+      );
+      check(
+        probeResult.state && Boolean(probeResult.state.meetingError),
+        'failure recorded on recorder state (readable app state)'
+      );
+    } else {
+      fail(`PATH-stripped probe produced no PROBE_RESULT (stdout tail: ${probeOut.slice(-300)})`);
+    }
+
+    // Honest SKIPs for the parts this harness cannot automate.
+    skip('meeting both-WAV capture in the UI: Screen & System Audio Recording is DENIED on this host — real consent flow is L4/A4; catap crash path covered by the unit test + the PATH-stripped probe above');
+    skip('watch-folder pick + watcher lsof drain: pickWatchFolder opens a native dialog — not automatable (L4)');
+    skip('migration fixture (legacy transcripts/ + summaries/ → reindex): needs an app restart cycle — Tester-stage work');
+    skip('export via the Save as TXT/SRT/VTT buttons: native save dialog — round-trip covered node-side below');
+
+    // --- batch import queue order (test plan §3.3) -------------------------
+    step('Batch import: queue order + drain');
+    const batchOne = path.join(scratch, 'batch-one.wav');
+    const batchTwo = path.join(scratch, 'batch-two.wav');
+    fs.copyFileSync(SPEECH_WAV, batchOne);
+    fs.copyFileSync(SPEECH_WAV, batchTwo);
+    const listBeforeBatch = await openNoteCount();
+    const enqueued = await ev(
+      `window.electronAPI.enqueueImports(${JSON.stringify([batchOne, batchTwo])})`
+    );
+    check(
+      Array.isArray(enqueued) && enqueued.length === 2,
+      `two files enqueued (${Array.isArray(enqueued) ? enqueued.length : 'n/a'} accepted)`
+    );
+    const queueRowsVisible = await waitFor(
+      async () => (await ev('document.getElementById("importQueueList").children.length')) >= 2,
+      { timeout: 15000, label: 'queue rows render' }
+    )
+      .then(() => true)
+      .catch(() => false);
+    check(queueRowsVisible, 'import queue section shows both pending rows');
+    const queueOrder = await ev(
+      `[...document.querySelectorAll('#importQueueList h4')].map(h => h.textContent || '')`
+    );
+    check(
+      queueOrder.length >= 2 &&
+        queueOrder[0].includes('batch-one') &&
+        queueOrder[1].includes('batch-two'),
+      `queue keeps enqueue order (${(queueOrder || []).join(' → ')})`
+    );
+    const queueDrained = await waitFor(
+      async () => await ev('document.getElementById("importQueueSection").hidden'),
+      { timeout: 420000, interval: 1000, label: 'import queue drains' }
+    )
+      .then(() => true)
+      .catch(() => false);
+    check(queueDrained, 'import queue drains to empty (both files processed)');
+    const listAfterBatch = await openNoteCount();
+    check(
+      listAfterBatch >= listBeforeBatch + 2,
+      `batch imports add notes to the list (${listBeforeBatch} → ${listAfterBatch})`
+    );
+
+    // --- export SRT/VTT parse round-trip (node-side, app's own code) -------
+    step('Export SRT/VTT parse round-trip');
+    try {
+      const exportMod = requireCjs(path.join(ROOT, 'dist', 'main', 'exportText.js'));
+      const roundWords = Array.from({ length: 25 }, (_, i) => ({
+        word: `word${i + 1}`,
+        start: i * 0.4,
+        end: i * 0.4 + 0.35,
+      }));
+      const roundText = roundWords.map((w) => w.word).join(' ');
+      const srtFile = path.join(scratch, 'roundtrip.srt');
+      const vttFile = path.join(scratch, 'roundtrip.vtt');
+      const srtRes = exportMod.saveTranscript({ filePath: srtFile, format: 'srt', text: roundText, words: roundWords });
+      const vttRes = exportMod.saveTranscript({ filePath: vttFile, format: 'vtt', text: roundText, words: roundWords });
+      check(Boolean(srtRes && srtRes.success), `SRT export writes (${srtFile})`);
+      check(Boolean(vttRes && vttRes.success), `VTT export writes (${vttFile})`);
+      const parseStamps = (content, re) =>
+        [...content.matchAll(re)].map((m) => ({
+          start: m[1],
+          end: m[2],
+          s: Number(m[1].replace(/[,.]/g, '.')) || (() => {
+            const [h, mm, rest] = m[1].split(':');
+            const [s, ms] = rest.split(/[,.]/);
+            return Number(h) * 3600 + Number(mm) * 60 + Number(s) + Number(ms) / 1000;
+          })(),
+        }));
+      const srtContent = fs.readFileSync(srtFile, 'utf8');
+      const vttContent = fs.readFileSync(vttFile, 'utf8');
+      const srtStamps = parseStamps(srtContent, /(\d\d:\d\d:\d\d,\d\d\d) --> (\d\d:\d\d:\d\d,\d\d\d)/g);
+      const vttStamps = parseStamps(vttContent, /(\d\d:\d\d:\d\d\.\d\d\d) --> (\d\d:\d\d:\d\d\.\d\d\d)/g);
+      check(vttContent.startsWith('WEBVTT'), 'VTT starts with the WEBVTT header');
+      check(srtStamps.length >= 2, `SRT parses back ${srtStamps.length} cue(s)`);
+      const srtIndexes = [...srtContent.matchAll(/^(\d+)$/gm)].map((m) => Number(m[1]));
+      check(
+        srtIndexes.length === srtStamps.length && srtIndexes.every((v, i) => v === i + 1),
+        `SRT cue indexes are sequential 1..${srtIndexes.length}`
+      );
+      const monotonic = (stamps) =>
+        stamps.every((c, i) => i === 0 || c.s >= stamps[i - 1].s);
+      check(monotonic(srtStamps), 'SRT timestamps are monotonic');
+      check(monotonic(vttStamps), 'VTT timestamps are monotonic');
+      const roundTripText = [...srtContent.matchAll(/^\d+\n\d\d.*\n(.*)$/gm)].map((m) => m[1]).join(' ');
+      check(
+        roundTripText.replace(/\s+/g, ' ').trim() === roundText,
+        'SRT cue text round-trips to the source words'
+      );
+    } catch (err) {
+      fail(`export round-trip aborted: ${err.message}`);
+    }
+
     // --- dictation: hold Option, system-wide --------------------------------
     step('Dictation end-to-end (workstream 3)');
 
@@ -1467,14 +2171,24 @@ async function main() {
     const noticeText = () => ev('document.getElementById("dictationNotice").textContent || ""');
     const transcriptValue = () => ev('document.getElementById("transcriptArea").value');
     const dictationStatus = () => ev('window.electronAPI.getDictationStatus()');
-    /** Samples status/notice for `ms`; stops early when the notice changes. */
+    const badgeVisible = async () => !(await ev('document.getElementById("dictationBadge").hidden'));
+    /**
+     * Samples status/notice/pipeline-state for `ms`; stops early when the
+     * notice changes. Dictation events never touch #statusText (the renderer
+     * branches on origin first), so the dictation badge and the IPC
+     * pipeline state are the real observables here.
+     */
     async function sampleOutcome(ms) {
       const startNotice = await noticeText();
       const seen = new Set();
+      const pipeline = new Set();
+      let badgeSeen = false;
       let notice = startNotice;
       const end = Date.now() + ms;
       while (Date.now() < end) {
         seen.add(await statusText());
+        pipeline.add(await reqStatus());
+        if (await badgeVisible()) badgeSeen = true;
         const now = await noticeText();
         if (now && now !== startNotice) {
           notice = now;
@@ -1483,9 +2197,10 @@ async function main() {
         notice = now;
         await sleep(120);
       }
-      return { seen: [...seen], notice };
+      return { seen: [...seen], pipeline: [...pipeline], badgeSeen, notice };
     }
     const sawStatus = (sample, needle) => sample.seen.some((s) => s.includes(needle));
+    const sawPipeline = (sample, value) => (sample.pipeline || []).includes(value);
 
     // Re-enable dictation and confirm the guarded hook is really running.
     await ev('window.electronAPI.updateSettings({ dictationEnabled: true, autoSummarize: false })');
@@ -1510,6 +2225,9 @@ async function main() {
     );
 
     // (1) bare Option hold -> recording -> release -> transcription APPENDED.
+    // The app owns the foreground for the whole dictation section so the
+    // paste target is deterministic (own-window; guard rail asserted below).
+    await cdp.send('Page.bringToFront');
     let take = null;
     // Up to 5 attempts: a chord abort here means an unrelated key arrived
     // during the hold (the desktop is shared), which is correct behaviour —
@@ -1518,15 +2236,15 @@ async function main() {
       const before = await transcriptValue();
       uIOhook.keyToggle(UiohookKey.Alt, 'down');
       const heldAt = Date.now();
-      const started = await waitFor(async () => (await statusText()).includes('recording'), {
+      // The dictation badge (not #statusText) reflects an open take: the
+      // renderer branches on origin === 'dictation' before touching status.
+      const started = await waitFor(async () => !(await ev('document.getElementById("dictationBadge").hidden')), {
         timeout: 8000,
-        label: `take ${attempt}: recording starts on Option keydown`,
+        label: `take ${attempt}: badge shows on Option keydown`,
       })
         .then(() => true)
         .catch(() => false);
-      const badgeVisible = started
-        ? !(await ev('document.getElementById("dictationBadge").hidden'))
-        : false;
+      const badgeVisibleDuringHold = started;
       const heldText = await transcriptValue();
       const clearedWhileHolding = heldText !== before;
 
@@ -1544,27 +2262,17 @@ async function main() {
       if (audio) audio.kill();
 
       const releasedAt = Date.now();
+      // Single outcome wait: the badge proved the take opened, so a stale
+      // 'completed' from the floor cannot short-circuit it — the pipeline
+      // is already 'transcribing' (streaming) when the badge shows.
       let outcome = 'timeout';
-      // The floor's earlier transcription leaves "completed" on screen, so wait
-      // for THIS take to move on: an abort notice, an error, or the
-      // transcription phase.
       while (Date.now() - releasedAt < 240000) {
-        const status = await statusText();
         const notice = await noticeText();
         if (notice) { outcome = notice; break; }
-        if (status.includes('error')) { outcome = status; break; }
-        if (status.includes('transcribing')) { outcome = 'transcribing'; break; }
+        const pipelineStatus = await reqStatus();
+        if (pipelineStatus === 'completed') { outcome = 'completed'; break; }
+        if (pipelineStatus === 'error') { outcome = 'error'; break; }
         await sleep(200);
-      }
-      if (outcome === 'transcribing') {
-        const transcribingSince = Date.now();
-        while (Date.now() - transcribingSince < 240000) {
-          const status = await statusText();
-          const notice = await noticeText();
-          if (status.includes('completed')) { outcome = 'completed'; break; }
-          if (status.includes('error') || notice) { outcome = notice || status; break; }
-          await sleep(300);
-        }
       }
       const after = await transcriptValue();
       const appendedSoFar = after.length > before.length ? after.slice(before.length) : '';
@@ -1573,18 +2281,21 @@ async function main() {
       // trace of the sample — silence hallucinations come out unrelated.
       const looksLikeSample = /hello/i.test(appendedSoFar) || /transcription test/i.test(appendedSoFar);
       if (started && outcome === 'completed' && after !== before && looksLikeSample) {
-        take = { attempt, before, after, badgeVisible, clearedWhileHolding };
+        take = { attempt, before, after, badgeVisibleDuringHold, clearedWhileHolding };
       } else {
         note(
-          `dictation take ${attempt}: outcome=${outcome} appended="${appendedSoFar.trim().slice(0, 80) || '(none)'}" — retrying`
+          `dictation take ${attempt}/5: outcome=${outcome} appended="${appendedSoFar.trim().slice(0, 80) || '(none)'}" — retrying`
         );
       }
       if (!take) await sleep(1500);
     }
-    check(take !== null, 'a bare Option hold produced a transcription');
+    check(
+      take !== null,
+      `a bare Option hold produced a transcription (attempt ${take ? `${take.attempt}/5` : '5/5 exhausted'})`
+    );
     if (take) {
       check(
-        take.badgeVisible,
+        take.badgeVisibleDuringHold,
         'dictation-active indicator (#dictationBadge) shows while the key is held'
       );
       check(
@@ -1604,8 +2315,8 @@ async function main() {
     }
 
     // (2) chord: Option down + arrow -> abort, no transcription.
-    // The arrow must land while the take is actually open, so wait for the app
-    // to show "recording" first (its main process can be busy finishing the
+    // The arrow must land while the take is actually open, so wait for the
+    // badge to show first (its main process can be busy finishing the
     // previous take), and retry if the abort never surfaces.
     let beforeChord = await transcriptValue();
     let chord = null;
@@ -1613,10 +2324,10 @@ async function main() {
       beforeChord = await transcriptValue();
       const sampler = sampleOutcome(9000);
       uIOhook.keyToggle(UiohookKey.Alt, 'down');
-      const sawRecording = await waitFor(async () => (await statusText()).includes('recording'), {
-        timeout: 8000,
-        label: `chord ${attempt}: take opens`,
-      })
+      const sawTakeOpen = await waitFor(
+        async () => !(await ev('document.getElementById("dictationBadge").hidden')),
+        { timeout: 8000, label: `chord ${attempt}: take opens` }
+      )
         .then(() => true)
         .catch(() => false);
       uIOhook.keyToggle(UiohookKey.ArrowRight, 'down');
@@ -1627,20 +2338,26 @@ async function main() {
       const sample = await sampler;
       const afterAttempt = await transcriptValue();
       if (sample.notice === CHORD_NOTICE && afterAttempt === beforeChord) {
-        chord = { ...sample, sawRecording };
+        chord = { ...sample, sawTakeOpen, attempt };
       } else {
         note(
-          `chord ${attempt}: hint was "${sample.notice}" (recording seen: ${sawRecording}, transcript ${
+          `chord ${attempt}/3: hint was "${sample.notice}" (take opened: ${sawTakeOpen}, transcript ${
             afterAttempt === beforeChord ? 'unchanged' : 'CHANGED'
-          }, statuses: ${sample.seen.join(' > ')}) — retrying`
+          }, pipeline: ${sample.pipeline.join(' > ')}) — retrying`
         );
         await sleep(1500);
       }
     }
     const afterChord = await transcriptValue();
-    check(chord !== null && chord.sawRecording, `chord take opened (statuses: ${chord ? chord.seen.join(' > ') : 'n/a'})`);
+    check(
+      chord !== null && chord.sawTakeOpen,
+      `chord take opened (attempt ${chord ? `${chord.attempt}/3` : '3/3 exhausted'}; pipeline: ${chord ? chord.pipeline.join(' > ') : 'n/a'})`
+    );
     check(chord !== null && chord.notice === CHORD_NOTICE, `chord abort hint: "${chord ? chord.notice : '(never shown)'}"`);
-    check(chord === null || !sawStatus(chord, 'transcribing'), 'chord take never reaches the transcription pipeline');
+    check(
+      chord === null || !sawPipeline(chord, 'completed'),
+      'chord take never reaches a completed transcription'
+    );
     check(afterChord === beforeChord, 'chord produces NO transcription (transcript unchanged)');
 
     // (3) release inside ~300ms -> discard with the inline hint.
@@ -1655,66 +2372,146 @@ async function main() {
       uIOhook.keyToggle(UiohookKey.Alt, 'up');
       const sample = await sampler;
       if (sample.notice === TOO_SHORT_NOTICE) {
-        tap = sample;
+        tap = { ...sample, attempt };
       } else {
-        note(`tap ${attempt}: hint was "${sample.notice}" (statuses: ${sample.seen.join(' > ')}) — retrying`);
+        note(`tap ${attempt}/3: hint was "${sample.notice}" (pipeline: ${sample.pipeline.join(' > ')}) — retrying`);
         await sleep(1200);
       }
     }
     const afterTap = await transcriptValue();
     check(
       tap !== null && tap.notice === TOO_SHORT_NOTICE,
-      `too-short hint: "${tap ? tap.notice : '(never shown)'}"`
+      `too-short hint (attempt ${tap ? `${tap.attempt}/3` : '3/3 exhausted'}): "${tap ? tap.notice : '(never shown)'}"`
     );
-    check(tap === null || !sawStatus(tap, 'transcribing'), 'too-short take never reaches the transcription pipeline');
+    check(
+      tap === null || !sawPipeline(tap, 'completed'),
+      'too-short take never reaches a completed transcription'
+    );
     check(afterTap === beforeTap, 'too-short tap produces NO transcription (transcript unchanged)');
 
     // (4) dictationEnabled OFF -> the settings toggle stops the hook and a
     // hold produces no recording.
     const beforeOff = await transcriptValue();
+    const offOn = await dictationStatus();
+    check(offOn.enabled && offOn.running, 'dictationEnabled is ON before the toggle-off check');
     await ev('document.getElementById("settingsBtn").click()');
     check(
-      !(await ev('document.getElementById("dictationEnabledChk").checked')),
-      'settings checkbox still reflects the parked (off) state'
+      !(await ev('document.getElementById("settingsDictationChk").checked')),
+      'settings toggle reflects the parked (off) state'
     );
     await ev('document.getElementById("settingsSaveBtn").click()');
     await waitFor(async () => (await dictationStatus()).running === false, {
       timeout: 15000,
       label: 'hook stopped after saving dictationEnabled=OFF',
     });
-    const offHintOk = await waitFor(
-      async () => ((await textOf('dictationStatus')) || '').includes('switched off'),
-      { timeout: 10000, interval: 300, label: 'settings hint reports dictation off' }
-    ).catch(() => false);
-    check(Boolean(offHintOk), `settings hint when off: "${((await textOf('dictationStatus')) || '').trim()}"`);
     const offStatus = await dictationStatus();
     check(offStatus.enabled === false && offStatus.running === false, 'dictationEnabled=OFF stops the hook');
+    // The plan's hint contract lives on the sidebar hint: OFF hides it.
+    // (#dictationStatus is a hidden ID remnant that no code writes.)
+    const offHintOk = await waitFor(
+      async () => await ev('document.getElementById("dictationHint").hidden'),
+      { timeout: 10000, interval: 300, label: 'sidebar dictation hint hides when off' }
+    )
+      .then(() => true)
+      .catch(() => false);
+    check(offHintOk, 'sidebar dictation hint hides while dictationEnabled is OFF');
     const offSamplePromise = sampleOutcome(6000);
     uIOhook.keyToggle(UiohookKey.Alt, 'down');
     await sleep(1500);
     uIOhook.keyToggle(UiohookKey.Alt, 'up');
     const offSample = await offSamplePromise;
-    check(!sawStatus(offSample, 'recording'), 'dictationEnabled=OFF produces NO recording');
+    check(
+      !offSample.badgeSeen && !sawPipeline(offSample, 'completed'),
+      'dictationEnabled=OFF produces NO recording (badge never shows, no run)'
+    );
     check((await transcriptValue()) === beforeOff, 'transcript unchanged while dictation is off');
 
     // Re-enable through the same toggle so the default ON state is restored.
-    await ev('document.getElementById("dictationEnabledChk").checked = true');
+    await ev('document.getElementById("settingsDictationChk").checked = true');
     await ev('document.getElementById("settingsSaveBtn").click()');
     await waitFor(async () => (await dictationStatus()).running === true, {
       timeout: 20000,
       label: 'hook restarted after re-enabling',
     });
     const onHintOk = await waitFor(
-      async () => ((await textOf('dictationStatus')) || '').includes(DICTATION_HINT_TEXT),
-      { timeout: 10000, interval: 300, label: 'settings hint back to hold-Option' }
-    ).catch(() => false);
-    check(Boolean(onHintOk), `settings hint when on: "${((await textOf('dictationStatus')) || '').trim()}"`);
+      async () => {
+        const probe = await ev(
+          `(() => { const h = document.getElementById('dictationHint'); return { hidden: h.hidden, text: h.textContent.trim() }; })()`
+        );
+        return probe.hidden === false && probe.text === DICTATION_HINT_TEXT ? probe : null;
+      },
+      { timeout: 10000, interval: 300, label: 'sidebar dictation hint copy (exact)' }
+    ).catch(() => null);
     check(
-      await ev('document.getElementById("dictationEnabledChk").checked'),
-      'settings checkbox restored to checked (default ON)'
+      onHintOk !== null,
+      `sidebar dictation hint exact when ON: "${onHintOk ? onHintOk.text : 'hint not shown / copy mismatch'}"`
+    );
+    check(
+      await ev('document.getElementById("settingsDictationChk").checked'),
+      'settings toggle restored to checked (default ON)'
     );
     await ev('document.getElementById("settingsBtn").click()');
     pass('dictationEnabled re-enabled (default ON) at the end of the run');
+
+    // --- dictation guard rail: own-window focus ----------------------------
+    step('Dictation guard rail: own-window focus (no synthesized Cmd+V)');
+    await cdp.send('Page.bringToFront');
+    await ev('window.focus()');
+    const OWN_SENTINEL = 'UNIQUE-OWNWINDOW-CLIP-SENTINEL-0930';
+    spawnSync('pbcopy', [], { input: OWN_SENTINEL, encoding: 'utf8' });
+    const clipBeforeOwn = spawnSync('pbpaste', [], { encoding: 'utf8' }).stdout;
+    check(clipBeforeOwn === OWN_SENTINEL, 'clipboard seeded with the sentinel');
+    let ownTake = null;
+    for (let attempt = 1; attempt <= 3 && !ownTake; attempt += 1) {
+      const beforeOwn = await transcriptValue();
+      uIOhook.keyToggle(UiohookKey.Alt, 'down');
+      const ownHeldAt = Date.now();
+      const ownStarted = await waitFor(
+        async () => !(await ev('document.getElementById("dictationBadge").hidden')),
+        { timeout: 8000, label: `own-window take ${attempt}: badge shows` }
+      )
+        .then(() => true)
+        .catch(() => false);
+      let ownAudio = null;
+      if (ownStarted) {
+        ownAudio = spawn('afplay', ['-v', '1.0', SPEECH_WAV], { stdio: 'ignore' });
+        const ownAudioExited = new Promise((resolve) => ownAudio.once('exit', resolve));
+        await Promise.race([ownAudioExited, sleep(8000)]);
+        await sleep(400);
+      }
+      while (Date.now() - ownHeldAt < 4000) await sleep(100);
+      uIOhook.keyToggle(UiohookKey.Alt, 'up');
+      if (ownAudio) ownAudio.kill();
+      const ownReleasedAt = Date.now();
+      let ownOutcome = 'timeout';
+      while (Date.now() - ownReleasedAt < 240000) {
+        const ownNotice = await noticeText();
+        if (ownNotice) { ownOutcome = ownNotice; break; }
+        const ownPipeline = await reqStatus();
+        if (ownPipeline === 'completed') { ownOutcome = 'completed'; break; }
+        if (ownPipeline === 'error') { ownOutcome = 'error'; break; }
+        await sleep(200);
+      }
+      const afterOwn = await transcriptValue();
+      const ownAppend = afterOwn.length > beforeOwn.length ? afterOwn.slice(beforeOwn.length) : '';
+      if (ownStarted && ownOutcome === 'completed' && /hello|transcription test/i.test(ownAppend)) {
+        ownTake = { attempt };
+      } else {
+        note(`own-window take ${attempt}/3: outcome=${ownOutcome} appended="${ownAppend.trim().slice(0, 60) || '(none)'}" — retrying`);
+        await sleep(1500);
+      }
+    }
+    check(
+      ownTake !== null,
+      `own-window take appends in-app (attempt ${ownTake ? `${ownTake.attempt}/3` : '3/3 exhausted'})`
+    );
+    const clipAfterOwn = spawnSync('pbpaste', [], { encoding: 'utf8' }).stdout;
+    check(
+      clipAfterOwn === OWN_SENTINEL,
+      `clipboard untouched by the take — no synthesized Cmd+V in the own window (${JSON.stringify(
+        clipAfterOwn.slice(0, 40)
+      )})`
+    );
 
     // --- network + console assertions -------------------------------------
     step('Console + network assertions');
@@ -1765,6 +2562,10 @@ async function main() {
   } catch (err) {
     fail(`smoke aborted: ${err.message}`);
   } finally {
+    // Stop the D7.4 watchdog/monitor before tearing the app down so the
+    // monitor can never abort a normal teardown.
+    clearInterval(targetMonitor);
+    clearTimeout(watchdog);
     // --- teardown ----------------------------------------------------------
     step('Teardown');
     clearInterval(sampler);
@@ -1820,11 +2621,18 @@ async function main() {
   }
 
   // --- report --------------------------------------------------------------
+  clearInterval(targetMonitor);
+  clearTimeout(watchdog);
   console.log('\n================ SMOKE REPORT ================');
   console.log(`passed : ${passCount}`);
   console.log(`failed : ${failures.length}`);
+  console.log(`skipped: ${skipCount}`);
   for (const msg of failures) console.log(`  FAIL: ${msg}`);
   for (const msg of notes) console.log(`  note: ${msg}`);
+  console.log('--- app stdout (tail) ---');
+  console.log(appStdout.split('\n').slice(-40).join('\n'));
+  console.log('--- app stderr (tail) ---');
+  console.log(appStderr.split('\n').slice(-40).join('\n'));
   console.log('===============================================');
   process.exit(failures.length > 0 ? 1 : 0);
 }
