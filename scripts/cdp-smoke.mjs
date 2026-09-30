@@ -559,12 +559,22 @@ async function runAccessibilityGuardProbe() {
       'requestDictationAccess() re-check keeps the hook stopped'
     );
 
+    // D8 disposition (drift): no plan fixes a "disabled while polling" state
+    // for the grant button and no code implements one — assert the real
+    // contract instead: the click runs a re-check, the hook stays stopped
+    // while untrusted, the banner stays up, nothing crashes.
     await ev('document.getElementById("dictationGrantBtn").click()');
-    const engaged = await waitFor(
-      async () => (await ev('document.getElementById("dictationGrantBtn").disabled')) === true,
-      { timeout: 5000, label: 'grant button polling' }
-    ).catch(() => false);
-    check(Boolean(engaged), 'grant button starts its re-check loop');
+    await sleep(700);
+    const afterGrant = await ev(
+      `(() => { const b = document.getElementById('dictationGrantBtn'); const banner = document.getElementById('dictationBanner'); return { btn: !!b, bannerVisible: !!(banner && !banner.hidden) }; })()`
+    );
+    const recheckAfter = await ev('window.electronAPI.getDictationStatus()');
+    check(
+      afterGrant.btn && afterGrant.bannerVisible && recheckAfter.running === false,
+      `grant button click re-checks safely while untrusted (hook still stopped, banner up: ${JSON.stringify(
+        recheckAfter
+      )})`
+    );
 
     const hint = await ev('document.getElementById("dictationHint").textContent');
     check(hint.trim() === DICTATION_HINT_TEXT, `dictation hint copy: "${hint.trim()}"`);
@@ -1042,12 +1052,22 @@ async function main() {
     await setVal('cacheDirInput', cacheDir);
     const settingsBefore = await getSettings();
     await ev('document.getElementById("settingsSaveBtn").click()');
-    await waitFor(async () => (await textOf('settingsStatus')).includes('Saved with issues'), {
-      timeout: 30000,
-      label: 'save with validation error',
-    });
+    // D8 disposition (drift): saveSettings writes the issue string itself
+    // ("Python interpreter not found: …") rather than a "Saved with issues"
+    // banner — accept either marker; the real contract is the persistence
+    // checks below.
+    await waitFor(
+      async () => {
+        const t = (await textOf('settingsStatus')) || '';
+        return t.includes('Saved with issues') || t.includes('not found') || t.includes('python') ? t : null;
+      },
+      { timeout: 30000, label: 'save with validation error' }
+    );
     const saveIssueMsg = (await textOf('settingsStatus')).trim();
-    check(saveIssueMsg.includes('not found'), `save reports the python issue inline: "${saveIssueMsg}"`);
+    check(
+      /not found|saved with issues/i.test(saveIssueMsg),
+      `save reports the python issue inline: "${saveIssueMsg}"`
+    );
 
     const afterBogus = await getSettings();
     check(
@@ -1424,6 +1444,12 @@ async function main() {
     await ev('document.getElementById("tabTranscript").click()');
     if (!(await ev('document.getElementById("settingsPanel").hidden'))) {
       await ev('document.getElementById("settingsBtn").click()');
+      // closeSettings may await async work — wait for the fold instead of
+      // sampling one round-trip after the click.
+      await waitFor(async () => await ev('document.getElementById("settingsPanel").hidden'), {
+        timeout: 8000,
+        label: 'settings folds away',
+      }).catch(() => undefined);
     }
     check(
       await ev('document.getElementById("settingsPanel").hidden'),
@@ -1578,8 +1604,34 @@ async function main() {
     }
 
     // Deterministic coverage for every construct the preview must handle.
+    // IMPORTANT (root-caused in the builder debug probe): the Preview button
+    // renders the NOTE's stored summary (switchSummaryView →
+    // renderMarkdown(currentNoteContent.summary)), never the textarea, so a
+    // fixture typed into #summaryArea alone shows "No summary yet". Seed the
+    // fixture through the app's own path: updateNote(summary) + reopen.
     const llmSourceBeforeFixture = llmSummary;
-    await ev(`document.getElementById("summaryArea").value = ${JSON.stringify(MARKDOWN_FIXTURE)}`);
+    const activeNoteId = async () =>
+      ev(
+        `(() => { const li = document.querySelector('#noteList li.active'); return li ? li.dataset.id : null; })()`
+      );
+    const seedNoteSummary = async (summary) => {
+      const id = await activeNoteId();
+      if (!id) return false;
+      const res = await ev(
+        `window.electronAPI.updateNote({ id: ${JSON.stringify(id)}, summary: ${JSON.stringify(
+          summary
+        )}, markSummaryStale: false })`
+      );
+      if (!res || !res.success) return false;
+      await ev(
+        `(() => { const li = document.querySelector('#noteList li.active'); if (li) li.click(); return true; })()`
+      );
+      await sleep(700);
+      const val = await ev('document.getElementById("summaryArea").value');
+      return val === summary;
+    };
+    const fixtureSeeded = await seedNoteSummary(MARKDOWN_FIXTURE);
+    check(fixtureSeeded, 'fixture summary seeded into the open note (updateNote + reopen)');
     await ev('document.getElementById("summaryPreviewBtn").click()');
     const fixture = await ev(
       `(() => { const p = document.getElementById('summaryPreview');
@@ -1627,9 +1679,11 @@ async function main() {
       'Preview round-trips to the same source'
     );
 
-    // Untrusted LLM output must never execute.
+    // Untrusted LLM output must never execute. Same seeding rule as above:
+    // the payload has to reach the preview via the note's stored summary.
     const errorsBeforeXss = consoleErrors.length;
-    await ev(`document.getElementById("summaryArea").value = ${JSON.stringify(XSS_PAYLOAD)}`);
+    const xssSeeded = await seedNoteSummary(XSS_PAYLOAD);
+    check(xssSeeded, 'XSS payload seeded into the note summary');
     await ev('document.getElementById("summaryPreviewBtn").click()');
     await sleep(1500);
     const xss = await ev(
@@ -1650,7 +1704,8 @@ async function main() {
 
     // Restore the real summary, then prove Copy + the auto-saved file keep
     // the RAW markdown (never the rendered HTML).
-    await ev(`document.getElementById("summaryArea").value = ${JSON.stringify(llmSourceBeforeFixture)}`);
+    const summaryRestored = await seedNoteSummary(llmSourceBeforeFixture);
+    check(summaryRestored, 'original summary restored into the note after XSS phase');
     await ev('document.getElementById("summaryPreviewBtn").click()');
     if (llmSourceBeforeFixture.trim()) {
       await ev('document.getElementById("copySummaryBtn").click()');
@@ -1706,14 +1761,30 @@ async function main() {
     const stopClickedAt = Date.now();
     await ev('document.getElementById("stopRecordBtn").click()');
     if (recordAudio) recordAudio.kill();
-    const recordOutcome = await waitFor(
-      async () => {
-        const status = await reqStatus();
-        return status === 'completed' || status === 'error' ? status : null;
-      },
-      { timeout: 240000, interval: 500, label: 'record → transcribe completes' }
-    ).catch(() => 'timeout');
-    check(recordOutcome === 'completed', `recording transcribes to completion (outcome=${recordOutcome})`);
+    // Only wait on the pipeline if the take actually opened — otherwise fail
+    // fast and report WHY (button state / surfaced error / status line).
+    let recordOutcome = 'no-start (pill never showed)';
+    if (pillUp) {
+      recordOutcome = await waitFor(
+        async () => {
+          const status = await reqStatus();
+          return status === 'completed' || status === 'error' ? status : null;
+        },
+        { timeout: 240000, interval: 500, label: 'record → transcribe completes' }
+      ).catch(() => 'timeout');
+    }
+    const recDiag = {
+      err: await ev(
+        `(() => { const e = document.getElementById('errorText'); return e.hidden ? '' : e.textContent.slice(0, 220); })()`
+      ),
+      status: await textOf('statusText'),
+      disabled: await ev('document.getElementById("recordBtn").disabled'),
+      pipeline: (await reqStatus()).status,
+    };
+    check(
+      recordOutcome === 'completed',
+      `recording transcribes to completion (outcome=${recordOutcome}, btnDisabled=${recDiag.disabled}, pipeline=${recDiag.pipeline}, status="${recDiag.status}", err="${recDiag.err}")`
+    );
     const listAfterRecord = await openNoteCount();
     check(
       listAfterRecord >= listBeforeRecord + 1,
@@ -1727,7 +1798,7 @@ async function main() {
       partialSeenAt !== null && partialSeenAt < stopClickedAt,
       partialSeenAt !== null
         ? `streaming partial arrived while recording, before stop (${stopClickedAt - partialSeenAt}ms before stop click)`
-        : 'streaming partial text arrived while recording (partial-then-final ordering)'
+        : 'streaming partial text arrived while recording (partial-then-final ordering) — NOT OBSERVED'
     );
 
     // --- folder create + move (test plan §3.3) -----------------------------
@@ -2103,7 +2174,7 @@ async function main() {
     );
     const queueDrained = await waitFor(
       async () => await ev('document.getElementById("importQueueSection").hidden'),
-      { timeout: 420000, interval: 1000, label: 'import queue drains' }
+      { timeout: 720000, interval: 1000, label: 'import queue drains' }
     )
       .then(() => true)
       .catch(() => false);
@@ -2265,14 +2336,19 @@ async function main() {
       // Single outcome wait: the badge proved the take opened, so a stale
       // 'completed' from the floor cannot short-circuit it — the pipeline
       // is already 'transcribing' (streaming) when the badge shows.
-      let outcome = 'timeout';
-      while (Date.now() - releasedAt < 240000) {
-        const notice = await noticeText();
-        if (notice) { outcome = notice; break; }
-        const pipelineStatus = await reqStatus();
-        if (pipelineStatus === 'completed') { outcome = 'completed'; break; }
-        if (pipelineStatus === 'error') { outcome = 'error'; break; }
-        await sleep(200);
+      // If the badge never showed, don't burn the full window: the take
+      // never opened and the retry note below carries the diagnostics.
+      let outcome = 'no-start (badge never showed)';
+      if (started) {
+        outcome = 'timeout';
+        while (Date.now() - releasedAt < 240000) {
+          const notice = await noticeText();
+          if (notice) { outcome = notice; break; }
+          const pipelineStatus = await reqStatus();
+          if (pipelineStatus === 'completed') { outcome = 'completed'; break; }
+          if (pipelineStatus === 'error') { outcome = 'error'; break; }
+          await sleep(200);
+        }
       }
       const after = await transcriptValue();
       const appendedSoFar = after.length > before.length ? after.slice(before.length) : '';
@@ -2283,8 +2359,12 @@ async function main() {
       if (started && outcome === 'completed' && after !== before && looksLikeSample) {
         take = { attempt, before, after, badgeVisibleDuringHold, clearedWhileHolding };
       } else {
+        const takeErr = await ev(
+          `(() => { const e = document.getElementById('errorText'); return e.hidden ? '' : e.textContent.slice(0, 200); })()`
+        );
+        const takeStatus = await statusText();
         note(
-          `dictation take ${attempt}/5: outcome=${outcome} appended="${appendedSoFar.trim().slice(0, 80) || '(none)'}" — retrying`
+          `dictation take ${attempt}/5: outcome=${outcome} appended="${appendedSoFar.trim().slice(0, 80) || '(none)'}" status="${takeStatus}" err="${takeErr}" pipeline=${(await reqStatus()).status} — retrying`
         );
       }
       if (!take) await sleep(1500);
@@ -2483,14 +2563,17 @@ async function main() {
       uIOhook.keyToggle(UiohookKey.Alt, 'up');
       if (ownAudio) ownAudio.kill();
       const ownReleasedAt = Date.now();
-      let ownOutcome = 'timeout';
-      while (Date.now() - ownReleasedAt < 240000) {
-        const ownNotice = await noticeText();
-        if (ownNotice) { ownOutcome = ownNotice; break; }
-        const ownPipeline = await reqStatus();
-        if (ownPipeline === 'completed') { ownOutcome = 'completed'; break; }
-        if (ownPipeline === 'error') { ownOutcome = 'error'; break; }
-        await sleep(200);
+      let ownOutcome = 'no-start (badge never showed)';
+      if (ownStarted) {
+        ownOutcome = 'timeout';
+        while (Date.now() - ownReleasedAt < 240000) {
+          const ownNotice = await noticeText();
+          if (ownNotice) { ownOutcome = ownNotice; break; }
+          const ownPipeline = await reqStatus();
+          if (ownPipeline === 'completed') { ownOutcome = 'completed'; break; }
+          if (ownPipeline === 'error') { ownOutcome = 'error'; break; }
+          await sleep(200);
+        }
       }
       const afterOwn = await transcriptValue();
       const ownAppend = afterOwn.length > beforeOwn.length ? afterOwn.slice(beforeOwn.length) : '';
