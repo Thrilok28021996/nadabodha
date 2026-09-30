@@ -141,7 +141,7 @@ export class TranscriptionAdapter extends EventEmitter {
         bytesTotal: typeof parsed.bytes_total === 'number' ? parsed.bytes_total : undefined,
       };
       this.options.onEvent(event);
-    } catch (err) {
+    } catch {
       this.emit('stderr', `Failed to parse adapter output: ${line}`);
     }
   }

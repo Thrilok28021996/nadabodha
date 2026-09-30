@@ -125,7 +125,7 @@ function serializeFrontmatter(fm: NoteFrontmatter): string {
 
 function yamlString(value: string): string {
   // Wrap in double-quotes when the value contains special chars.
-  if (/[:#\[\]{}&*!|>'"\\%@`\n\r\t]/.test(value) || value.trim() !== value || value === '') {
+  if (/[:#[\]{}&*!|>'"\\%@`\n\r\t]/.test(value) || value.trim() !== value || value === '') {
     return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
   }
   return value;

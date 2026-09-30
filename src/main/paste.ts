@@ -14,7 +14,7 @@ export async function isSecureInputEnabled(): Promise<boolean> {
     // Use ioreg which is fast enough (~100-200ms) and built-in
     const { stdout } = await execAsync('ioreg -l -w 0 | grep -i SecureInput', { timeout: 1000 });
     return stdout.includes('SecureInput');
-  } catch (err) {
+  } catch {
     // grep returns exit code 1 if not found, which throws an error
     return false;
   }
@@ -41,10 +41,12 @@ export async function pasteTextAtCursor(text: string): Promise<'pasted' | 'secur
     return 'own-window';
   }
 
-  // Ensure uiohook is available
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  // Ensure uiohook is available. Required lazily (not at module top level)
+  // so a native-module load failure degrades to a failed paste instead of
+  // taking the Electron main process down — scoped disable, not file-wide.
   let uIOhook;
   try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require('uiohook-napi');
     uIOhook = mod.uIOhook;
   } catch {
