@@ -88,6 +88,15 @@ export interface TranscriptionEvent {
   saveError?: string;
   // Word level timestamps
   words?: {word: string, start: number, end: number}[];
+  /** D3: system-audio (catap) capture failed; the mic recording continues. */
+  meetingError?: string;
+  /**
+   * D4: run token stamped by main onto every event of an in-flight
+   * re-transcribe. The renderer routes completions by this note id, so a
+   * completion can never land on a different note.
+   */
+  reTranscribeNoteId?: string;
+  reTranscribeRunId?: number;
 }
 
 export interface StartRecordingRequest {
@@ -269,4 +278,6 @@ export interface ReTranscribeRequest {
 export interface ReTranscribeResult {
   started: boolean;
   error?: string;
+  /** D4: token identifying this run (present when started). */
+  runId?: number;
 }

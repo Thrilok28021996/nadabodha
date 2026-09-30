@@ -28,9 +28,11 @@ jest.mock('uiohook-napi', () => {
   return { uIOhook: hook };
 });
 
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { BrowserWindow, ipcMain, systemPreferences } from 'electron';
 import { EventEmitter } from 'events';
-// @ts-ignore: native module unavailable in test env
 import { uIOhook } from 'uiohook-napi';
 import { AudioRecorder } from './audioRecorder';
 import { setupIpcHandlers } from './ipcHandlers';
@@ -290,5 +292,160 @@ describe('hook failure with a take open (MEDIUM-2)', () => {
     expect(recorderStatus).toBe('idle');
     expect(transcriptionService.startTranscription).not.toHaveBeenCalled();
     expect(dictation?.isRunning()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D4 — re-transcribe concurrency and completion routing
+// ---------------------------------------------------------------------------
+
+describe('Re-transcribe run token (D4)', () => {
+  let audioDir = '';
+  let audioA = '';
+  let audioB = '';
+
+  type Listener = (event: Record<string, unknown>) => Promise<void> | void;
+
+  function runListener(): Listener {
+    const calls = transcriptionService.onEvent.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    return calls[calls.length - 1][0] as Listener;
+  }
+
+  function reTranscribe(noteId: string): Promise<{ started: boolean; error?: string; runId?: number }> {
+    return handlerFor(IpcChannel.ReTranscribe)({}, { noteId }) as Promise<{
+      started: boolean;
+      error?: string;
+      runId?: number;
+    }>;
+  }
+
+  beforeEach(() => {
+    audioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nadabodha-d4-'));
+    audioA = path.join(audioDir, 'note-a.wav');
+    audioB = path.join(audioDir, 'note-b.wav');
+    fs.writeFileSync(audioA, 'RIFFfake-a');
+    fs.writeFileSync(audioB, 'RIFFfake-b');
+    // The shared settings mock is minimal; the completed-event listener
+    // reads llm fields unconditionally (prod settings always have them).
+    settings = {
+      dictationEnabled: true,
+      summarizationEnabled: false,
+      autoSummarize: false,
+      llmBaseUrl: '',
+      llmModel: '',
+      dataDir: '',
+    };
+    mockNoteStore.get.mockImplementation((id: string) => ({
+      id,
+      title: `note ${id}`,
+      created: new Date('2026-01-01T00:00:00Z'),
+      source: 'recording',
+      folder: '',
+      duration: 1,
+      model: 'model-x',
+      audio: id === 'noteA' ? audioA : audioB,
+      summaryStale: false,
+    }));
+  });
+
+  afterEach(() => {
+    if (audioDir) fs.rmSync(audioDir, { recursive: true, force: true });
+  });
+
+  it('rejects a second re-transcribe while one is in flight; routing never crosses', async () => {
+    setup(true);
+    const listener = runListener();
+
+    const first = await reTranscribe('noteA');
+    expect(first.started).toBe(true);
+    expect(first.runId).toBe(1);
+    expect(transcriptionService.startTranscription).toHaveBeenCalledTimes(1);
+    expect(transcriptionService.startTranscription).toHaveBeenCalledWith(audioA, {
+      origin: 'transcription',
+    });
+
+    // A is in flight: B must be rejected, never queued behind A's back.
+    const second = await reTranscribe('noteB');
+    expect(second.started).toBe(false);
+    expect(second.error).toMatch(/already in progress/i);
+    expect(transcriptionService.startTranscription).toHaveBeenCalledTimes(1);
+
+    // A's completion still carries A's token — the slot cannot cross to B.
+    await listener({ status: 'completed', text: 'transcript for A' });
+    const completed = sentEvents.find((e) => e.status === 'completed');
+    expect(completed).toBeDefined();
+    expect(completed?.reTranscribeNoteId).toBe('noteA');
+    expect(completed?.reTranscribeRunId).toBe(1);
+    expect(completed?.text).toBe('transcript for A');
+    // Routing happens in the renderer via the token; main never rewrites
+    // the note itself.
+    expect(mockNoteStore.update).not.toHaveBeenCalled();
+  });
+
+  it('routes the completion to the originating note and frees the run after', async () => {
+    setup(true);
+    const listener = runListener();
+
+    const started = await reTranscribe('noteA');
+    expect(started.started).toBe(true);
+
+    await listener({ status: 'transcribing', progress: 50 });
+    await listener({ status: 'completed', text: 'fresh words', origin: 'transcription' });
+
+    const completed = sentEvents.find((e) => e.status === 'completed');
+    expect(completed?.reTranscribeNoteId).toBe('noteA');
+    expect(completed?.reTranscribeRunId).toBe(started.runId);
+
+    // Terminal event cleared the run: a later re-transcribe starts with a
+    // new token instead of being locked out forever.
+    const again = await reTranscribe('noteB');
+    expect(again.started).toBe(true);
+    expect(again.runId).toBe(2);
+    expect(transcriptionService.startTranscription).toHaveBeenLastCalledWith(audioB, {
+      origin: 'transcription',
+    });
+  });
+
+  it('failure path never writes the note — the old transcript stays byte-identical', async () => {
+    setup(true);
+    const listener = runListener();
+
+    const started = await reTranscribe('noteA');
+    expect(started.started).toBe(true);
+
+    // Adapter dies mid-run: the renderer gets a stamped error, never a
+    // completed event, and no note write happens anywhere in main.
+    await listener({ status: 'error', error: 'adapter died', origin: 'transcription' });
+
+    const errored = sentEvents.find((e) => e.status === 'error');
+    expect(errored?.error).toBe('adapter died');
+    expect(errored?.reTranscribeNoteId).toBe('noteA');
+    expect(sentEvents.some((e) => e.status === 'completed')).toBe(false);
+    expect(mockNoteStore.update).not.toHaveBeenCalled();
+    expect(mockNoteStore.create).not.toHaveBeenCalled();
+
+    // The run is over: the next request is allowed (no permanent lock).
+    const again = await reTranscribe('noteB');
+    expect(again.started).toBe(true);
+    expect(again.runId).toBe(2);
+  });
+
+  it('converts a throwing startTranscribe into started:false and frees the run', async () => {
+    setup(true);
+    transcriptionService.startTranscription.mockImplementationOnce(() => {
+      throw new Error('Cannot start transcription while in state transcribing');
+    });
+
+    const result = await reTranscribe('noteA');
+    expect(result.started).toBe(false);
+    expect(result.error).toContain('Cannot start transcription');
+
+    // The failed attempt must not leave a phantom run behind: the next
+    // request starts and receives a fresh, distinct token.
+    const second = await reTranscribe('noteA');
+    expect(second.started).toBe(true);
+    expect(typeof second.runId).toBe('number');
+    expect(transcriptionService.startTranscription).toHaveBeenCalledTimes(2);
   });
 });

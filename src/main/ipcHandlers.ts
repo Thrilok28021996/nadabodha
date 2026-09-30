@@ -23,7 +23,12 @@ import {
 } from '../shared/ipc';
 import { isSupportedAudioFile } from '../shared/audioFormats';
 import { AudioRecorder } from './audioRecorder';
-import { ensureMicrophonePermission, MICROPHONE_DENIED_MESSAGE } from './micPermission';
+import {
+  ensureMicrophonePermission,
+  ensureScreenPermission,
+  MICROPHONE_DENIED_MESSAGE,
+  SCREEN_DENIED_MESSAGE,
+} from './micPermission';
 import { TranscriptionService } from './transcriptionService';
 import { saveTranscript } from './exportText';
 import { SettingsStore, resolvePythonExecutable, validatePythonInterpreter } from './settingsStore';
@@ -126,6 +131,40 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
 
   const importQueue = new ImportQueue(transcriptionService);
   let watchFolder: WatchFolder | null = null;
+
+  // ---- Re-transcribe run bookkeeping (D4) ---------------------------------
+  // At most one re-transcribe may be in flight. The note id is stamped onto
+  // every event the run produces, so the renderer routes the completion by
+  // the token this process issued — the renderer's single slot can never
+  // cross notes, even if it is overwritten. The run clears itself on the
+  // terminal status of the run it belongs to.
+  let reTranscribeRun: { noteId: string; runId: number } | null = null;
+  let reTranscribeRunSeq = 0;
+
+  const stampReTranscribe = (event: TranscriptionEvent): TranscriptionEvent => {
+    if (
+      !reTranscribeRun ||
+      event.origin === 'download' ||
+      event.origin === 'summary' ||
+      event.origin === 'dictation'
+    ) {
+      return event;
+    }
+    const stamped: TranscriptionEvent = {
+      ...event,
+      reTranscribeNoteId: reTranscribeRun.noteId,
+      reTranscribeRunId: reTranscribeRun.runId,
+    };
+    if (
+      event.status === 'completed' ||
+      event.status === 'error' ||
+      event.status === 'cancelled' ||
+      event.status === 'idle'
+    ) {
+      reTranscribeRun = null;
+    }
+    return stamped;
+  };
 
   importQueue.onEvent = (queue) => {
     if (!mainWindow.isDestroyed()) {
@@ -359,7 +398,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
 
   // ---- Transcription events (autosave + auto-summary) ------------------------
 
-  transcriptionService.onEvent(async (event) => {
+  transcriptionService.onEvent(async (rawEvent) => {
+    // D4: stamp the re-transcribe run token before anything else sees the
+    // event, and clear the run on its terminal status.
+    const event = stampReTranscribe(rawEvent);
     if (event.origin === 'download' || event.origin === 'summary') {
       emit(event);
       return;
@@ -442,7 +484,6 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     }
     
     if (request?.meetingMode) {
-      const { ensureScreenPermission, SCREEN_DENIED_MESSAGE } = require('./micPermission');
       const screenPerm = await ensureScreenPermission();
       if (!screenPerm.granted) {
         emit({ status: 'error', error: SCREEN_DENIED_MESSAGE });
@@ -771,6 +812,14 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     emit({ status: 'error', error: err.message });
   });
 
+  // D3: a failed system-audio (catap) spawn degrades meeting capture to
+  // mic-only. It is NOT a recorder failure: the mic keeps recording, so the
+  // event must not tear down the recording UI — the renderer shows it in
+  // the status bar while the pill stays up.
+  recorder.on('meeting-error', (message: string) => {
+    emit({ status: 'recording', meetingError: message });
+  });
+
   // Start (or deliberately skip) the global Option hook now that every
   // dependency exists.
   applyDictationSetting();
@@ -873,6 +922,22 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       if (!req || typeof req.noteId !== 'string') {
         return { started: false, error: 'noteId is required' };
       }
+      // D4: never run two re-transcribes (or a re-transcribe over any other
+      // transcription/recording) concurrently — a second request while one
+      // is in flight is rejected, so completion routing keyed to the run's
+      // note can never cross notes even if the renderer's slot is stale.
+      const state = transcriptionService.getState();
+      if (
+        reTranscribeRun ||
+        state === 'transcribing' ||
+        state === 'recording' ||
+        recorder.getState().status === 'recording'
+      ) {
+        return {
+          started: false,
+          error: 'A transcription is already in progress — wait for it to finish before re-transcribing',
+        };
+      }
       const record = noteStore.get(req.noteId);
       if (!record) {
         return { started: false, error: `Note not found: ${req.noteId}` };
@@ -883,15 +948,20 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       if (!fs.existsSync(record.audio)) {
         return { started: false, error: `Audio file missing: ${record.audio}` };
       }
-      // Re-transcribe uses the same pipeline but with a note-scoped callback
-      // that updates the note on completion (replacing the old transcript only
-      // on success; on failure/cancel the previous transcript stays intact).
-      transcriptionService.startTranscription(record.audio, { origin: 'transcription' });
-      // The transcription completion event fires through the existing
-      // transcriptionService.onEvent handler and emits to the renderer; the
-      // renderer is responsible for calling UpdateNote once it receives the
-      // completed event and associates it with this note.
-      return { started: true };
+      // Re-transcribe uses the same pipeline; the run token stamped onto its
+      // events (stampReTranscribe) is what routes the completion back to
+      // THIS note. Replace-on-success only: on failure/cancel the renderer
+      // never receives a completed event, so the previous transcript stays
+      // byte-identical.
+      const runId = ++reTranscribeRunSeq;
+      reTranscribeRun = { noteId: req.noteId, runId };
+      try {
+        transcriptionService.startTranscription(record.audio, { origin: 'transcription' });
+      } catch (err) {
+        reTranscribeRun = null;
+        return { started: false, error: describeError(err) };
+      }
+      return { started: true, runId };
     }
   );
 

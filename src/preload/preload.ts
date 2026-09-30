@@ -255,7 +255,7 @@ export interface ElectronApi {
   readNoteContent: (id: string) => Promise<NoteGetResult>;
   listFolders: () => Promise<{ folders: string[]; counts: Record<string, number> }>;
   searchNotes: (query: string) => Promise<NoteListResult>;
-  reTranscribe: (noteId: string) => Promise<{ started: boolean; error?: string }>;
+  reTranscribe: (noteId: string) => Promise<{ started: boolean; error?: string; runId?: number }>;
   // Stage 5
   pickWatchFolder: () => Promise<string | null>;
   enqueueImports: (filePaths: string[]) => Promise<string[]>;
