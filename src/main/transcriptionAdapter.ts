@@ -118,6 +118,27 @@ function buildChildEnv(): NodeJS.ProcessEnv {
   };
 }
 
+export function resolveDefaultPythonScriptPath(): string {
+  if (process.resourcesPath) {
+    const candidate = path.join(process.resourcesPath, 'python', 'nadabodha_transcribe.py');
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  const defaultPath = path.join(__dirname, '../../python/nadabodha_transcribe.py');
+  if (fs.existsSync(defaultPath)) {
+    return defaultPath;
+  }
+
+  const unpacked = defaultPath.replace('app.asar', 'app.asar.unpacked');
+  if (fs.existsSync(unpacked)) {
+    return unpacked;
+  }
+
+  return defaultPath;
+}
+
 /**
  * Manages the Python subprocess that performs local transcription.
  * Communicates over JSON lines on stdout.
@@ -140,7 +161,7 @@ export class TranscriptionAdapter extends EventEmitter {
     const python = this.options.pythonExecutable || 'python3';
     const script =
       this.options.pythonScriptPath ||
-      path.join(__dirname, '../../python/nadabodha_transcribe.py');
+      resolveDefaultPythonScriptPath();
 
     this.process = spawn(python, [script, '--server'], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -188,7 +209,7 @@ export class TranscriptionAdapter extends EventEmitter {
     const python = this.options.pythonExecutable || 'python3';
     const script =
       this.options.pythonScriptPath ||
-      path.join(__dirname, '../../python/nadabodha_transcribe.py');
+      resolveDefaultPythonScriptPath();
 
     this.process = spawn(python, [script, '--stream', '--repo_id', repoId, '--cache_dir', cacheDir], {
       stdio: ['pipe', 'pipe', 'pipe'],

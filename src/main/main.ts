@@ -1,5 +1,6 @@
 import { app, BrowserWindow, globalShortcut, nativeImage } from 'electron';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { setupIpcHandlers } from './ipcHandlers';
 import { AudioRecorder } from './audioRecorder';
@@ -8,6 +9,28 @@ import { SettingsStore, resolvePythonExecutable, settingsFilePath } from './sett
 import { NoteStore } from './noteStore';
 
 app.setName('Nadabodha');
+
+// When launched from Finder or the Dock on macOS, the environment lacks
+// shell RC paths. Augment PATH with common directories so tools like ffmpeg
+// and catap are available out-of-the-box.
+function fixPath(): void {
+  if (process.platform !== 'darwin') return;
+  const commonPaths = [
+    '/opt/homebrew/bin',
+    '/opt/homebrew/sbin',
+    '/usr/local/bin',
+    '/Volumes/personal/conda_envs/misc/bin',
+    path.join(os.homedir(), 'miniconda3', 'bin'),
+    path.join(os.homedir(), 'anaconda3', 'bin'),
+    path.join(os.homedir(), '.local', 'bin'),
+  ];
+  const existing = (process.env.PATH || '').split(path.delimiter);
+  const toAdd = commonPaths.filter((p) => fs.existsSync(p) && !existing.includes(p));
+  if (toAdd.length > 0) {
+    process.env.PATH = [...toAdd, ...existing].join(path.delimiter);
+  }
+}
+fixPath();
 
 // Suppress benign EPIPE errors from child process stream closures so they don't trigger
 // unhandled exception dialogs.
@@ -23,6 +46,13 @@ let mainWindow: BrowserWindow | null = null;
 
 function resolveAppIcon(): string | undefined {
   const candidates = [
+    ...(process.resourcesPath
+      ? [
+          path.join(process.resourcesPath, 'assets', 'icon.png'),
+          path.join(process.resourcesPath, 'assets', 'icon.icns'),
+          path.join(process.resourcesPath, 'dist', 'assets', 'icon.png'),
+        ]
+      : []),
     path.join(__dirname, '../assets/icon.png'),
     path.join(__dirname, '../../assets/icon.png'),
     path.join(app.getAppPath(), 'assets/icon.png'),
