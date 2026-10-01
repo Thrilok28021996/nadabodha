@@ -242,9 +242,9 @@ export interface ElectronApi {
   testLlmConnection: (baseUrl?: string) => Promise<LlmConnectionResult>;
   listHfModels: (query?: string) => Promise<HfModelListResult>;
   downloadModel: (repoId: string) => Promise<{ started: boolean; error?: string }>;
-  cancelDownload: () => Promise<{ cancelled: boolean }>;
-  summarize: (text?: string) => Promise<{ started: boolean; error?: string }>;
-  cancelSummary: () => Promise<{ cancelled: boolean }>;
+  summarize: (
+    opts?: { text?: string; promptId?: string; template?: string } | string
+  ) => Promise<{ started: boolean; error?: string }>;
   // Dictation (hold Option)
   getDictationStatus: () => Promise<DictationStatusInfo>;
   requestDictationAccess: () => Promise<DictationStatusInfo>;
@@ -301,9 +301,11 @@ const api: ElectronApi = {
   testLlmConnection: (baseUrl) => ipcRenderer.invoke(IpcChannel.TestLlmConnection, baseUrl),
   listHfModels: (query) => ipcRenderer.invoke(IpcChannel.ListHfModels, query),
   downloadModel: (repoId) => ipcRenderer.invoke(IpcChannel.DownloadModel, repoId),
-  cancelDownload: () => ipcRenderer.invoke(IpcChannel.CancelDownload),
-  summarize: (text) => ipcRenderer.invoke(IpcChannel.Summarize, { text }),
-  cancelSummary: () => ipcRenderer.invoke(IpcChannel.CancelSummary),
+  summarize: (opts) =>
+    ipcRenderer.invoke(
+      IpcChannel.Summarize,
+      typeof opts === 'string' ? { text: opts } : opts
+    ),
   getDictationStatus: () => ipcRenderer.invoke(IpcChannel.DictationStatus),
   requestDictationAccess: () => ipcRenderer.invoke(IpcChannel.DictationRequestAccess),
   listNotes: () => ipcRenderer.invoke(IpcChannel.ListNotes),

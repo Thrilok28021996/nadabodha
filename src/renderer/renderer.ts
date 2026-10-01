@@ -89,6 +89,15 @@ interface AppSettings {
   dictationPasteEnabled?: boolean;
   meetingModeEnabled?: boolean;
   watchFolderDir?: string;
+  customPrompts?: CustomPrompt[];
+  defaultPromptId?: string;
+}
+interface CustomPrompt {
+  id: string;
+  name: string;
+  description?: string;
+  template: string;
+  isBuiltIn?: boolean;
 }
 interface DictationStatusInfo { supported: boolean; enabled: boolean; accessibilityTrusted: boolean; running: boolean; reason?: string; }
 interface HfModelInfo { id: string; downloads: number; pipelineTag: string | null; tags: string[]; kind: string; reason?: string; format: string; }
@@ -133,7 +142,7 @@ interface ElectronAPI {
   listHfModels(q?: string): Promise<HfModelListResult>;
   downloadModel(id: string): Promise<{ started: boolean; error?: string }>;
   cancelDownload(): Promise<{ cancelled: boolean }>;
-  summarize(text?: string): Promise<{ started: boolean; error?: string }>;
+  summarize(opts?: { text?: string; promptId?: string; template?: string } | string): Promise<{ started: boolean; error?: string }>;
   cancelSummary(): Promise<{ cancelled: boolean }>;
   getDictationStatus(): Promise<DictationStatusInfo>;
   requestDictationAccess(): Promise<DictationStatusInfo>;
@@ -217,6 +226,8 @@ const saveBtn           = document.getElementById('saveBtn') as HTMLButtonElemen
 const saveSrtBtn        = document.getElementById('saveSrtBtn') as HTMLButtonElement;
 const saveVttBtn        = document.getElementById('saveVttBtn') as HTMLButtonElement;
 const summarizeBtn      = document.getElementById('summarizeBtn') as HTMLButtonElement;
+const summaryPromptSelect = document.getElementById('summaryPromptSelect') as HTMLSelectElement;
+const summaryActionGroup  = document.getElementById('summaryActionGroup') as HTMLDivElement;
 const cancelSummaryBtn  = document.getElementById('cancelSummaryBtn') as HTMLButtonElement;
 const summaryRawBtn     = document.getElementById('summaryRawBtn') as HTMLButtonElement;
 const summaryPreviewBtn = document.getElementById('summaryPreviewBtn') as HTMLButtonElement;
@@ -259,7 +270,15 @@ const cacheDirBrowseBtn = document.getElementById('cacheDirBrowseBtn') as HTMLBu
 const cacheDirStatus    = document.getElementById('cacheDirStatus') as HTMLParagraphElement;
 const summarizeEnabledChk = document.getElementById('summarizeEnabledChk') as HTMLInputElement;
 const autoSummarizeChk  = document.getElementById('autoSummarizeChk') as HTMLInputElement;
-const promptPathStatus  = document.getElementById('promptPathStatus') as HTMLParagraphElement;
+const promptPurposeSelect = document.getElementById('promptPurposeSelect') as HTMLSelectElement;
+const promptSetDefaultBtn = document.getElementById('promptSetDefaultBtn') as HTMLButtonElement;
+const promptNewBtn        = document.getElementById('promptNewBtn') as HTMLButtonElement;
+const promptResetBtn      = document.getElementById('promptResetBtn') as HTMLButtonElement;
+const promptDeleteBtn     = document.getElementById('promptDeleteBtn') as HTMLButtonElement;
+const promptNameInput     = document.getElementById('promptNameInput') as HTMLInputElement;
+const promptDescInput     = document.getElementById('promptDescInput') as HTMLInputElement;
+const promptTemplateArea  = document.getElementById('promptTemplateArea') as HTMLTextAreaElement;
+const promptEditorStatus  = document.getElementById('promptEditorStatus') as HTMLParagraphElement;
 const sttActiveModelStatus = document.getElementById('sttActiveModelStatus') as HTMLParagraphElement;
 const hfSearchInput     = document.getElementById('hfSearchInput') as HTMLInputElement;
 const hfSearchBtn       = document.getElementById('hfSearchBtn') as HTMLButtonElement;
@@ -557,6 +576,7 @@ async function openNote(id: string): Promise<void> {
 
     // Summarize button: enable if there's a transcript
     summarizeBtn.disabled = !currentNoteContent.transcript;
+    if (summaryPromptSelect) summaryPromptSelect.disabled = !currentNoteContent.transcript;
 
     // Status bar: show transcription status if relevant
     updateStatusBar({ status: 'idle' });
@@ -872,6 +892,7 @@ async function handleTranscriptionCompleted(text: string, event: TranscriptionEv
   saveSrtBtn.disabled = !text;
   saveVttBtn.disabled = !text;
   summarizeBtn.disabled = !text;
+  if (summaryPromptSelect) summaryPromptSelect.disabled = !text;
 
   // Scroll back to idle after a brief moment
   setTimeout(() => updateStatusBar({ status: 'idle' }), 2000);
@@ -924,10 +945,12 @@ function handleSummaryEvent(event: TranscriptionEvent): void {
     setHint(summaryStatus, progress != null ? `Summarizing… ${progress}%` : 'Summarizing…');
     cancelSummaryBtn.hidden = false;
     summarizeBtn.hidden = true;
+    if (summaryPromptSelect) summaryPromptSelect.disabled = true;
   } else if (status === 'completed' && text) {
     setHint(summaryStatus, '');
     cancelSummaryBtn.hidden = true;
     summarizeBtn.hidden = false;
+    if (summaryPromptSelect) summaryPromptSelect.disabled = false;
     currentNoteContent.summary = text;
     summaryArea.value = text;
     copySummaryBtn.disabled = false;
@@ -947,11 +970,13 @@ function handleSummaryEvent(event: TranscriptionEvent): void {
     setHint(summaryStatus, 'Summary cancelled.');
     cancelSummaryBtn.hidden = true;
     summarizeBtn.hidden = false;
+    if (summaryPromptSelect) summaryPromptSelect.disabled = false;
   } else if (status === 'error') {
     setHint(summaryError, error || 'Summary failed');
     summaryError.hidden = false;
     cancelSummaryBtn.hidden = true;
     summarizeBtn.hidden = false;
+    if (summaryPromptSelect) summaryPromptSelect.disabled = false;
   }
 }
 
@@ -1005,6 +1030,314 @@ function switchSummaryView(view: SummaryView): void {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt Purposes & Customization
+// ---------------------------------------------------------------------------
+
+const BUILTIN_PROMPTS: CustomPrompt[] = [
+  {
+    id: 'general',
+    name: 'General Summary',
+    description: 'Overview, key points, and action items',
+    isBuiltIn: true,
+    template: `# Summarization prompt
+
+You are a careful assistant summarizing a speech-to-text transcript.
+Write in the same language as the transcript.
+
+Answer with valid Markdown only, using exactly these sections:
+
+## Overview
+One paragraph summarizing what was said.
+
+## Key points
+- A short bullet list of the most important points.
+
+## Action items
+- A bullet list of things to do. Give each item an owner when one was mentioned in the transcript, otherwise write "-".
+
+Rules:
+- Do not invent facts: only use what the transcript actually says.
+- Keep headings, lists and paragraphs as valid Markdown (## headings, "- " bullets).
+- If the transcript is empty or meaningless, say so in the Overview.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'meeting-minutes',
+    name: 'Meeting Minutes',
+    description: 'Decisions made, discussion points, action items table',
+    isBuiltIn: true,
+    template: `# Meeting Minutes
+
+You are an assistant recording formal meeting minutes from this transcript.
+Write in the same language as the transcript.
+
+Answer with valid Markdown only:
+
+## Meeting Overview & Goals
+Brief summary of the meeting context and core purpose.
+
+## Decisions Made
+- Key decisions agreed upon by the participants.
+
+## Key Discussion Points
+- Significant topics, alternatives considered, and consensus reached.
+
+## Action Items
+| Task | Assignee | Deadline / Notes |
+| --- | --- | --- |
+| Description | Name or "-" | Date or "-" |
+
+## Next Steps
+- Follow-ups or topics tabled for future discussion.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'executive-brief',
+    name: 'Executive Brief',
+    description: 'High-level TL;DR, strategic implications, bottom line',
+    isBuiltIn: true,
+    template: `# Executive Brief
+
+Provide an executive-level briefing of the following transcript. Be concise, strategic, and direct.
+
+Answer with valid Markdown only:
+
+## Executive Summary (TL;DR)
+A 2-3 sentence high-impact summary of what transpired and the key outcome.
+
+## Strategic Implications & Takeaways
+- Key impact points
+- Risks, opportunities, or trade-offs mentioned
+
+## Bottom Line & Immediate Decisions
+- What needs immediate attention, approval, or follow-up.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'action-items',
+    name: 'Action Items & Tasks',
+    description: 'Extracted task list with assignees, priorities, and deadlines',
+    isBuiltIn: true,
+    template: `# Action Items & Tasks
+
+Extract all tasks, action items, commitments, and deadlines from this transcript.
+
+Answer with valid Markdown only:
+
+## Immediate / Urgent Tasks
+- [ ] Task description — **Owner**: Name (or "-")
+
+## General Action Items
+- [ ] Task description — **Owner**: Name (or "-")
+
+## Ideas & Future Considerations
+- Items mentioned to look into or explore later.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'clean-notes',
+    name: 'Clean Transcript & Notes',
+    description: 'Polished prose removing filler words, organized into clear notes',
+    isBuiltIn: true,
+    template: `# Clean Notes & Polished Transcript
+
+Clean up and structure the following raw speech transcript into clear, professional, well-formatted notes.
+
+Rules:
+- Remove filler words (um, uh, like, you know), false starts, and stuttering.
+- Fix grammar, punctuation, and capitalization without altering the speaker's original meaning or voice.
+- Organize the thoughts into logical paragraphs and bullet points with clear subheadings.
+- Preserve any technical terms, names, and numbers accurately.
+
+Transcript:
+{{transcript}}
+`,
+  },
+];
+
+let editingPrompts: CustomPrompt[] = [];
+let editingDefaultPromptId = 'general';
+let selectedPromptToEdit = 'general';
+
+function updateSummaryPromptDropdown(): void {
+  if (!summaryPromptSelect) return;
+  const prompts = (currentSettings && currentSettings.customPrompts && currentSettings.customPrompts.length > 0)
+    ? currentSettings.customPrompts
+    : BUILTIN_PROMPTS;
+  const defaultId = currentSettings?.defaultPromptId || 'general';
+
+  const prevVal = summaryPromptSelect.value;
+  summaryPromptSelect.innerHTML = '';
+  for (const p of prompts) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.id === defaultId ? `${p.name} (Default)` : p.name;
+    summaryPromptSelect.appendChild(opt);
+  }
+  if (prevVal && prompts.some(p => p.id === prevVal)) {
+    summaryPromptSelect.value = prevVal;
+  } else {
+    summaryPromptSelect.value = defaultId;
+  }
+}
+
+function syncActivePromptFromInputs(): void {
+  if (!selectedPromptToEdit) return;
+  const p = editingPrompts.find(item => item.id === selectedPromptToEdit);
+  if (!p) return;
+  if (promptNameInput) p.name = promptNameInput.value.trim() || p.name;
+  if (promptDescInput) p.description = promptDescInput.value.trim();
+  if (promptTemplateArea) p.template = promptTemplateArea.value;
+}
+
+function renderPromptEditor(): void {
+  if (!promptPurposeSelect) return;
+
+  if (editingPrompts.length === 0) {
+    editingPrompts = BUILTIN_PROMPTS.map(p => ({ ...p }));
+  }
+  if (!editingPrompts.some(p => p.id === editingDefaultPromptId)) {
+    editingDefaultPromptId = editingPrompts[0].id;
+  }
+  if (!editingPrompts.some(p => p.id === selectedPromptToEdit)) {
+    selectedPromptToEdit = editingDefaultPromptId;
+  }
+
+  promptPurposeSelect.innerHTML = '';
+  for (const p of editingPrompts) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = p.id === editingDefaultPromptId ? `★ ${p.name} (Default)` : p.name;
+    promptPurposeSelect.appendChild(opt);
+  }
+  promptPurposeSelect.value = selectedPromptToEdit;
+
+  const current = editingPrompts.find(p => p.id === selectedPromptToEdit);
+  if (!current) return;
+
+  if (promptNameInput) promptNameInput.value = current.name;
+  if (promptDescInput) promptDescInput.value = current.description || '';
+  if (promptTemplateArea) promptTemplateArea.value = current.template;
+
+  const isDefault = current.id === editingDefaultPromptId;
+  if (promptSetDefaultBtn) {
+    promptSetDefaultBtn.disabled = isDefault;
+    promptSetDefaultBtn.textContent = isDefault ? '✓ Default' : '★ Set as Default';
+  }
+  if (promptResetBtn) {
+    promptResetBtn.style.display = current.isBuiltIn ? 'inline-block' : 'none';
+  }
+  if (promptDeleteBtn) {
+    promptDeleteBtn.style.display = current.isBuiltIn ? 'none' : 'inline-block';
+  }
+}
+
+if (promptPurposeSelect) {
+  promptPurposeSelect.addEventListener('change', () => {
+    syncActivePromptFromInputs();
+    selectedPromptToEdit = promptPurposeSelect.value;
+    renderPromptEditor();
+  });
+}
+
+if (promptNameInput) {
+  promptNameInput.addEventListener('input', () => {
+    const p = editingPrompts.find(item => item.id === selectedPromptToEdit);
+    if (p) {
+      p.name = promptNameInput.value;
+      const opt = promptPurposeSelect.querySelector(`option[value="${p.id}"]`);
+      if (opt) {
+        opt.textContent = p.id === editingDefaultPromptId ? `★ ${p.name || 'Untitled'} (Default)` : (p.name || 'Untitled');
+      }
+    }
+  });
+}
+
+if (promptDescInput) {
+  promptDescInput.addEventListener('input', () => {
+    const p = editingPrompts.find(item => item.id === selectedPromptToEdit);
+    if (p) p.description = promptDescInput.value;
+  });
+}
+
+if (promptTemplateArea) {
+  promptTemplateArea.addEventListener('input', () => {
+    const p = editingPrompts.find(item => item.id === selectedPromptToEdit);
+    if (p) p.template = promptTemplateArea.value;
+  });
+}
+
+if (promptSetDefaultBtn) {
+  promptSetDefaultBtn.addEventListener('click', () => {
+    editingDefaultPromptId = selectedPromptToEdit;
+    renderPromptEditor();
+    if (promptEditorStatus) setHint(promptEditorStatus, 'Set as default summarization purpose.', 'ok');
+  });
+}
+
+if (promptNewBtn) {
+  promptNewBtn.addEventListener('click', () => {
+    syncActivePromptFromInputs();
+    const id = 'custom-' + Date.now().toString(36);
+    const newPrompt: CustomPrompt = {
+      id,
+      name: 'Custom Purpose',
+      description: 'Custom summarization prompt',
+      template: `Summarize the following transcript:\n\nTranscript:\n{{transcript}}\n`,
+      isBuiltIn: false,
+    };
+    editingPrompts.push(newPrompt);
+    selectedPromptToEdit = id;
+    renderPromptEditor();
+    if (promptNameInput) {
+      promptNameInput.focus();
+      promptNameInput.select();
+    }
+    if (promptEditorStatus) setHint(promptEditorStatus, 'Created new purpose. Click Save Settings to persist.', 'info');
+  });
+}
+
+if (promptDeleteBtn) {
+  promptDeleteBtn.addEventListener('click', () => {
+    const p = editingPrompts.find(item => item.id === selectedPromptToEdit);
+    if (!p || p.isBuiltIn) return;
+    editingPrompts = editingPrompts.filter(item => item.id !== selectedPromptToEdit);
+    if (editingDefaultPromptId === selectedPromptToEdit) {
+      editingDefaultPromptId = editingPrompts[0]?.id || 'general';
+    }
+    selectedPromptToEdit = editingDefaultPromptId;
+    renderPromptEditor();
+    if (promptEditorStatus) setHint(promptEditorStatus, 'Custom purpose removed. Click Save Settings to persist.', 'info');
+  });
+}
+
+if (promptResetBtn) {
+  promptResetBtn.addEventListener('click', () => {
+    const original = BUILTIN_PROMPTS.find(p => p.id === selectedPromptToEdit);
+    const p = editingPrompts.find(item => item.id === selectedPromptToEdit);
+    if (original && p) {
+      p.name = original.name;
+      p.description = original.description;
+      p.template = original.template;
+      renderPromptEditor();
+      if (promptEditorStatus) setHint(promptEditorStatus, 'Template reset to built-in default.', 'ok');
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Settings panel
 // ---------------------------------------------------------------------------
 
@@ -1049,6 +1382,15 @@ async function loadSettings(): Promise<void> {
       llmModelSelect.value = savedLlmModel;
     }
 
+    // Prompt templates
+    editingPrompts = (currentSettings.customPrompts && currentSettings.customPrompts.length > 0)
+      ? currentSettings.customPrompts.map(p => ({ ...p }))
+      : BUILTIN_PROMPTS.map(p => ({ ...p }));
+    editingDefaultPromptId = currentSettings.defaultPromptId || 'general';
+    selectedPromptToEdit = editingDefaultPromptId;
+    renderPromptEditor();
+    if (promptEditorStatus) setHint(promptEditorStatus, '');
+
     // Populate STT model cards immediately upon opening settings
     await loadHfModels();
   } catch (err) {
@@ -1059,10 +1401,10 @@ async function loadSettings(): Promise<void> {
 function updateActiveModelDisplay(): void {
   const label = activeModel ? `Active model: ${activeModel}` : 'No STT model selected (using built-in fallback)';
   if (sttActiveModelStatus) setHint(sttActiveModelStatus, label, activeModel ? 'ok' : 'info');
-  if (promptPathStatus) setHint(promptPathStatus, label, activeModel ? 'ok' : 'info');
 }
 
 async function saveSettings(): Promise<void> {
+  syncActivePromptFromInputs();
   const patch: Partial<AppSettings> = {
     pythonPath: pythonPathInput.value.trim(),
     llmBaseUrl: llmBaseUrlInput.value.trim(),
@@ -1076,12 +1418,15 @@ async function saveSettings(): Promise<void> {
     dictationEnabled: (document.getElementById('settingsDictationChk') as HTMLInputElement).checked,
     dictationPasteEnabled: (document.getElementById('dictationPasteChk') as HTMLInputElement).checked,
     meetingModeEnabled: (document.getElementById('meetingModeChk') as HTMLInputElement).checked,
+    customPrompts: editingPrompts,
+    defaultPromptId: editingDefaultPromptId,
   };
   if (activeModel) patch.activeModel = activeModel;
 
   try {
     const result = await api.updateSettings(patch);
     currentSettings = result.settings;
+    updateSummaryPromptDropdown();
     const errors = result.errors || {};
     const hasErrors = Object.keys(errors).length > 0;
     if (hasErrors) {
@@ -1430,7 +1775,8 @@ saveVttBtn.addEventListener('click', async () => {
 
 // Summarize
 summarizeBtn.addEventListener('click', async () => {
-  const result = await api.summarize(transcriptArea.value || undefined);
+  const promptId = summaryPromptSelect ? summaryPromptSelect.value : undefined;
+  const result = await api.summarize({ text: transcriptArea.value || undefined, promptId });
   if (!result.started && result.error) setHint(summaryStatus, result.error, 'error');
   else switchTab('summary');
 });
@@ -1713,6 +2059,7 @@ async function init(): Promise<void> {
     currentSettings = await api.getSettings();
     if (currentSettings) {
       activeModel = currentSettings.activeModel || '';
+      updateSummaryPromptDropdown();
     }
   } catch { /* ignore */ }
 

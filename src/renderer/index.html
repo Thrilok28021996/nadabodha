@@ -178,7 +178,10 @@
           <button id="tabTranscript" type="button" class="tab active" role="tab" aria-selected="true" aria-controls="transcriptPanel">Transcript</button>
           <button id="tabSummary" type="button" class="tab" role="tab" aria-selected="false" aria-controls="summaryPanel">Summary</button>
           <span class="tab-spacer"></span>
-          <button id="summarizeBtn" type="button" class="chip-btn" disabled>Summarize</button>
+          <div id="summaryActionGroup" class="summary-action-group">
+            <select id="summaryPromptSelect" class="chip-select" aria-label="Select prompt purpose" title="Prompt purpose"></select>
+            <button id="summarizeBtn" type="button" class="chip-btn" disabled>Summarize</button>
+          </div>
           <button id="cancelSummaryBtn" type="button" class="chip-btn chip-danger" hidden>Cancel Summary</button>
         </div>
 
@@ -293,6 +296,35 @@
             </label>
           </div>
 
+          <!-- Prompt Templates -->
+          <div class="setting-group" id="promptTemplatesGroup">
+            <h3>Prompt Templates</h3>
+            <p class="setting-desc">Customize prompts for each purpose and choose which one is the default.</p>
+            <div class="setting-row prompt-header-row">
+              <select id="promptPurposeSelect" aria-label="Choose prompt purpose to edit"></select>
+              <button id="promptSetDefaultBtn" type="button" class="chip-btn" title="Set this purpose as default">★ Set as Default</button>
+              <button id="promptNewBtn" type="button" class="chip-btn" title="Add a new custom purpose">+ New</button>
+              <button id="promptResetBtn" type="button" class="chip-btn" title="Reset this built-in template to default">Reset</button>
+              <button id="promptDeleteBtn" type="button" class="chip-btn chip-danger" title="Delete this custom prompt">Delete</button>
+            </div>
+            <div class="setting-row">
+              <span class="setting-sublabel">Purpose Name:</span>
+              <input type="text" id="promptNameInput" placeholder="Purpose name (e.g. Standup Notes)" aria-label="Purpose name">
+            </div>
+            <div class="setting-row">
+              <span class="setting-sublabel">Description:</span>
+              <input type="text" id="promptDescInput" placeholder="Brief description of this purpose" aria-label="Description">
+            </div>
+            <div class="setting-col">
+              <div class="prompt-template-header">
+                <span class="setting-sublabel">Prompt Template:</span>
+                <span class="prompt-hint">Use <code>{{transcript}}</code> for transcript insertion.</span>
+              </div>
+              <textarea id="promptTemplateArea" rows="8" spellcheck="false" class="code-area" aria-label="Prompt template"></textarea>
+            </div>
+            <p id="promptEditorStatus" class="setting-status"></p>
+          </div>
+
           <!-- Local LLM -->
           <div class="setting-group">
             <h3>Local LLM (for summaries)</h3>
@@ -322,7 +354,6 @@
             <label class="toggle-label">
               <input type="checkbox" id="dictationPasteChk"> Paste at cursor (Cmd+V) on release
             </label>
-            <p id="promptPathStatus" class="setting-status"></p>
           </div>
 
           <!-- HF model browser -->

@@ -2,7 +2,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
-import { AppSettings, PythonValidation } from '../shared/ipc';
+import { AppSettings, CustomPrompt, PythonValidation } from '../shared/ipc';
+import { DEFAULT_PROMPT_TEMPLATE } from './autoSave';
 
 /**
  * Settings persistence: a single JSON file at
@@ -13,6 +14,140 @@ import { AppSettings, PythonValidation } from '../shared/ipc';
 export const SETTINGS_FILE_NAME = 'settings.json';
 export const DEFAULT_LLM_BASE_URL = 'http://127.0.0.1:1234/v1';
 
+export const DEFAULT_CUSTOM_PROMPTS: CustomPrompt[] = [
+  {
+    id: 'general',
+    name: 'General Summary',
+    description: 'Overview, key points, and action items',
+    isBuiltIn: true,
+    template: `# Summarization prompt
+
+You are a careful assistant summarizing a speech-to-text transcript.
+Write in the same language as the transcript.
+
+Answer with valid Markdown only, using exactly these sections:
+
+## Overview
+One paragraph summarizing what was said.
+
+## Key points
+- A short bullet list of the most important points.
+
+## Action items
+- A bullet list of things to do. Give each item an owner when one was mentioned in the transcript, otherwise write "-".
+
+Rules:
+- Do not invent facts: only use what the transcript actually says.
+- Keep headings, lists and paragraphs as valid Markdown (## headings, "- " bullets).
+- If the transcript is empty or meaningless, say so in the Overview.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'meeting-minutes',
+    name: 'Meeting Minutes',
+    description: 'Decisions made, discussion points, action items table',
+    isBuiltIn: true,
+    template: `# Meeting Minutes
+
+You are an assistant recording formal meeting minutes from this transcript.
+Write in the same language as the transcript.
+
+Answer with valid Markdown only:
+
+## Meeting Overview & Goals
+Brief summary of the meeting context and core purpose.
+
+## Decisions Made
+- Key decisions agreed upon by the participants.
+
+## Key Discussion Points
+- Significant topics, alternatives considered, and consensus reached.
+
+## Action Items
+| Task | Assignee | Deadline / Notes |
+| --- | --- | --- |
+| Description | Name or "-" | Date or "-" |
+
+## Next Steps
+- Follow-ups or topics tabled for future discussion.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'executive-brief',
+    name: 'Executive Brief',
+    description: 'High-level TL;DR, strategic implications, bottom line',
+    isBuiltIn: true,
+    template: `# Executive Brief
+
+Provide an executive-level briefing of the following transcript. Be concise, strategic, and direct.
+
+Answer with valid Markdown only:
+
+## Executive Summary (TL;DR)
+A 2-3 sentence high-impact summary of what transpired and the key outcome.
+
+## Strategic Implications & Takeaways
+- Key impact points
+- Risks, opportunities, or trade-offs mentioned
+
+## Bottom Line & Immediate Decisions
+- What needs immediate attention, approval, or follow-up.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'action-items',
+    name: 'Action Items & Tasks',
+    description: 'Extracted task list with assignees, priorities, and deadlines',
+    isBuiltIn: true,
+    template: `# Action Items & Tasks
+
+Extract all tasks, action items, commitments, and deadlines from this transcript.
+
+Answer with valid Markdown only:
+
+## Immediate / Urgent Tasks
+- [ ] Task description — **Owner**: Name (or "-")
+
+## General Action Items
+- [ ] Task description — **Owner**: Name (or "-")
+
+## Ideas & Future Considerations
+- Items mentioned to look into or explore later.
+
+Transcript:
+{{transcript}}
+`,
+  },
+  {
+    id: 'clean-notes',
+    name: 'Clean Transcript & Notes',
+    description: 'Polished prose removing filler words, organized into clear notes',
+    isBuiltIn: true,
+    template: `# Clean Notes & Polished Transcript
+
+Clean up and structure the following raw speech transcript into clear, professional, well-formatted notes.
+
+Rules:
+- Remove filler words (um, uh, like, you know), false starts, and stuttering.
+- Fix grammar, punctuation, and capitalization without altering the speaker's original meaning or voice.
+- Organize the thoughts into logical paragraphs and bullet points with clear subheadings.
+- Preserve any technical terms, names, and numbers accurately.
+
+Transcript:
+{{transcript}}
+`,
+  },
+];
+
 const STRING_KEYS = [
   'pythonPath',
   'llmBaseUrl',
@@ -22,6 +157,7 @@ const STRING_KEYS = [
   'sttCacheDir',
   'activeModel',
   'watchFolderDir',
+  'defaultPromptId',
 ] as const;
 
 const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled', 'meetingModeEnabled'] as const;
@@ -52,6 +188,8 @@ export function defaultSettings(
     dictationPasteEnabled: true, // Stage 2: ON by default
     meetingModeEnabled: false,
     watchFolderDir: '',
+    customPrompts: DEFAULT_CUSTOM_PROMPTS.map((p) => ({ ...p })),
+    defaultPromptId: 'general',
   };
 }
 
@@ -79,7 +217,69 @@ export function mergeSettings(
       merged[key] = value;
     }
   }
+  if (Array.isArray(patch.customPrompts)) {
+    const validPrompts: CustomPrompt[] = [];
+    for (const item of patch.customPrompts) {
+      if (
+        item &&
+        typeof item === 'object' &&
+        typeof (item as CustomPrompt).id === 'string' &&
+        (item as CustomPrompt).id.trim() &&
+        typeof (item as CustomPrompt).name === 'string' &&
+        (item as CustomPrompt).name.trim() &&
+        typeof (item as CustomPrompt).template === 'string'
+      ) {
+        validPrompts.push({
+          id: (item as CustomPrompt).id.trim(),
+          name: (item as CustomPrompt).name.trim(),
+          description: typeof (item as CustomPrompt).description === 'string' ? (item as CustomPrompt).description : undefined,
+          template: (item as CustomPrompt).template,
+          isBuiltIn: Boolean((item as CustomPrompt).isBuiltIn),
+        });
+      }
+    }
+    if (validPrompts.length > 0) {
+      merged.customPrompts = validPrompts;
+    }
+  }
+  // Ensure defaultPromptId exists in customPrompts
+  if (merged.customPrompts && merged.customPrompts.length > 0) {
+    const found = merged.customPrompts.some((p) => p.id === merged.defaultPromptId);
+    if (!found) {
+      merged.defaultPromptId = merged.customPrompts[0].id;
+    }
+  }
   return merged;
+}
+
+export function resolvePromptTemplate(
+  settings: AppSettings,
+  promptId?: string
+): { id: string; template: string; name: string } {
+  const prompts = settings.customPrompts || [];
+  const targetId = promptId || settings.defaultPromptId || 'general';
+
+  if (prompts.length > 0) {
+    const found = prompts.find((p) => p.id === targetId);
+    if (found && found.template && found.template.trim()) {
+      return { id: found.id, template: found.template, name: found.name };
+    }
+    if (promptId && settings.defaultPromptId) {
+      const def = prompts.find((p) => p.id === settings.defaultPromptId);
+      if (def && def.template && def.template.trim()) {
+        return { id: def.id, template: def.template, name: def.name };
+      }
+    }
+    if (prompts[0].template && prompts[0].template.trim()) {
+      return { id: prompts[0].id, template: prompts[0].template, name: prompts[0].name };
+    }
+  }
+
+  return { id: 'general', template: DEFAULT_PROMPT_TEMPLATE, name: 'General Summary' };
+}
+
+export function getBuiltInPrompt(id: string): CustomPrompt | undefined {
+  return DEFAULT_CUSTOM_PROMPTS.find((p) => p.id === id);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

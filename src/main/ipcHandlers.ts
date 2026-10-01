@@ -31,8 +31,8 @@ import {
 } from './micPermission';
 import { TranscriptionService } from './transcriptionService';
 import { saveTranscript } from './exportText';
-import { SettingsStore, resolvePythonExecutable, validatePythonInterpreter } from './settingsStore';
-import { ensureDataDirLayout, readPromptTemplate, saveSummaryToDataDir, saveTranscriptToDataDir } from './autoSave';
+import { SettingsStore, resolvePythonExecutable, validatePythonInterpreter, resolvePromptTemplate } from './settingsStore';
+import { ensureDataDirLayout, readPromptTemplate, saveSummaryToDataDir, saveTranscriptToDataDir, SCRIPTS_DIR, PROMPT_TEMPLATE_FILE } from './autoSave';
 import { Summarizer, listLlmModels } from './summarizer';
 import { ModelDownloadService } from './modelDownloadService';
 import { classifyRepo, searchHfModels } from './hfModels';
@@ -226,8 +226,17 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   const SUMMARY_SYSTEM_PROMPT =
     'You are a local summarization assistant. Reply with the Markdown summary only: no preamble and no commentary.';
 
-  function runSummary(settings: AppSettings, transcript: string): void {
-    const { template } = readPromptTemplate(settings.dataDir);
+  function runSummary(
+    settings: AppSettings,
+    transcript: string,
+    promptId?: string,
+    customTemplate?: string
+  ): void {
+    let template = customTemplate;
+    if (!template) {
+      const resolved = resolvePromptTemplate(settings, promptId);
+      template = resolved.template;
+    }
     void summarizer
       .summarize({
         baseUrl: settings.llmBaseUrl,
@@ -641,9 +650,27 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       if (typeof patch.meetingModeEnabled === 'boolean') {
         accepted.meetingModeEnabled = patch.meetingModeEnabled;
       }
+      if (typeof patch.defaultPromptId === 'string' && patch.defaultPromptId.trim()) {
+        accepted.defaultPromptId = patch.defaultPromptId.trim();
+      }
+      if (Array.isArray(patch.customPrompts)) {
+        accepted.customPrompts = patch.customPrompts;
+      }
 
       try {
         const settings = settingsStore.update(accepted);
+        const activeDataDir = settings.dataDir;
+        if (activeDataDir) {
+          try {
+            const resolved = resolvePromptTemplate(settings);
+            const promptPath = path.join(activeDataDir, SCRIPTS_DIR, PROMPT_TEMPLATE_FILE);
+            if (fs.existsSync(path.dirname(promptPath))) {
+              fs.writeFileSync(promptPath, resolved.template, 'utf8');
+            }
+          } catch {
+            // Non-blocking sync to dataDir/scripts/summarize-prompt.md
+          }
+        }
         if (typeof patch.dataDir === 'string' && !errors.dataDir) {
           // The vault follows a dataDir change (noteStore only reads the dir
           // it was constructed with, so without this new notes land in the
@@ -779,7 +806,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
 
   ipcMain.handle(
     IpcChannel.Summarize,
-    async (_event: unknown, request?: { text?: string }): Promise<{ started: boolean; error?: string }> => {
+    async (
+      _event: unknown,
+      request?: { text?: string; promptId?: string; template?: string }
+    ): Promise<{ started: boolean; error?: string }> => {
       const settings = settingsStore.get();
       if (!settings.summarizationEnabled) {
         return { started: false, error: 'Summarization is disabled in Settings' };
@@ -794,7 +824,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       if (!text.trim()) {
         return { started: false, error: 'Nothing to summarize: the transcript is empty' };
       }
-      runSummary(settings, text);
+      runSummary(settings, text, request?.promptId, request?.template);
       return { started: true };
     }
   );

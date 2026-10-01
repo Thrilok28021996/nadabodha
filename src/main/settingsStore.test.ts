@@ -3,10 +3,12 @@ import os from 'os';
 import path from 'path';
 import {
   DEFAULT_LLM_BASE_URL,
+  DEFAULT_CUSTOM_PROMPTS,
   SettingsStore,
   defaultSettings,
   loadSettings,
   mergeSettings,
+  resolvePromptTemplate,
   resolvePythonExecutable,
   saveSettings,
   settingsFilePath,
@@ -222,3 +224,64 @@ describe('validatePythonInterpreter', () => {
     expect(result.message).toContain('/missing/interpreter');
   });
 });
+
+describe('customPrompts and prompt purpose configuration', () => {
+  it('provides default built-in prompts with general as default', () => {
+    const settings = defaultSettings();
+    expect(settings.defaultPromptId).toBe('general');
+    expect(settings.customPrompts?.length).toBeGreaterThanOrEqual(4);
+    const ids = settings.customPrompts?.map((p) => p.id);
+    expect(ids).toContain('general');
+    expect(ids).toContain('meeting-minutes');
+    expect(ids).toContain('executive-brief');
+    expect(ids).toContain('action-items');
+  });
+
+  it('merges customPrompts and defaultPromptId correctly', () => {
+    const base = defaultSettings();
+    const customList = [
+      { id: 'custom-1', name: 'Custom 1', template: 'Test 1 {{transcript}}' },
+      { id: 'custom-2', name: 'Custom 2', template: 'Test 2 {{transcript}}' },
+    ];
+    const merged = mergeSettings(base, {
+      customPrompts: customList,
+      defaultPromptId: 'custom-2',
+    });
+    expect(merged.defaultPromptId).toBe('custom-2');
+    expect(merged.customPrompts?.length).toBe(2);
+    expect(merged.customPrompts?.[1].name).toBe('Custom 2');
+  });
+
+  it('falls back defaultPromptId if the specified id does not exist in prompts', () => {
+    const base = defaultSettings();
+    const merged = mergeSettings(base, {
+      customPrompts: [{ id: 'only-one', name: 'Only One', template: 'Body' }],
+      defaultPromptId: 'non-existent',
+    });
+    expect(merged.defaultPromptId).toBe('only-one');
+  });
+
+  it('resolvePromptTemplate returns requested prompt by id', () => {
+    const settings = defaultSettings();
+    const resolved = resolvePromptTemplate(settings, 'meeting-minutes');
+    expect(resolved.id).toBe('meeting-minutes');
+    expect(resolved.name).toBe('Meeting Minutes');
+    expect(resolved.template).toContain('Action Items');
+  });
+
+  it('resolvePromptTemplate falls back to defaultPromptId when no id provided', () => {
+    const settings = defaultSettings();
+    settings.defaultPromptId = 'executive-brief';
+    const resolved = resolvePromptTemplate(settings);
+    expect(resolved.id).toBe('executive-brief');
+    expect(resolved.name).toBe('Executive Brief');
+  });
+
+  it('resolvePromptTemplate falls back gracefully if customPrompts is empty', () => {
+    const settings = defaultSettings();
+    settings.customPrompts = [];
+    const resolved = resolvePromptTemplate(settings, 'missing');
+    expect(resolved.template).toContain('Summarization prompt');
+  });
+});
+

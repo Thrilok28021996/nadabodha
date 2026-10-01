@@ -143,6 +143,24 @@ export interface AppSettings {
   dictationPasteEnabled?: boolean;
   meetingModeEnabled?: boolean;
   watchFolderDir?: string;
+  /** Custom prompt templates configured by purpose. */
+  customPrompts?: CustomPrompt[];
+  /** The default prompt purpose ID (e.g. 'general'). */
+  defaultPromptId?: string;
+}
+
+export interface CustomPrompt {
+  id: string;
+  name: string;
+  description?: string;
+  template: string;
+  isBuiltIn?: boolean;
+}
+
+export interface SummarizeRequest {
+  text?: string;
+  promptId?: string;
+  template?: string;
 }
 
 /** Live state of the hold-Option dictation hook. */
