@@ -130,17 +130,6 @@ app.whenReady().then(() => {
     noteStore,
   });
 
-  // Global keybinding for recording (Cmd+Shift+R / Ctrl+Shift+R)
-  try {
-    globalShortcut.register('CommandOrControl+Shift+R', () => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('toggle-recording');
-      }
-    });
-  } catch (err) {
-    console.warn('[GlobalShortcut] Failed to register CommandOrControl+Shift+R:', err);
-  }
-
   // The global Option hook and global shortcuts must never outlive the app
   app.on('will-quit', () => {
     try {

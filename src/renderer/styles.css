@@ -1275,6 +1275,29 @@ details[open] .hf-search-summary::before { transform: rotate(90deg); }
 }
 
 /* Keybindings reference */
+.shortcut-config-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shortcut-config-row .setting-input {
+  flex: 1;
+}
+
+.chip-btn.capturing {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  animation: pulse-border 1.5s infinite;
+}
+
+@keyframes pulse-border {
+  0% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(99, 102, 241, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+}
+
 .shortcuts-list {
   display: flex;
   flex-direction: column;

@@ -92,6 +92,7 @@ interface AppSettings {
   watchFolderDir?: string;
   customPrompts?: CustomPrompt[];
   defaultPromptId?: string;
+  recordingShortcut?: string;
 }
 interface CustomPrompt {
   id: string;
@@ -283,6 +284,12 @@ const promptDescInput     = document.getElementById('promptDescInput') as HTMLIn
 const promptTemplateArea  = document.getElementById('promptTemplateArea') as HTMLTextAreaElement;
 const promptEditorStatus  = document.getElementById('promptEditorStatus') as HTMLParagraphElement;
 const sttActiveModelStatus = document.getElementById('sttActiveModelStatus') as HTMLParagraphElement;
+const recordingShortcutInput  = document.getElementById('recordingShortcutInput') as HTMLInputElement;
+const recordShortcutBtn      = document.getElementById('recordShortcutBtn') as HTMLButtonElement;
+const resetShortcutBtn       = document.getElementById('resetShortcutBtn') as HTMLButtonElement;
+const recordingShortcutStatus = document.getElementById('recordingShortcutStatus') as HTMLParagraphElement;
+const recordingShortcutKbd   = document.getElementById('recordingShortcutKbd') as HTMLElement;
+const emptyHintKbd           = document.getElementById('emptyHintKbd') as HTMLElement;
 const hfSearchInput     = document.getElementById('hfSearchInput') as HTMLInputElement;
 const hfSearchBtn       = document.getElementById('hfSearchBtn') as HTMLButtonElement;
 const hfStatus          = document.getElementById('hfStatus') as HTMLParagraphElement;
@@ -1511,6 +1518,12 @@ async function loadSettings(): Promise<void> {
       llmModelSelect.value = savedLlmModel;
     }
 
+    // Global recording shortcut
+    const shortcut = currentSettings.recordingShortcut || 'CommandOrControl+Shift+R';
+    if (recordingShortcutInput) recordingShortcutInput.value = shortcut;
+    updateShortcutBadges(shortcut);
+    if (recordingShortcutStatus) setHint(recordingShortcutStatus, '');
+
     // Prompt templates
     editingPrompts = (currentSettings.customPrompts && currentSettings.customPrompts.length > 0)
       ? currentSettings.customPrompts.map(p => ({ ...p }))
@@ -1532,6 +1545,131 @@ function updateActiveModelDisplay(): void {
   if (sttActiveModelStatus) setHint(sttActiveModelStatus, label, activeModel ? 'ok' : 'info');
 }
 
+function formatShortcutDisplay(accelerator: string): string {
+  if (!accelerator) return '⌘⇧R';
+  let s = accelerator.trim();
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+  if (isMac) {
+    s = s.replace(/CommandOrControl/gi, '⌘');
+    s = s.replace(/CmdOrCtrl/gi, '⌘');
+    s = s.replace(/Command/gi, '⌘');
+    s = s.replace(/Cmd/gi, '⌘');
+    s = s.replace(/Control/gi, '⌃');
+    s = s.replace(/Ctrl/gi, '⌃');
+    s = s.replace(/Alt/gi, '⌥');
+    s = s.replace(/Option/gi, '⌥');
+    s = s.replace(/Shift/gi, '⇧');
+    s = s.replace(/\+/g, '');
+  } else {
+    s = s.replace(/CommandOrControl/gi, 'Ctrl');
+    s = s.replace(/CmdOrCtrl/gi, 'Ctrl');
+    s = s.replace(/Command/gi, 'Win');
+    s = s.replace(/Option/gi, 'Alt');
+  }
+  return s;
+}
+
+function updateShortcutBadges(accelerator: string): void {
+  const display = formatShortcutDisplay(accelerator || 'CommandOrControl+Shift+R');
+  if (recordingShortcutKbd) recordingShortcutKbd.textContent = display;
+  if (emptyHintKbd) emptyHintKbd.textContent = display;
+}
+
+let isCapturingShortcut = false;
+
+function startCapturingShortcut(): void {
+  if (isCapturingShortcut) return;
+  isCapturingShortcut = true;
+  if (recordShortcutBtn) {
+    recordShortcutBtn.textContent = 'Press keys…';
+    recordShortcutBtn.classList.add('capturing');
+  }
+  setHint(recordingShortcutStatus, 'Press desired key combination (e.g. ⌘⇧R, Ctrl+Alt+R, F9). Esc to cancel.', 'info');
+  if (recordingShortcutInput) recordingShortcutInput.focus();
+}
+
+function stopCapturingShortcut(): void {
+  if (!isCapturingShortcut) return;
+  isCapturingShortcut = false;
+  if (recordShortcutBtn) {
+    recordShortcutBtn.textContent = 'Capture';
+    recordShortcutBtn.classList.remove('capturing');
+  }
+}
+
+recordShortcutBtn?.addEventListener('click', () => {
+  if (isCapturingShortcut) {
+    stopCapturingShortcut();
+    setHint(recordingShortcutStatus, '');
+  } else {
+    startCapturingShortcut();
+  }
+});
+
+resetShortcutBtn?.addEventListener('click', () => {
+  stopCapturingShortcut();
+  if (recordingShortcutInput) recordingShortcutInput.value = 'CommandOrControl+Shift+R';
+  updateShortcutBadges('CommandOrControl+Shift+R');
+  setHint(recordingShortcutStatus, 'Reset to default: CommandOrControl+Shift+R. Click "Save settings" to persist.', 'ok');
+});
+
+recordingShortcutInput?.addEventListener('input', () => {
+  updateShortcutBadges(recordingShortcutInput.value.trim());
+});
+
+recordingShortcutInput?.addEventListener('keydown', (e) => {
+  if (!isCapturingShortcut) return;
+  e.preventDefault();
+  e.stopPropagation();
+
+  // Escape cancels capture
+  if (e.key === 'Escape') {
+    stopCapturingShortcut();
+    setHint(recordingShortcutStatus, 'Capture cancelled.');
+    return;
+  }
+
+  // Strictly disallow Space as a keybind
+  if (e.code === 'Space') {
+    setHint(recordingShortcutStatus, 'Space cannot be used as a keybinding. Please use standard modifiers and letters or function keys.', 'error');
+    return;
+  }
+
+  // Ignore bare modifier presses
+  if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) {
+    return;
+  }
+
+  const parts: string[] = [];
+  if (e.metaKey || e.ctrlKey) {
+    parts.push('CommandOrControl');
+  }
+  if (e.altKey) {
+    parts.push('Alt');
+  }
+  if (e.shiftKey) {
+    parts.push('Shift');
+  }
+
+  let keyName = e.key;
+  if (e.code.startsWith('Key')) {
+    keyName = e.code.substring(3).toUpperCase();
+  } else if (e.code.startsWith('Digit')) {
+    keyName = e.code.substring(5);
+  } else if (/^F\d{1,2}$/i.test(e.key)) {
+    keyName = e.key.toUpperCase();
+  } else if (keyName.length === 1) {
+    keyName = keyName.toUpperCase();
+  }
+
+  parts.push(keyName);
+  const accelerator = parts.join('+');
+  if (recordingShortcutInput) recordingShortcutInput.value = accelerator;
+  updateShortcutBadges(accelerator);
+  stopCapturingShortcut();
+  setHint(recordingShortcutStatus, `Captured: ${accelerator}. Click "Save settings" to apply.`, 'ok');
+});
+
 async function saveSettings(): Promise<void> {
   syncActivePromptFromInputs();
   const patch: Partial<AppSettings> = {
@@ -1549,6 +1687,7 @@ async function saveSettings(): Promise<void> {
     meetingModeEnabled: (document.getElementById('meetingModeChk') as HTMLInputElement).checked,
     customPrompts: editingPrompts,
     defaultPromptId: editingDefaultPromptId,
+    recordingShortcut: recordingShortcutInput ? recordingShortcutInput.value.trim() || 'CommandOrControl+Shift+R' : undefined,
   };
   if (activeModel) patch.activeModel = activeModel;
 
@@ -1566,6 +1705,7 @@ async function saveSettings(): Promise<void> {
     if (errors.pythonPath) setHint(pythonStatus, errors.pythonPath, 'error');
     if (errors.dataDir) setHint(dataDirStatus, errors.dataDir, 'error');
     if (errors.sttCacheDir) setHint(cacheDirStatus, errors.sttCacheDir, 'error');
+    if (errors.recordingShortcut) setHint(recordingShortcutStatus, errors.recordingShortcut, 'error');
     const messages = result.messages || {};
     if (messages.pythonPath) setHint(pythonStatus, messages.pythonPath, errors.pythonPath ? 'error' : 'ok');
     setTimeout(() => setHint(settingsStatus, ''), 3000);
@@ -1754,21 +1894,8 @@ document.addEventListener('keydown', (e) => {
     searchInput.select();
     return;
   }
-  // Cmd/Ctrl + R (or Cmd/Ctrl + Shift + R): Toggle recording
+  // Cmd/Ctrl + R: Toggle recording
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') {
-    e.preventDefault();
-    handleRecordBtnClick();
-    return;
-  }
-  // Spacebar to toggle recording when not in an editable text field
-  const activeEl = document.activeElement;
-  const isEditingText =
-    activeEl instanceof HTMLInputElement ||
-    activeEl instanceof HTMLTextAreaElement ||
-    activeEl instanceof HTMLSelectElement ||
-    (activeEl && activeEl.getAttribute('contenteditable') === 'true');
-
-  if (e.code === 'Space' && !isEditingText && !e.metaKey && !e.ctrlKey && !e.altKey) {
     e.preventDefault();
     handleRecordBtnClick();
     return;

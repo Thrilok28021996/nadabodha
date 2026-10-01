@@ -149,6 +149,8 @@ export interface AppSettings {
   customPrompts?: CustomPrompt[];
   /** The default prompt purpose ID (e.g. 'general'). */
   defaultPromptId?: string;
+  /** Global recording toggle accelerator (e.g. 'CommandOrControl+Shift+R'). */
+  recordingShortcut?: string;
 }
 
 export interface CustomPrompt {
@@ -217,7 +219,7 @@ export interface LlmConnectionResult {
   message: string;
 }
 
-export type SettingsFieldError = 'pythonPath' | 'dataDir' | 'sttCacheDir' | 'llm';
+export type SettingsFieldError = 'pythonPath' | 'dataDir' | 'sttCacheDir' | 'llm' | 'recordingShortcut';
 
 export interface SettingsUpdateResult {
   settings: AppSettings;

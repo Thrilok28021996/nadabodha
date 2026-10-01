@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences, globalShortcut } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -31,7 +31,14 @@ import {
 } from './micPermission';
 import { TranscriptionService } from './transcriptionService';
 import { saveTranscript } from './exportText';
-import { SettingsStore, resolvePythonExecutable, validatePythonInterpreter, resolvePromptTemplate } from './settingsStore';
+import {
+  SettingsStore,
+  resolvePythonExecutable,
+  validatePythonInterpreter,
+  resolvePromptTemplate,
+  DEFAULT_RECORDING_SHORTCUT,
+  normalizeAccelerator,
+} from './settingsStore';
 import { ensureDataDirLayout, saveSummaryToDataDir, saveTranscriptToDataDir, SCRIPTS_DIR, PROMPT_TEMPLATE_FILE } from './autoSave';
 import { Summarizer, listLlmModels } from './summarizer';
 import { ModelDownloadService } from './modelDownloadService';
@@ -59,6 +66,8 @@ export interface IpcSetupOptions {
 export interface IpcSetupResult {
   /** Null when uiohook-napi could not be loaded in the main process. */
   dictation: DictationController | null;
+  /** Apply or update the global recording shortcut. */
+  applyRecordingShortcut: (shortcut: string) => { success: boolean; error?: string };
 }
 
 /** Convert a NoteRecord to the serializable NoteInfo sent over IPC. */
@@ -184,6 +193,80 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     }
   };
   applyWatchFolderSetting();
+
+  // ---- Global Recording Shortcut Manager ---------------------------------
+  let currentRecordingShortcut = settingsStore.get().recordingShortcut || DEFAULT_RECORDING_SHORTCUT;
+
+  const applyRecordingShortcut = (shortcut: string): { success: boolean; error?: string } => {
+    const raw = (shortcut || '').trim();
+    if (!raw) {
+      if (currentRecordingShortcut) {
+        try {
+          globalShortcut.unregister(currentRecordingShortcut);
+        } catch { /* ignore */ }
+        currentRecordingShortcut = '';
+      }
+      return { success: true };
+    }
+
+    const normalized = normalizeAccelerator(raw);
+
+    // Space alone is strictly prohibited as a keybind
+    if (normalized.toLowerCase() === 'space' || raw.toLowerCase() === 'space') {
+      return {
+        success: false,
+        error: 'Space alone cannot be used as a keybinding. Please use a combination with modifiers (e.g. CommandOrControl+Shift+R).',
+      };
+    }
+
+    try {
+      if (currentRecordingShortcut) {
+        try {
+          globalShortcut.unregister(currentRecordingShortcut);
+        } catch { /* ignore */ }
+      }
+      const registered = globalShortcut.register(normalized, () => {
+        if (!mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('toggle-recording');
+        }
+      });
+      if (!registered) {
+        // Attempt to restore previous shortcut if valid
+        if (currentRecordingShortcut && currentRecordingShortcut !== normalized) {
+          try {
+            globalShortcut.register(currentRecordingShortcut, () => {
+              if (!mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('toggle-recording');
+              }
+            });
+          } catch { /* ignore */ }
+        }
+        return {
+          success: false,
+          error: `Could not register shortcut "${normalized}". It may already be in use by another application.`,
+        };
+      }
+      currentRecordingShortcut = normalized;
+      return { success: true };
+    } catch (err) {
+      if (currentRecordingShortcut && currentRecordingShortcut !== normalized) {
+        try {
+          globalShortcut.register(currentRecordingShortcut, () => {
+            if (!mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('toggle-recording');
+            }
+          });
+        } catch { /* ignore */ }
+      }
+      return {
+        success: false,
+        error: `Invalid shortcut accelerator "${raw}": ${(err as Error).message}`,
+      };
+    }
+  };
+
+  // Register initial global shortcut
+  applyRecordingShortcut(currentRecordingShortcut);
 
   // ---- Summary orchestration -------------------------------------------------
 
@@ -664,6 +747,16 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       if (Array.isArray(patch.customPrompts)) {
         accepted.customPrompts = patch.customPrompts;
       }
+      if (typeof patch.recordingShortcut === 'string') {
+        const candidate = patch.recordingShortcut.trim();
+        const shortcutToApply = candidate || DEFAULT_RECORDING_SHORTCUT;
+        const res = applyRecordingShortcut(shortcutToApply);
+        if (!res.success) {
+          errors.recordingShortcut = res.error;
+        } else {
+          accepted.recordingShortcut = shortcutToApply;
+        }
+      }
 
       try {
         const settings = settingsStore.update(accepted);
@@ -1039,7 +1132,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     }
   );
 
-  return { dictation };
+  return { dictation, applyRecordingShortcut };
 }
 
 

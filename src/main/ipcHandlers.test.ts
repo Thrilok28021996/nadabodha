@@ -18,6 +18,12 @@ jest.mock('electron', () => ({
     getMediaAccessStatus: jest.fn(),
     askForMediaAccess: jest.fn(),
   },
+  globalShortcut: {
+    register: jest.fn(() => true),
+    unregister: jest.fn(),
+    unregisterAll: jest.fn(),
+    isRegistered: jest.fn(() => false),
+  },
 }));
 
 jest.mock('uiohook-napi', () => {
@@ -38,7 +44,7 @@ import { AudioRecorder } from './audioRecorder';
 import { setupIpcHandlers } from './ipcHandlers';
 import { SettingsStore } from './settingsStore';
 import { TranscriptionService } from './transcriptionService';
-import { DictationStatusInfo, IpcChannel } from '../shared/ipc';
+import { DictationStatusInfo, IpcChannel, SettingsUpdateResult } from '../shared/ipc';
 import { NoteStore } from './noteStore';
 
 type Handler = (...args: unknown[]) => unknown;
@@ -481,4 +487,22 @@ describe('StartRecording transcription guard', () => {
     expect(recorder.start).toHaveBeenCalled();
   });
 });
+
+describe('recording shortcut management', () => {
+  it('registers shortcut when valid accelerator is supplied', async () => {
+    setup(true);
+    const settingsSetHandler = handlerFor(IpcChannel.SettingsSet);
+    const result = (await settingsSetHandler({}, { recordingShortcut: 'CommandOrControl+Shift+D' })) as SettingsUpdateResult;
+    expect(result.errors.recordingShortcut).toBeUndefined();
+    expect(result.settings.recordingShortcut).toBe('CommandOrControl+Shift+D');
+  });
+
+  it('rejects Space alone as a keybinding', async () => {
+    setup(true);
+    const settingsSetHandler = handlerFor(IpcChannel.SettingsSet);
+    const result = (await settingsSetHandler({}, { recordingShortcut: 'Space' })) as SettingsUpdateResult;
+    expect(result.errors.recordingShortcut).toContain('Space alone cannot be used as a keybinding');
+  });
+});
+
 

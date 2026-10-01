@@ -13,6 +13,35 @@ import { DEFAULT_PROMPT_TEMPLATE } from './autoSave';
 
 export const SETTINGS_FILE_NAME = 'settings.json';
 export const DEFAULT_LLM_BASE_URL = 'http://127.0.0.1:1234/v1';
+export const DEFAULT_RECORDING_SHORTCUT = 'CommandOrControl+Shift+R';
+
+/**
+ * Normalizes user-entered accelerator strings (handling symbols, case, aliases)
+ * into Electron-compatible accelerator format.
+ */
+export function normalizeAccelerator(shortcut: string): string {
+  let s = (shortcut || '').trim();
+  if (!s) return '';
+  s = s.replace(/CommandOrControl/gi, 'CommandOrControl');
+  s = s.replace(/CmdOrCtrl/gi, 'CommandOrControl');
+  s = s.replace(/⌘/g, 'Command+');
+  s = s.replace(/⌃/g, 'Control+');
+  s = s.replace(/⌥/g, 'Alt+');
+  s = s.replace(/⇧/g, 'Shift+');
+  const tokens = s.split('+').map((t) => t.trim()).filter(Boolean);
+  const normalizedTokens = tokens.map((t) => {
+    const lower = t.toLowerCase();
+    if (lower === 'cmd' || lower === 'command') return 'Command';
+    if (lower === 'ctrl' || lower === 'control') return 'Control';
+    if (lower === 'cmdorctrl' || lower === 'commandorcontrol') return 'CommandOrControl';
+    if (lower === 'opt' || lower === 'option' || lower === 'alt') return 'Alt';
+    if (lower === 'shift') return 'Shift';
+    if (lower.length === 1) return lower.toUpperCase();
+    if (/^f\d{1,2}$/i.test(lower)) return lower.toUpperCase();
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  });
+  return normalizedTokens.join('+');
+}
 
 export const DEFAULT_CUSTOM_PROMPTS: CustomPrompt[] = [
   {
@@ -158,6 +187,7 @@ const STRING_KEYS = [
   'activeModel',
   'watchFolderDir',
   'defaultPromptId',
+  'recordingShortcut',
 ] as const;
 
 const BOOLEAN_KEYS = ['summarizationEnabled', 'autoSummarize', 'dictationEnabled', 'dictationPasteEnabled', 'meetingModeEnabled'] as const;
@@ -218,6 +248,7 @@ export function defaultSettings(
     watchFolderDir: '',
     customPrompts: DEFAULT_CUSTOM_PROMPTS.map((p) => ({ ...p })),
     defaultPromptId: 'general',
+    recordingShortcut: DEFAULT_RECORDING_SHORTCUT,
   };
 }
 
@@ -276,6 +307,10 @@ export function mergeSettings(
     if (!found) {
       merged.defaultPromptId = merged.customPrompts[0].id;
     }
+  }
+  // Guarantee recordingShortcut is never empty string
+  if (!merged.recordingShortcut) {
+    merged.recordingShortcut = DEFAULT_RECORDING_SHORTCUT;
   }
   return merged;
 }

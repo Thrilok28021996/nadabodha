@@ -13,6 +13,8 @@ import {
   saveSettings,
   settingsFilePath,
   validatePythonInterpreter,
+  DEFAULT_RECORDING_SHORTCUT,
+  normalizeAccelerator,
 } from './settingsStore';
 
 function tmpDir(): string {
@@ -303,6 +305,30 @@ describe('customPrompts and prompt purpose configuration', () => {
     settings.customPrompts = [];
     const resolved = resolvePromptTemplate(settings, 'missing');
     expect(resolved.template).toContain('Summarization prompt');
+  });
+
+  it('defaultSettings includes DEFAULT_RECORDING_SHORTCUT', () => {
+    const settings = defaultSettings();
+    expect(settings.recordingShortcut).toBe(DEFAULT_RECORDING_SHORTCUT);
+  });
+
+  it('mergeSettings preserves or updates recordingShortcut', () => {
+    const base = defaultSettings();
+    const merged = mergeSettings(base, { recordingShortcut: 'Command+Shift+D' });
+    expect(merged.recordingShortcut).toBe('Command+Shift+D');
+
+    // Falls back to default if empty string
+    const emptyMerged = mergeSettings(base, { recordingShortcut: '   ' });
+    expect(emptyMerged.recordingShortcut).toBe(DEFAULT_RECORDING_SHORTCUT);
+  });
+
+  it('normalizeAccelerator normalizes symbols, case, and function keys', () => {
+    expect(normalizeAccelerator('⌘⇧R')).toBe('Command+Shift+R');
+    expect(normalizeAccelerator('Cmd+Shift+R')).toBe('Command+Shift+R');
+    expect(normalizeAccelerator('ctrl+alt+r')).toBe('Control+Alt+R');
+    expect(normalizeAccelerator('commandorcontrol+shift+r')).toBe('CommandOrControl+Shift+R');
+    expect(normalizeAccelerator('f9')).toBe('F9');
+    expect(normalizeAccelerator('')).toBe('');
   });
 });
 

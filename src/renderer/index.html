@@ -41,7 +41,7 @@
 
       <!-- Primary Actions -->
       <div class="sidebar-actions">
-        <button id="recordBtn" class="action-btn action-record" type="button" title="Toggle Recording (Space, ⌘R, or ⌘⇧R globally)">
+        <button id="recordBtn" class="action-btn action-record" type="button" title="Toggle Recording (Global Shortcut)">
           <span class="action-icon" aria-hidden="true">⏺</span> Record
         </button>
         <button id="importBtn" class="action-btn action-import" type="button">
@@ -123,10 +123,10 @@
         <h2>Welcome to Nadabodha</h2>
         <p>Your local, private speech-to-text workspace.</p>
         <div class="empty-actions">
-          <button id="emptyRecordBtn" type="button" class="btn-primary" title="Toggle Recording (Space, ⌘R, or ⌘⇧R globally)">⏺ Start Recording</button>
+          <button id="emptyRecordBtn" type="button" class="btn-primary" title="Toggle Recording (Global Shortcut)">⏺ Start Recording</button>
           <button id="emptyImportBtn" type="button" class="btn-secondary">⬆ Import Audio</button>
         </div>
-        <p class="empty-hint">Press <kbd>Space</kbd> or <kbd>⌘R</kbd> to record (<kbd>⌘⇧R</kbd> globally) · Hold <kbd>⌥</kbd> anywhere to dictate</p>
+        <p class="empty-hint">Press <kbd id="emptyHintKbd">⌘⇧R</kbd> globally or <kbd>⌘R</kbd> in app to record · Hold <kbd>⌥</kbd> anywhere to dictate</p>
       </div>
 
       <!-- Note detail (hidden until a note is selected) -->
@@ -393,13 +393,33 @@
             <p id="downloadStatus" class="setting-status"></p>
           </div>
 
-          <!-- Keybindings reference -->
+          <!-- Keybindings & Shortcuts -->
           <div class="setting-group">
             <h3>Keybindings & Shortcuts</h3>
-            <div class="shortcuts-list">
+
+            <!-- Global Recording Keybinding Configurator -->
+            <div class="setting-row">
+              <label for="recordingShortcutInput">Global Recording Shortcut</label>
+              <div class="shortcut-config-row">
+                <input
+                  type="text"
+                  id="recordingShortcutInput"
+                  class="setting-input"
+                  placeholder="CommandOrControl+Shift+R"
+                  spellcheck="false"
+                  autocomplete="off"
+                >
+                <button type="button" id="recordShortcutBtn" class="chip-btn" title="Click and press your desired key combination">Capture</button>
+                <button type="button" id="resetShortcutBtn" class="chip-btn" title="Reset to default (CommandOrControl+Shift+R)">Default</button>
+              </div>
+              <p class="setting-hint">System-wide shortcut to toggle recording even when Nadabodha is in the background. Space alone is not allowed.</p>
+              <p id="recordingShortcutStatus" class="setting-status"></p>
+            </div>
+
+            <div class="shortcuts-list" style="margin-top: 14px;">
               <div class="shortcut-item">
                 <span class="shortcut-desc">Toggle Recording</span>
-                <span class="shortcut-keys"><kbd>Space</kbd> or <kbd>⌘R</kbd> <span class="shortcut-tag">in app</span> · <kbd>⌘⇧R</kbd> <span class="shortcut-tag">global</span></span>
+                <span class="shortcut-keys"><kbd id="recordingShortcutKbd">⌘⇧R</kbd> <span class="shortcut-tag">global</span> · <kbd>⌘R</kbd> <span class="shortcut-tag">in app</span></span>
               </div>
               <div class="shortcut-item">
                 <span class="shortcut-desc">Dictation Take</span>
