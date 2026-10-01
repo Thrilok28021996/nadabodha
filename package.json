@@ -8,10 +8,11 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "build": "tsc && node scripts/copy-assets.js",
+    "compile": "tsc && node scripts/copy-assets.js",
     "watch": "tsc -w",
-    "start": "npm run build && electron .",
-    "package": "npm run build && electron-builder --mac --arm64 --dir && codesign --force --deep --sign - release/mac-arm64/Nadabodha.app",
+    "start": "npm run compile && electron .",
+    "build": "npm run compile && electron-builder --mac --arm64 --dir && codesign --force --deep --sign - release/mac-arm64/Nadabodha.app && ln -sf release/mac-arm64/Nadabodha.app Nadabodha.app",
+    "package": "npm run build",
     "test": "jest --passWithNoTests",
     "test:python": "python3 -m pytest python/tests -q",
     "lint": "eslint src --ext .ts"
