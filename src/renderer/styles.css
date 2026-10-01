@@ -1184,3 +1184,42 @@ details[open] .hf-search-summary::before { transform: rotate(90deg); }
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent);
 }
+
+/* Keybindings reference */
+.shortcuts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+}
+
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.shortcut-desc {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.shortcut-keys {
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+}
+
+.shortcut-tag {
+  font-size: 9.5px;
+  color: var(--text-hint);
+  text-transform: uppercase;
+  margin-left: 2px;
+  letter-spacing: 0.4px;
+}

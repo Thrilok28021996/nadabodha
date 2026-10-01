@@ -1,4 +1,4 @@
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, globalShortcut } from 'electron';
 import path from 'path';
 import { setupIpcHandlers } from './ipcHandlers';
 import { AudioRecorder } from './audioRecorder';
@@ -84,14 +84,28 @@ app.whenReady().then(() => {
     noteStore,
   });
 
-
-  // The global Option hook must never outlive the app (approved plan,
-  // workstream 3: "Stop the hook on app quit").
-  if (dictation) {
-    app.on('will-quit', () => {
-      dictation.stop();
+  // Global keybinding for recording (Cmd+Shift+R / Ctrl+Shift+R)
+  try {
+    globalShortcut.register('CommandOrControl+Shift+R', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('toggle-recording');
+      }
     });
+  } catch (err) {
+    console.warn('[GlobalShortcut] Failed to register CommandOrControl+Shift+R:', err);
   }
+
+  // The global Option hook and global shortcuts must never outlive the app
+  app.on('will-quit', () => {
+    try {
+      globalShortcut.unregisterAll();
+    } catch {
+      // ignore
+    }
+    if (dictation) {
+      dictation.stop();
+    }
+  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

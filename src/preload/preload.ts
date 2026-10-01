@@ -265,6 +265,7 @@ export interface ElectronApi {
   removeImportItem: (id: string) => Promise<{success: boolean}>;
   onImportQueueEvent: (callback: (queue: ImportItem[]) => void) => void;
   removeImportQueueListener: () => void;
+  onToggleRecording: (callback: () => void) => () => void;
 }
 
 const api: ElectronApi = {
@@ -329,6 +330,11 @@ const api: ElectronApi = {
   },
   removeImportQueueListener: () => {
     ipcRenderer.removeAllListeners(IpcChannel.ImportQueueEvent);
+  },
+  onToggleRecording: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('toggle-recording', listener);
+    return () => ipcRenderer.removeListener('toggle-recording', listener);
   },
 };
 

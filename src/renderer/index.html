@@ -40,7 +40,7 @@
 
       <!-- Primary Actions -->
       <div class="sidebar-actions">
-        <button id="recordBtn" class="action-btn action-record" type="button">
+        <button id="recordBtn" class="action-btn action-record" type="button" title="Toggle Recording (Space, ⌘R, or ⌘⇧R globally)">
           <span class="action-icon" aria-hidden="true">⏺</span> Record
         </button>
         <button id="importBtn" class="action-btn action-import" type="button">
@@ -122,10 +122,10 @@
         <h2>Welcome to Nadabodha</h2>
         <p>Your local, private speech-to-text workspace.</p>
         <div class="empty-actions">
-          <button id="emptyRecordBtn" type="button" class="btn-primary">⏺ Start Recording</button>
+          <button id="emptyRecordBtn" type="button" class="btn-primary" title="Toggle Recording (Space, ⌘R, or ⌘⇧R globally)">⏺ Start Recording</button>
           <button id="emptyImportBtn" type="button" class="btn-secondary">⬆ Import Audio</button>
         </div>
-        <p class="empty-hint">Or hold <kbd>⌥</kbd> anywhere to dictate</p>
+        <p class="empty-hint">Press <kbd>Space</kbd> or <kbd>⌘R</kbd> to record (<kbd>⌘⇧R</kbd> globally) · Hold <kbd>⌥</kbd> anywhere to dictate</p>
       </div>
 
       <!-- Note detail (hidden until a note is selected) -->
@@ -389,6 +389,29 @@
             </div>
             <progress id="downloadProgress" value="0" max="100" hidden></progress>
             <p id="downloadStatus" class="setting-status"></p>
+          </div>
+
+          <!-- Keybindings reference -->
+          <div class="setting-group">
+            <h3>Keybindings & Shortcuts</h3>
+            <div class="shortcuts-list">
+              <div class="shortcut-item">
+                <span class="shortcut-desc">Toggle Recording</span>
+                <span class="shortcut-keys"><kbd>Space</kbd> or <kbd>⌘R</kbd> <span class="shortcut-tag">in app</span> · <kbd>⌘⇧R</kbd> <span class="shortcut-tag">global</span></span>
+              </div>
+              <div class="shortcut-item">
+                <span class="shortcut-desc">Dictation Take</span>
+                <span class="shortcut-keys">Hold <kbd>⌥ Option</kbd> <span class="shortcut-tag">global</span></span>
+              </div>
+              <div class="shortcut-item">
+                <span class="shortcut-desc">Search Notes</span>
+                <span class="shortcut-keys"><kbd>⌘K</kbd></span>
+              </div>
+              <div class="shortcut-item">
+                <span class="shortcut-desc">Close Panels / Modal</span>
+                <span class="shortcut-keys"><kbd>Esc</kbd></span>
+              </div>
+            </div>
           </div>
 
           <div class="setting-group">

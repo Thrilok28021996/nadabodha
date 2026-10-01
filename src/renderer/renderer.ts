@@ -155,6 +155,7 @@ interface ElectronAPI {
   listFolders(): Promise<{ folders: string[]; counts: Record<string, number> }>;
   searchNotes(q: string): Promise<NoteListResult>;
   reTranscribe(noteId: string): Promise<{ started: boolean; error?: string; runId?: number }>;
+  onToggleRecording?(cb: () => void): () => void;
 }
 
 const api = window.electronAPI;
@@ -1605,11 +1606,38 @@ document.addEventListener('keydown', (e) => {
     closeSettings();
     return;
   }
-  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
     e.preventDefault();
     searchInput.focus();
+    return;
+  }
+  // Cmd/Ctrl + R (or Cmd/Ctrl + Shift + R): Toggle recording
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') {
+    e.preventDefault();
+    handleRecordBtnClick();
+    return;
+  }
+  // Spacebar to toggle recording when not in an editable text field
+  const activeEl = document.activeElement;
+  const isEditingText =
+    activeEl instanceof HTMLInputElement ||
+    activeEl instanceof HTMLTextAreaElement ||
+    activeEl instanceof HTMLSelectElement ||
+    (activeEl && activeEl.getAttribute('contenteditable') === 'true');
+
+  if (e.code === 'Space' && !isEditingText && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    handleRecordBtnClick();
+    return;
   }
 });
+
+// Global shortcut listener from main process
+if (api.onToggleRecording) {
+  api.onToggleRecording(() => {
+    handleRecordBtnClick();
+  });
+}
 
 // Navigation
 navHome.addEventListener('click', () => {
