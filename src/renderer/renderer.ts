@@ -314,8 +314,27 @@ let summaryView: SummaryView = 'preview';
 let selectedModelId: string | null = null;
 let installedModels: string[] = [];
 let activeModel = '';
-let hfSearchTimer: number | undefined;
+let noteSearchTimer: number | undefined;
 let llmLoadTimer: number | undefined;
+let currentSearchQuery = '';
+
+const CUSTOM_FOLDERS_KEY = 'nadabodha_custom_folders';
+
+function getSavedCustomFolders(): string[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_FOLDERS_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCustomFolders(list: string[]): void {
+  try {
+    localStorage.setItem(CUSTOM_FOLDERS_KEY, JSON.stringify(list));
+  } catch { /* ignore */ }
+}
+
 let isRecording = false;
 let recordingInterval: number | undefined;
 let recordingStartTime = 0;
@@ -344,6 +363,16 @@ function formatDate(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) +
     ' ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+}
+
+function formatShortDate(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  } catch {
+    return '';
+  }
 }
 
 function formatDuration(seconds: number): string {
@@ -419,19 +448,41 @@ function renderMarkdown(md: string): void {
 // Notes: loading and rendering
 // ---------------------------------------------------------------------------
 
+function updateNotesListLabel(): void {
+  if (currentSearchQuery) {
+    notesListLabel.textContent = `Search results (${notes.length})`;
+  } else if (currentView === 'all') {
+    notesListLabel.textContent = 'All notes';
+  } else if (currentView === 'dictation') {
+    notesListLabel.textContent = 'Dictation log';
+  } else if (currentView === 'folder') {
+    notesListLabel.textContent = currentFolder || 'Folder';
+  } else {
+    notesListLabel.textContent = 'Recent';
+  }
+}
+
 async function loadNotes(searchQuery = ''): Promise<void> {
   try {
+    currentSearchQuery = searchQuery.trim();
     let result: NoteListResult;
-    if (searchQuery.trim()) {
-      result = await api.searchNotes(searchQuery);
+    if (currentSearchQuery) {
+      result = await api.searchNotes(currentSearchQuery);
     } else {
       result = await api.listNotes();
     }
     notes = result.notes || [];
-    folders = result.folders || [];
+
+    // Merge backend folders with custom persistent folders
+    const backendFolders = result.folders || [];
+    const savedCustomFolders = getSavedCustomFolders();
+    folders = Array.from(new Set([...backendFolders, ...savedCustomFolders])).sort();
     folderCounts = result.folderCounts || {};
 
-    allCount.textContent = String(notes.length);
+    const totalCount = Object.values(folderCounts).reduce((sum, c) => sum + c, 0);
+    allCount.textContent = String(totalCount);
+
+    updateNotesListLabel();
     renderFolderList();
     renderNoteList();
   } catch (err) {
@@ -444,24 +495,73 @@ function renderFolderList(): void {
   for (const folder of folders) {
     const li = document.createElement('li');
     li.className = 'folder-item' + (currentView === 'folder' && currentFolder === folder ? ' active' : '');
-    li.textContent = `${folder}`;
+    li.setAttribute('role', 'listitem');
+
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'nav-icon';
+    iconSpan.setAttribute('aria-hidden', 'true');
+    iconSpan.textContent = '📁';
+    li.appendChild(iconSpan);
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'folder-name';
+    nameSpan.textContent = folder;
+    li.appendChild(nameSpan);
+
     const countSpan = document.createElement('span');
     countSpan.className = 'folder-count';
     countSpan.textContent = String(folderCounts[folder] || 0);
     li.appendChild(countSpan);
-    li.addEventListener('click', () => {
+
+    // Delete folder button (appears on hover)
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'folder-delete-btn';
+    deleteBtn.title = 'Delete folder';
+    deleteBtn.setAttribute('aria-label', `Delete folder ${folder}`);
+    deleteBtn.textContent = '✕';
+    deleteBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const count = folderCounts[folder] || 0;
+      const msg = count > 0
+        ? `Delete folder "${folder}"? Its ${count} note(s) will be moved to Unfiled.`
+        : `Delete folder "${folder}"?`;
+      if (!confirm(msg)) return;
+
+      if (count > 0) {
+        const notesInFolder = notes.filter(n => n.folder === folder);
+        for (const n of notesInFolder) {
+          await api.updateNote({ id: n.id, folder: '' });
+        }
+      }
+
+      const saved = getSavedCustomFolders().filter(f => f !== folder);
+      saveCustomFolders(saved);
+
+      if (currentView === 'folder' && currentFolder === folder) {
+        currentView = 'home';
+        currentFolder = '';
+        setActiveNav(navHome);
+      }
+      await loadNotes(currentSearchQuery);
+    });
+    li.appendChild(deleteBtn);
+
+    li.addEventListener('click', async () => {
+      clearSearch();
       currentView = 'folder';
       currentFolder = folder;
-      notesListLabel.textContent = folder;
       setActiveNav(null);
       renderFolderList();
-      renderNoteList();
+      await loadNotes();
     });
     folderList.appendChild(li);
   }
 }
 
 function filteredNotes(): NoteInfo[] {
+  if (currentSearchQuery) {
+    return notes;
+  }
   switch (currentView) {
     case 'all': return notes;
     case 'dictation': return notes.filter(n => n.source === 'dictation-log');
@@ -474,6 +574,18 @@ function renderNoteList(): void {
   noteList.innerHTML = '';
   const visible = filteredNotes();
   noteListEmpty.hidden = visible.length > 0;
+
+  if (visible.length === 0) {
+    if (currentSearchQuery) {
+      noteListEmpty.textContent = `No notes found matching "${currentSearchQuery}".`;
+    } else if (currentView === 'folder') {
+      noteListEmpty.textContent = `No notes in "${currentFolder}".`;
+    } else if (currentView === 'dictation') {
+      noteListEmpty.textContent = 'No dictation notes yet. Hold ⌥ to dictate.';
+    } else {
+      noteListEmpty.innerHTML = 'No notes yet.<br>Record, import, or dictate to create one.';
+    }
+  }
 
   for (const note of visible) {
     const li = document.createElement('li');
@@ -490,7 +602,7 @@ function renderNoteList(): void {
 
     const date = document.createElement('span');
     date.className = 'note-item-date';
-    date.textContent = new Date(note.created).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    date.textContent = formatShortDate(note.created);
 
     const badge = document.createElement('span');
     badge.className = `source-badge ${note.source}`;
@@ -516,7 +628,7 @@ function renderNoteList(): void {
         noteDetail.hidden = true;
       }
       await api.deleteNote(note.id);
-      await loadNotes();
+      await loadNotes(currentSearchQuery);
     });
     li.appendChild(deleteBtn);
 
@@ -693,7 +805,7 @@ function startRecordingUI(): void {
   }, 1000);
 
   recordBtn.classList.add('recording');
-  recordBtn.querySelector('.action-icon')!.textContent = '⏸';
+  recordBtn.innerHTML = '<span class="action-icon" aria-hidden="true">⏹</span> Stop';
   updateStatusBar({ status: 'recording' });
 }
 
@@ -705,7 +817,7 @@ function stopRecordingUI(): void {
   }
   recordingPill.hidden = true;
   recordBtn.classList.remove('recording');
-  recordBtn.querySelector('.action-icon')!.textContent = '⏺';
+  recordBtn.innerHTML = '<span class="action-icon" aria-hidden="true">⏺</span> Record';
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +836,11 @@ function applyDictationStatus(info: DictationStatusInfo): void {
   dictationHint.textContent = DICTATION_HINT;
   // Checkbox kept for backward compatibility
   dictationEnabledChk.checked = enabled;
+
+  const dictationStrip = document.getElementById('dictationStrip');
+  if (dictationStrip) {
+    dictationStrip.hidden = !supported || !enabled;
+  }
 }
 
 let dictationStatusInterval: number | undefined;
@@ -1589,29 +1706,44 @@ function renderHfSelection(): void {
 // Event wiring
 // ---------------------------------------------------------------------------
 
+function clearSearch(): void {
+  searchInput.value = '';
+  searchClearBtn.hidden = true;
+  currentSearchQuery = '';
+}
+
 // Search
 searchInput.addEventListener('input', () => {
   const q = searchInput.value.trim();
   searchClearBtn.hidden = !q;
-  clearTimeout(hfSearchTimer);
-  hfSearchTimer = window.setTimeout(() => loadNotes(q), 300);
+  clearTimeout(noteSearchTimer);
+  noteSearchTimer = window.setTimeout(() => loadNotes(q), 250);
 });
 
 searchClearBtn.addEventListener('click', () => {
-  searchInput.value = '';
-  searchClearBtn.hidden = true;
+  clearSearch();
   loadNotes();
+  searchInput.focus();
 });
 
 // Keyboard shortcuts
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !settingsPanel.hidden) {
-    closeSettings();
-    return;
+  if (e.key === 'Escape') {
+    if (!settingsPanel.hidden) {
+      closeSettings();
+      return;
+    }
+    if (document.activeElement === searchInput) {
+      clearSearch();
+      loadNotes();
+      searchInput.blur();
+      return;
+    }
   }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
     e.preventDefault();
     searchInput.focus();
+    searchInput.select();
     return;
   }
   // Cmd/Ctrl + R (or Cmd/Ctrl + Shift + R): Toggle recording
@@ -1643,36 +1775,48 @@ if (api.onToggleRecording) {
 }
 
 // Navigation
-navHome.addEventListener('click', () => {
+navHome.addEventListener('click', async () => {
+  clearSearch();
   currentView = 'home';
-  notesListLabel.textContent = 'Recent';
+  currentFolder = '';
   setActiveNav(navHome);
-  renderFolderList();
-  renderNoteList();
+  await loadNotes();
 });
 
-navAll.addEventListener('click', () => {
+navAll.addEventListener('click', async () => {
+  clearSearch();
   currentView = 'all';
-  notesListLabel.textContent = 'All notes';
+  currentFolder = '';
   setActiveNav(navAll);
-  renderFolderList();
-  renderNoteList();
+  await loadNotes();
 });
 
-navDictation.addEventListener('click', () => {
+navDictation.addEventListener('click', async () => {
+  clearSearch();
   currentView = 'dictation';
-  notesListLabel.textContent = 'Dictation log';
+  currentFolder = '';
   setActiveNav(navDictation);
-  renderFolderList();
-  renderNoteList();
+  await loadNotes();
 });
 
 addFolderBtn.addEventListener('click', () => {
   const name = prompt('Folder name:');
   if (!name || !name.trim()) return;
   const folderName = name.trim();
-  if (!folders.includes(folderName)) folders.push(folderName);
+  const saved = getSavedCustomFolders();
+  if (!saved.includes(folderName)) {
+    saved.push(folderName);
+    saveCustomFolders(saved);
+  }
+  if (!folders.includes(folderName)) {
+    folders.push(folderName);
+    folders.sort();
+  }
   renderFolderList();
+  if (selectedNoteId) {
+    const currentNote = notes.find(n => n.id === selectedNoteId);
+    refreshFolderSelect(currentNote?.folder || '');
+  }
 });
 
 // Record buttons (sidebar + empty state)
@@ -1840,13 +1984,13 @@ noteTitle.addEventListener('blur', async () => {
   const newTitle = noteTitle.value.trim();
   if (!newTitle) return;
   await api.updateNote({ id: selectedNoteId, title: newTitle });
-  await loadNotes();
+  await loadNotes(currentSearchQuery);
 });
 
 noteFolderSelect.addEventListener('change', async () => {
   if (!selectedNoteId) return;
   await api.updateNote({ id: selectedNoteId, folder: noteFolderSelect.value });
-  await loadNotes();
+  await loadNotes(currentSearchQuery);
 });
 
 /**
@@ -1919,7 +2063,7 @@ reTranscribeFileInput.addEventListener('change', async () => {
       showError(updateResult.error || 'Failed to attach audio file');
       return;
     }
-    await loadNotes();
+    await loadNotes(currentSearchQuery);
     await openNote(noteId);
     await executeReTranscribe(noteId);
   } catch (err) {
@@ -1936,7 +2080,7 @@ deleteNoteBtn.addEventListener('click', async () => {
   emptyState.hidden = false;
   noteDetail.hidden = true;
   await api.deleteNote(idToDelete);
-  await loadNotes();
+  await loadNotes(currentSearchQuery);
 });
 
 // Dictation
@@ -1947,8 +2091,21 @@ dictationGrantBtn.addEventListener('click', async () => {
 });
 
 // Settings
-settingsBtn.addEventListener('click', openSettings);
+function toggleSettings(): void {
+  if (settingsPanel.hidden) {
+    openSettings();
+  } else {
+    closeSettings();
+  }
+}
+
+settingsBtn.addEventListener('click', toggleSettings);
 settingsCloseBtn.addEventListener('click', closeSettings);
+
+const sidebarBrand = document.querySelector('.sidebar-brand') as HTMLElement | null;
+sidebarBrand?.addEventListener('click', () => {
+  navHome.click();
+});
 settingsSaveBtn.addEventListener('click', saveSettings);
 
 pythonBrowseBtn.addEventListener('click', async () => {
@@ -2128,15 +2285,15 @@ function handleImportQueueEvent(queue: ImportItem[]) {
     if (item.status === 'completed' || item.status === 'cancelled') continue;
 
     const div = document.createElement('div');
-    div.className = 'hf-model-card';
+    div.className = 'queue-card';
     
     const title = document.createElement('h4');
-    title.className = 'hf-model-id';
+    title.className = 'queue-card-title';
     title.textContent = item.filePath.split(/[/\\]/).pop() || item.filePath;
     div.appendChild(title);
 
     const statusP = document.createElement('p');
-    statusP.className = 'hf-model-tags';
+    statusP.className = 'queue-card-status';
     statusP.textContent = `Status: ${item.status}`;
     div.appendChild(statusP);
 
@@ -2160,7 +2317,7 @@ function handleImportQueueEvent(queue: ImportItem[]) {
     cancelBtn.onclick = () => api.cancelImportItem(item.id);
     
     const acts = document.createElement('div');
-    acts.className = 'hf-actions';
+    acts.className = 'queue-card-actions';
     acts.appendChild(cancelBtn);
     div.appendChild(acts);
 
