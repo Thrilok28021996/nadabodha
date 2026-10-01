@@ -111,4 +111,61 @@ describe('TranscriptionService', () => {
       { status: 'completed', origin: 'download' },
     ]);
   });
+
+  it('does not prepend existing transcript or overwrite it during dictation', () => {
+    const service = new TranscriptionService();
+    const internal = service as unknown as {
+      transcript: string;
+      handleAdapterEvent: (event: { status: string; text?: string; origin?: string }) => void;
+      currentOrigin?: string;
+    };
+
+    // Simulate an existing note transcript
+    internal.transcript = 'Existing meeting notes';
+    internal.currentOrigin = 'dictation';
+
+    const events: { status: string; text?: string; origin?: string }[] = [];
+    service.onEvent((event) => events.push(event));
+
+    // Simulate dictation take completion
+    internal.handleAdapterEvent({
+      status: 'completed',
+      text: 'Just spoken words',
+    });
+
+    // Event should contain ONLY the spoken words, not the existing meeting notes
+    expect(events.length).toBe(1);
+    expect(events[0].text).toBe('Just spoken words');
+    expect(events[0].origin).toBe('dictation');
+
+    // Existing transcript should remain intact for the meeting note
+    expect(service.getTranscript()).toBe('Existing meeting notes');
+  });
+
+  it('keeps partial streaming text isolated during dictation', () => {
+    const service = new TranscriptionService();
+    const internal = service as unknown as {
+      transcript: string;
+      runBase: string;
+      handleAdapterEvent: (event: { status: string; text?: string; origin?: string; partial?: boolean }) => void;
+      currentOrigin?: string;
+    };
+
+    internal.transcript = 'Existing meeting notes';
+    internal.runBase = 'Existing meeting notes';
+    internal.currentOrigin = 'dictation';
+
+    const events: { status: string; text?: string; partial?: boolean }[] = [];
+    service.onEvent((event) => events.push(event));
+
+    internal.handleAdapterEvent({
+      status: 'transcribing',
+      text: 'hello world',
+      partial: true,
+    });
+
+    expect(events.length).toBe(1);
+    expect(events[0].text).toBe('hello world');
+  });
 });
+

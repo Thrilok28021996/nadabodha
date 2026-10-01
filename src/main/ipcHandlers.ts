@@ -371,7 +371,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         recorder.start();
         const stream = recorder.getStream();
         if (stream) {
-          transcriptionService.startStreaming(stream, { origin: 'dictation', append: true });
+          transcriptionService.startStreaming(stream, { origin: 'dictation' });
         }
       } catch (err) {
         if (id !== dictationTakeId) return;
@@ -421,9 +421,9 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       const usable =
         outputPath && typeof outputPath.micPath === 'string' && outputPath.micPath.length > 0 && fs.existsSync(outputPath.micPath);
       if (usable) {
-        // Dictation appends: the transcript grows take by take.
+        // Dictation transcribes ONLY this take's audio so cursor paste gets
+        // strictly the freshly spoken words.
         transcriptionService.startTranscription(outputPath, {
-          append: true,
           origin: 'dictation',
         });
       } else {
@@ -533,7 +533,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       ...(dictationNotice ? { dictationNotice } : {})
     };
 
-    if (settings.dataDir) {
+    if (event.origin !== 'dictation' && settings.dataDir) {
       const extracted = extractTagsAndFolder(text);
       if (extracted.tags.length > 0) {
         withSaves = { ...withSaves, tags: extracted.tags };
@@ -551,6 +551,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     const llmConfigured =
       settings.llmBaseUrl.trim().length > 0 && settings.llmModel.trim().length > 0;
     if (
+      event.origin !== 'dictation' &&
       settings.summarizationEnabled &&
       settings.autoSummarize &&
       llmConfigured &&

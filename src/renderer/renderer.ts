@@ -976,14 +976,8 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
     }
     if (status === 'completed' && text) {
       dictationBadge.textContent = '🎙️ Dictation active';
-      // In-app append fallback (plan Stage 2: "append-in-app becomes the
-      // fallback"): the finished take lands in the open transcript view as an
-      // append (text = prior transcript + this take), while the dictation-log
-      // note below keeps the history. Without this the transcript view never
-      // reflected a take unless the log note happened to be selected.
-      transcriptArea.value = text;
-      transcriptArea.style.opacity = '1.0';
-      // Append to existing transcript or create a dictation-log note
+      // Append to today's dictation log note (which updates transcriptArea
+      // immediately if the dictation log note is currently selected).
       appendDictationText(text);
     }
     return;

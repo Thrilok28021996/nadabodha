@@ -105,7 +105,8 @@ export class TranscriptionService {
     this.finishRun(this.adapter);
 
     this.currentOrigin = options.origin;
-    this.runBase = options.append ? this.transcript : '';
+    const isDictation = options.origin === 'dictation';
+    this.runBase = (!isDictation && options.append) ? this.transcript : '';
 
     const micPath = typeof paths === 'string' ? paths : paths.micPath;
     const systemPath = typeof paths === 'string' ? undefined : paths.systemPath;
@@ -115,10 +116,12 @@ export class TranscriptionService {
       return;
     }
 
-    this.currentFilePath = micPath;
-    if (!options.append) {
-      this.transcript = '';
-      this.runBase = '';
+    if (!isDictation) {
+      this.currentFilePath = micPath;
+      if (!options.append) {
+        this.transcript = '';
+        this.runBase = '';
+      }
     }
     this.lastError = undefined;
     this.setState('transcribing', 0);
@@ -166,8 +169,12 @@ export class TranscriptionService {
               this.setState('completed', 100, undefined, this.transcript, words);
               this.finishRun(adapter);
             } else {
-              this.transcript = this.runBase ? joinTranscriptParts(this.runBase, runTranscript) : runTranscript;
-              this.setState('completed', 100, undefined, this.transcript, words);
+              if (isDictation) {
+                this.setState('completed', 100, undefined, runTranscript, words);
+              } else {
+                this.transcript = this.runBase ? joinTranscriptParts(this.runBase, runTranscript) : runTranscript;
+                this.setState('completed', 100, undefined, this.transcript, words);
+              }
               this.finishRun(adapter);
             }
           } else if (event.status === 'error') {
@@ -214,13 +221,16 @@ export class TranscriptionService {
     this.finishRun(this.adapter);
 
     this.currentOrigin = options.origin;
-    this.runBase = options.append ? this.transcript : '';
-    if (!options.append) {
+    const isDictation = options.origin === 'dictation';
+    this.runBase = (!isDictation && options.append) ? this.transcript : '';
+    if (!options.append && !isDictation) {
       this.transcript = '';
       this.runBase = '';
     }
     this.lastError = undefined;
-    this.currentFilePath = null;
+    if (!isDictation) {
+      this.currentFilePath = null;
+    }
     this.setState('transcribing', 0);
 
     const pythonExecutable =
@@ -326,7 +336,9 @@ export class TranscriptionService {
     }
     if (event.status === 'transcribing') {
       if (event.text !== undefined && event.partial) {
-        const partialText = this.runBase ? joinTranscriptParts(this.runBase, event.text) : event.text;
+        const partialText = (this.currentOrigin === 'dictation' || !this.runBase)
+          ? event.text
+          : joinTranscriptParts(this.runBase, event.text);
         this.broadcast({ status: 'transcribing', text: partialText, origin: this.currentOrigin, partial: true });
       } else {
         this.setState('transcribing', event.progress);
@@ -334,12 +346,14 @@ export class TranscriptionService {
     } else if (event.status === 'completed') {
       const fragment = event.text || '';
       const words = event.words;
-      // Append runs (dictation) keep everything dictated so far and add this
-      // take; replace runs overwrite with the new text.
-      this.transcript = this.runBase
-        ? joinTranscriptParts(this.runBase, fragment)
-        : fragment;
-      this.setState('completed', 100, undefined, this.transcript, words);
+      if (this.currentOrigin === 'dictation') {
+        this.setState('completed', 100, undefined, fragment, words);
+      } else {
+        this.transcript = this.runBase
+          ? joinTranscriptParts(this.runBase, fragment)
+          : fragment;
+        this.setState('completed', 100, undefined, this.transcript, words);
+      }
       this.finishRun(source ?? this.adapter);
     } else if (event.status === 'error') {
       this.setState('error', undefined, event.error);
