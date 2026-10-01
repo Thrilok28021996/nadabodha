@@ -111,33 +111,11 @@ export function isAccessibilityTrusted(ask = false): boolean {
   if (process.env.NADABODHA_DICTATION_NO_ACCESSIBILITY === '1') {
     return false;
   }
-  let trusted = false;
   try {
-    trusted = systemPreferences.isTrustedAccessibilityClient(ask);
+    return systemPreferences.isTrustedAccessibilityClient(ask);
   } catch {
-    trusted = false;
+    return false;
   }
-  if (trusted) {
-    return true;
-  }
-  // On macOS, systemPreferences.isTrustedAccessibilityClient(false) queries
-  // AXIsProcessTrusted(), which macOS caches per-process at launch time.
-  // It frequently returns false even after a user toggles permission in System Settings.
-  // In production, probe uiohook directly (which calls AXIsProcessTrustedWithOptions live).
-  // In Jest unit tests, skip probing so mock call assertions stay deterministic.
-  if (!ask && process.env.NODE_ENV !== 'test') {
-    try {
-      const hook = loadDictationHook();
-      if (hook) {
-        hook.start();
-        hook.stop();
-        return true;
-      }
-    } catch {
-      return false;
-    }
-  }
-  return false;
 }
 
 /**
@@ -498,13 +476,20 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   };
 
   const dictationStatus = (): DictationStatusInfo => {
-    // BLOCKING-1: every status read (the renderer's post-grant polling loop
-    // included) re-confirms Accessibility trust, and the first read that sees
-    // it flip false->true runs the guarded start before the status is built.
+    // Every status poll attempts reconcileAccessibility(). reconcileAccessibility()
+    // calls start() unconditionally when not running; start() has the live trust
+    // check inside it. If the hook starts, lastOutcome becomes 'started'.
+    // We then derive accessibilityTrusted from lastOutcome rather than calling
+    // isAccessibilityTrusted() again — the probe approach caused uiohook singleton
+    // conflicts and returned false even after the user granted permission.
     dictation?.reconcileAccessibility();
     const enabled = settingsStore.get().dictationEnabled !== false;
     const running = dictation !== null && dictation.isRunning();
-    const accessibilityTrusted = running || isAccessibilityTrusted(false);
+    // 'no-accessibility' means trust was explicitly denied by the OS crash guard.
+    // Every other outcome (started, disabled, hook-error, already-running) means
+    // the OS allowed us past the trust check, so the banner must be hidden.
+    const lastOutcome = dictation?.getLastOutcome();
+    const accessibilityTrusted = running || (lastOutcome !== undefined && lastOutcome !== 'no-accessibility');
     let reason: string | undefined;
     if (!dictation) reason = 'uiohook-napi failed to load';
     else if (!enabled) reason = 'disabled';

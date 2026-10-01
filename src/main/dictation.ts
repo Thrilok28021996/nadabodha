@@ -236,27 +236,26 @@ export class DictationController {
   }
 
   /**
-   * Re-read Accessibility trust and run the guarded start when trust has just
-   * flipped false->true (review finding BLOCKING-1).
+   * Attempt to (re-)start the hook whenever we are not already running.
+   * start() already contains the full crash guard (trust check + hook.start()),
+   * so we can call it unconditionally here — it is idempotent when already
+   * running and handles every failure outcome internally.
    *
-   * The renderer's post-grant polling reaches this through the status IPC, so
-   * whichever side first observes the grant turns it into a start without the
-   * user toggling anything. Each transition triggers exactly one start attempt;
-   * start() itself re-checks trust immediately before hook.start().
+   * The renderer's post-grant polling reaches this every 1.5 s through the
+   * status IPC. On each poll we try start(); the first poll after the user
+   * grants Accessibility permission will succeed and the banner will disappear
+   * on the very next render cycle.
+   *
+   * Exception: do NOT auto-restart after 'hook-error'. A hook error means the
+   * native event tap died (e.g. the OS revoked it); silently restarting would
+   * mask real failures. The user must restart the app to recover.
    */
   reconcileAccessibility(): void {
     if (this.running) {
       return;
     }
-    let trusted = false;
-    try {
-      trusted = this.isTrustedAccessibilityClient(false);
-    } catch {
-      trusted = false;
-    }
-    const wasTrusted = this.wasTrusted;
-    this.wasTrusted = trusted;
-    if (!trusted || (wasTrusted && this.lastOutcome !== 'no-accessibility')) {
+    // Do not auto-restart after a native hook failure — it could loop.
+    if (this.lastOutcome === 'hook-error') {
       return;
     }
     this.start();
