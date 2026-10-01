@@ -7,6 +7,8 @@ import { TranscriptionService } from './transcriptionService';
 import { SettingsStore, resolvePythonExecutable, settingsFilePath } from './settingsStore';
 import { NoteStore } from './noteStore';
 
+app.setName('Nadabodha');
+
 // Suppress benign EPIPE errors from child process stream closures so they don't trigger
 // unhandled exception dialogs.
 process.on('uncaughtException', (err: Error) => {

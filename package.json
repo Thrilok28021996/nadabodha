@@ -1,5 +1,6 @@
 {
   "name": "nadabodha",
+  "productName": "Nadabodha",
   "version": "0.1.0",
   "description": "Local audio transcription macOS desktop app (Electron + Python)",
   "main": "dist/main/main.js",

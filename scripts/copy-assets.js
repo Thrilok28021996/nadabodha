@@ -65,3 +65,29 @@ vendorIntoRenderer(path.join(root, 'node_modules', 'marked', 'lib', 'marked.umd.
 vendorIntoRenderer(path.join(root, 'node_modules', 'dompurify', 'dist', 'purify.min.js'), 'dompurify');
 vendorIntoRenderer(path.join(root, 'node_modules', 'dompurify', 'dist', 'purify.min.js.map'), 'dompurify sourcemap');
 
+// On macOS, customize local Electron.app bundle info and icon for dev mode
+if (process.platform === 'darwin') {
+  const electronAppDir = path.join(root, 'node_modules', 'electron', 'dist', 'Electron.app');
+  const infoPlist = path.join(electronAppDir, 'Contents', 'Info.plist');
+  const resourcesDir = path.join(electronAppDir, 'Contents', 'Resources');
+  const electronIcns = path.join(resourcesDir, 'electron.icns');
+  const sourceIcns = path.join(assetsDir, 'icon.icns');
+
+  if (fs.existsSync(electronAppDir)) {
+    try {
+      const { execFileSync } = require('child_process');
+      if (fs.existsSync(infoPlist)) {
+        execFileSync('plutil', ['-replace', 'CFBundleDisplayName', '-string', 'Nadabodha', infoPlist]);
+        execFileSync('plutil', ['-replace', 'CFBundleName', '-string', 'Nadabodha', infoPlist]);
+      }
+      if (fs.existsSync(sourceIcns) && fs.existsSync(resourcesDir)) {
+        fs.copyFileSync(sourceIcns, electronIcns);
+      }
+      console.log('Patched local Electron.app bundle metadata for macOS dev mode');
+    } catch (err) {
+      console.warn('Could not patch local Electron.app bundle:', err.message);
+    }
+  }
+}
+
+
