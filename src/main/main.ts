@@ -1,4 +1,4 @@
-import { app, BrowserWindow, globalShortcut } from 'electron';
+import { app, BrowserWindow, globalShortcut, nativeImage } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import { setupIpcHandlers } from './ipcHandlers';
@@ -34,21 +34,6 @@ function resolveAppIcon(): string | undefined {
   return undefined;
 }
 
-function resolveDockIcon(): string | undefined {
-  const candidates = [
-    path.join(__dirname, '../assets/icon.icns'),
-    path.join(__dirname, '../../assets/icon.icns'),
-    path.join(app.getAppPath(), 'assets/icon.icns'),
-    path.join(app.getAppPath(), 'dist/assets/icon.icns'),
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return resolveAppIcon();
-}
-
 function createWindow(): void {
   const iconPath = resolveAppIcon();
 
@@ -81,10 +66,13 @@ function createWindow(): void {
 app.whenReady().then(() => {
   // Set native macOS dock icon if running on macOS
   if (process.platform === 'darwin' && app.dock) {
-    const dockIcon = resolveDockIcon();
-    if (dockIcon) {
+    const iconPath = resolveAppIcon();
+    if (iconPath) {
       try {
-        app.dock.setIcon(dockIcon);
+        const iconImage = nativeImage.createFromPath(iconPath);
+        if (!iconImage.isEmpty()) {
+          app.dock.setIcon(iconImage);
+        }
       } catch (err) {
         console.warn('[Dock] Failed to set dock icon:', err);
       }
