@@ -35,6 +35,8 @@ enum IpcChannel {
   DeleteNote = 'delete-note',
   ReadNoteContent = 'read-note-content',
   ListFolders = 'list-folders',
+  CreateFolder = 'create-folder',
+  DeleteFolder = 'delete-folder',
   SearchNotes = 'search-notes',
   ReTranscribe = 're-transcribe',
   EnqueueImports = 'enqueue-imports',
@@ -42,6 +44,7 @@ enum IpcChannel {
   RemoveImportItem = 'remove-import-item',
   ImportQueueEvent = 'import-queue-event',
   PickWatchFolder = 'pick-watch-folder',
+  CleanOldAudio = 'clean-old-audio',
 }
 
 
@@ -73,6 +76,7 @@ interface TranscriptionEvent {
   savedSummaryPath?: string;
   saveError?: string;
   partial?: boolean;
+  tags?: string[];
 }
 
 interface SaveTranscriptRequest {
@@ -102,6 +106,7 @@ interface AppSettings {
   dictationPasteEnabled?: boolean;
   meetingModeEnabled?: boolean;
   watchFolderDir?: string;
+  audioRetentionDays?: number;
 }
 
 interface ImportItem {
@@ -165,6 +170,7 @@ interface NoteInfo {
   created: string;
   source: NoteSource;
   folder: string;
+  tags?: string[];
   duration: number;
   model: string;
   transcribed_at?: string;
@@ -195,20 +201,24 @@ interface NoteCreateRequest {
   title?: string;
   source: NoteSource;
   folder?: string;
+  tags?: string[];
   transcript?: string;
   audioPath?: string;
+  words?: {word: string, start: number, end: number}[];
 }
 
 interface NoteUpdateRequest {
   id: string;
   title?: string;
   folder?: string;
+  tags?: string[];
   transcript?: string;
   summary?: string;
   model?: string;
   audioPath?: string;
   markSummaryStale?: boolean;
   clearSummaryStale?: boolean;
+  words?: {word: string, start: number, end: number}[];
 }
 
 interface NoteActionResult {
@@ -256,6 +266,8 @@ export interface ElectronApi {
   deleteNote: (id: string) => Promise<NoteActionResult>;
   readNoteContent: (id: string) => Promise<NoteGetResult>;
   listFolders: () => Promise<{ folders: string[]; counts: Record<string, number> }>;
+  createFolder: (name: string) => Promise<{ success: boolean; data?: string; error?: string }>;
+  deleteFolder: (name: string) => Promise<{ success: boolean; error?: string }>;
   searchNotes: (query: string) => Promise<NoteListResult>;
   reTranscribe: (noteId: string) => Promise<{ started: boolean; error?: string; runId?: number }>;
   // Stage 5
@@ -266,6 +278,7 @@ export interface ElectronApi {
   onImportQueueEvent: (callback: (queue: ImportItem[]) => void) => void;
   removeImportQueueListener: () => void;
   onToggleRecording: (callback: () => void) => () => void;
+  cleanOldAudio: (days?: number) => Promise<{ success: boolean; deletedCount: number; freedBytes: number; error?: string }>;
 }
 
 const api: ElectronApi = {
@@ -316,6 +329,8 @@ const api: ElectronApi = {
   deleteNote: (id) => ipcRenderer.invoke(IpcChannel.DeleteNote, id),
   readNoteContent: (id) => ipcRenderer.invoke(IpcChannel.ReadNoteContent, id),
   listFolders: () => ipcRenderer.invoke(IpcChannel.ListFolders),
+  createFolder: (name) => ipcRenderer.invoke(IpcChannel.CreateFolder, name),
+  deleteFolder: (name) => ipcRenderer.invoke(IpcChannel.DeleteFolder, name),
   searchNotes: (query) => ipcRenderer.invoke(IpcChannel.SearchNotes, query),
   reTranscribe: (noteId) => ipcRenderer.invoke(IpcChannel.ReTranscribe, { noteId }),
   pickWatchFolder: () => ipcRenderer.invoke(IpcChannel.PickWatchFolder),
@@ -336,6 +351,7 @@ const api: ElectronApi = {
     ipcRenderer.on('toggle-recording', listener);
     return () => ipcRenderer.removeListener('toggle-recording', listener);
   },
+  cleanOldAudio: (days) => ipcRenderer.invoke(IpcChannel.CleanOldAudio, days),
 };
 
 contextBridge.exposeInMainWorld('electronAPI', api);

@@ -330,5 +330,22 @@ describe('customPrompts and prompt purpose configuration', () => {
     expect(normalizeAccelerator('f9')).toBe('F9');
     expect(normalizeAccelerator('')).toBe('');
   });
+
+  it('defaultSettings includes audioRetentionDays of 90', () => {
+    const settings = defaultSettings();
+    expect(settings.audioRetentionDays).toBe(90);
+  });
+
+  it('mergeSettings preserves or updates audioRetentionDays', () => {
+    const base = defaultSettings();
+    const updated = mergeSettings(base, { audioRetentionDays: 30 });
+    expect(updated.audioRetentionDays).toBe(30);
+
+    const fromString = mergeSettings(base, { audioRetentionDays: '60' as any });
+    expect(fromString.audioRetentionDays).toBe(60);
+
+    const zero = mergeSettings(base, { audioRetentionDays: 0 });
+    expect(zero.audioRetentionDays).toBe(0);
+  });
 });
 

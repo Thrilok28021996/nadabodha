@@ -147,6 +147,8 @@
               <span id="noteDate" class="note-date"></span>
               <span id="noteDuration" class="note-duration"></span>
               <span id="noteSource" class="note-source-badge"></span>
+              <div id="noteTagsList" class="note-tags-list"></div>
+              <button id="addTagBtn" class="add-tag-btn" type="button" title="Add tag">+ Tag</button>
             </div>
           </div>
           <div class="note-header-actions">
@@ -275,6 +277,18 @@
               <button id="watchFolderBrowseBtn" type="button" class="chip-btn">Browse…</button>
               <button id="watchFolderClearBtn" type="button" class="chip-btn">Clear</button>
             </div>
+          </div>
+
+          <!-- Audio recording retention -->
+          <div class="setting-group">
+            <h3>Audio recording retention</h3>
+            <p class="setting-desc">Automatically delete audio recordings older than this number of days (default 90) to save disk space. Transcripts, summaries, and note text are never deleted. Set to 0 to keep audio indefinitely.</p>
+            <div class="setting-row">
+              <input type="number" id="audioRetentionDaysInput" min="0" max="3650" step="1" value="90" style="width: 90px;" aria-label="Audio retention days">
+              <span class="setting-sublabel">days</span>
+              <button id="cleanOldAudioBtn" type="button" class="chip-btn">Clean up now</button>
+            </div>
+            <p id="audioRetentionStatus" class="setting-status"></p>
           </div>
 
           <!-- STT model cache -->

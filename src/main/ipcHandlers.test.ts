@@ -107,6 +107,9 @@ const mockNoteStore = {
   create: jest.fn(),
   update: jest.fn(),
   delete: jest.fn(),
+  createFolder: jest.fn((name: string) => ({ success: true, data: name })),
+  deleteFolder: jest.fn(() => ({ success: true })),
+  deleteOldAudioRecordings: jest.fn(() => ({ deletedCount: 0, freedBytes: 0 })),
   reindex: jest.fn(() => ({ success: true })),
   setDataDir: jest.fn(() => ({ success: true })),
   migrateFromLegacy: jest.fn(),
@@ -502,6 +505,29 @@ describe('recording shortcut management', () => {
     const settingsSetHandler = handlerFor(IpcChannel.SettingsSet);
     const result = (await settingsSetHandler({}, { recordingShortcut: 'Space' })) as SettingsUpdateResult;
     expect(result.errors.recordingShortcut).toContain('Space alone cannot be used as a keybinding');
+  });
+});
+
+describe('Folder and CleanOldAudio IPC handlers', () => {
+  it('handles CreateFolder and DeleteFolder', async () => {
+    setup(true);
+    const createFolderHandler = handlerFor(IpcChannel.CreateFolder);
+    const res = (await createFolderHandler({}, 'TestFolder')) as { success: boolean; data?: string };
+    expect(res.success).toBe(true);
+    expect(res.data).toBe('TestFolder');
+
+    const deleteFolderHandler = handlerFor(IpcChannel.DeleteFolder);
+    const delRes = (await deleteFolderHandler({}, 'TestFolder')) as { success: boolean };
+    expect(delRes.success).toBe(true);
+  });
+
+  it('handles CleanOldAudio with retention days', async () => {
+    setup(true);
+    const cleanOldAudioHandler = handlerFor(IpcChannel.CleanOldAudio);
+    const res = (await cleanOldAudioHandler({}, 90)) as { success: boolean; deletedCount: number; freedBytes: number };
+    expect(res.success).toBe(true);
+    expect(typeof res.deletedCount).toBe('number');
+    expect(typeof res.freedBytes).toBe('number');
   });
 });
 

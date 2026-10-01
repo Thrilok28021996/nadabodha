@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { NoteStore, NoteRecord } from './noteStore';
+import { NoteStore, NoteRecord, extractTagsAndFolder } from './noteStore';
 
 /** Create a fresh temp directory for each test. */
 function tmpDir(): string {
@@ -390,5 +390,182 @@ describe('NoteStore: migrateFromLegacy', () => {
     // track which files were already imported).
     // This is acceptable per the plan: "additive only — never delete user files".
     expect(store.list().length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('extractTagsAndFolder', () => {
+  it('extracts hashtags from text', () => {
+    const res = extractTagsAndFolder('Discussion about #architecture and #performance.');
+    expect(res.tags).toContain('Architecture');
+    expect(res.tags).toContain('Performance');
+    expect(res.folder).toBe('Architecture');
+  });
+
+  it('extracts keywords for common categories', () => {
+    const res = extractTagsAndFolder('Weekly team standup sync and agenda review');
+    expect(res.tags).toContain('Meeting');
+    expect(res.folder).toBe('Meetings');
+  });
+
+  it('extracts candidate/interview keywords', () => {
+    const res = extractTagsAndFolder('Candidate interview for senior backend engineer');
+    expect(res.tags).toContain('Interview');
+    expect(res.folder).toBe('Interviews');
+  });
+
+  it('handles dictation-log source', () => {
+    const res = extractTagsAndFolder('Some random text', 'Note title', 'dictation-log');
+    expect(res.tags).toContain('Dictation');
+    expect(res.folder).toBe('Dictation');
+  });
+});
+
+describe('NoteStore: folders on disk and tags', () => {
+  let dir: string;
+  let store: NoteStore;
+
+  beforeEach(() => {
+    dir = tmpDir();
+    store = new NoteStore(dir);
+    store.reindex();
+  });
+
+  afterEach(() => cleanup(dir));
+
+  it('creates folders on disk using createFolder', () => {
+    const res = store.createFolder('ProjectAlpha');
+    expect(res.success).toBe(true);
+    expect(res.data).toBe('ProjectAlpha');
+    expect(fs.existsSync(path.join(dir, 'folders', 'ProjectAlpha'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'transcripts', 'ProjectAlpha'))).toBe(true);
+    expect(store.folders()).toContain('ProjectAlpha');
+  });
+
+  it('deletes folder from disk and moves notes to Unfiled', () => {
+    store.createFolder('TempFolder');
+    const note = store.create({ source: 'recording', title: 'FolderNote', folder: 'TempFolder' }).data!;
+    expect(note.folder).toBe('TempFolder');
+
+    const delRes = store.deleteFolder('TempFolder');
+    expect(delRes.success).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'folders', 'TempFolder'))).toBe(false);
+
+    const refreshed = store.get(note.id)!;
+    expect(refreshed.folder).toBe('');
+  });
+
+  it('auto-detects tags and moves note to tag folder on create', () => {
+    const note = store.create({
+      source: 'recording',
+      transcript: 'Talking about #Roadmap and project goals',
+    }).data!;
+    expect(note.tags).toContain('Roadmap');
+    expect(note.folder).toBe('Roadmap');
+    expect(fs.existsSync(path.join(dir, 'folders', 'Roadmap'))).toBe(true);
+  });
+
+  it('moves note to folder when user adds tags to unfiled note', () => {
+    const note = store.create({ source: 'recording', title: 'Untitled Note' }).data!;
+    expect(note.folder).toBe('');
+
+    const updated = store.update(note.id, { tags: ['SprintPlanning'] }).data!;
+    expect(updated.tags).toEqual(['SprintPlanning']);
+    expect(updated.folder).toBe('SprintPlanning');
+    expect(fs.existsSync(path.join(dir, 'folders', 'SprintPlanning'))).toBe(true);
+  });
+
+  it('searches notes by tag name', () => {
+    store.create({ source: 'recording', title: 'Note 1', tags: ['Backend'] });
+    store.create({ source: 'recording', title: 'Note 2', tags: ['Frontend'] });
+
+    const searchResults = store.search('backend');
+    expect(searchResults).toHaveLength(1);
+    expect(searchResults[0].title).toBe('Note 1');
+  });
+});
+
+describe('NoteStore: deleteOldAudioRecordings', () => {
+  let dir: string;
+  let store: NoteStore;
+
+  beforeEach(() => {
+    dir = tmpDir();
+    store = new NoteStore(dir);
+    store.reindex();
+  });
+
+  afterEach(() => cleanup(dir));
+
+  it('deletes audio recordings older than retention days while preserving note text and files', () => {
+    // Fake audio file
+    const audioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retention-audio-'));
+    const fakeAudioPath1 = path.join(audioDir, 'rec1.wav');
+    const fakeAudioPath2 = path.join(audioDir, 'rec2.wav');
+    fs.writeFileSync(fakeAudioPath1, Buffer.alloc(1024, 1));
+    fs.writeFileSync(fakeAudioPath2, Buffer.alloc(2048, 2));
+
+    // Note 1: Old note (100 days old)
+    const note1 = store.create({
+      source: 'recording',
+      title: 'Old Meeting',
+      transcript: 'Important meeting notes from 100 days ago',
+      audioPath: fakeAudioPath1,
+    }).data!;
+
+    // Note 2: Recent note (10 days old)
+    const note2 = store.create({
+      source: 'recording',
+      title: 'Recent Meeting',
+      transcript: 'Recent meeting notes',
+      audioPath: fakeAudioPath2,
+    }).data!;
+
+    // Backdate note 1 on disk and in index to 100 days ago
+    const oldDate = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
+    const rawNote1 = fs.readFileSync(note1.noteFile, 'utf8');
+    fs.writeFileSync(note1.noteFile, rawNote1.replace(/created: [^\n]+/, `created: ${oldDate.toISOString()}`));
+    store.reindex();
+
+    const note1Refreshed = store.get(note1.id)!;
+    const note1AudioPath = note1Refreshed.audio!;
+    expect(fs.existsSync(note1AudioPath)).toBe(true);
+
+    const note2Refreshed = store.get(note2.id)!;
+    const note2AudioPath = note2Refreshed.audio!;
+    expect(fs.existsSync(note2AudioPath)).toBe(true);
+
+    // Run cleanup with 90 days retention
+    const result = store.deleteOldAudioRecordings(90);
+    expect(result.deletedCount).toBe(1);
+    expect(result.freedBytes).toBe(1024);
+
+    // Note 1 audio file should be removed from disk
+    expect(fs.existsSync(note1AudioPath)).toBe(false);
+
+    // Note 1 markdown file, transcript, and metadata MUST BE INTACT ("not the files")
+    expect(fs.existsSync(note1.noteFile)).toBe(true);
+    const content = store.readContent(note1.id);
+    expect(content.data!.transcript).toBe('Important meeting notes from 100 days ago');
+    expect(store.get(note1.id)!.audio).toBeUndefined();
+
+    // Note 2 audio file must NOT be deleted (recent, within 90 days)
+    expect(fs.existsSync(note2AudioPath)).toBe(true);
+    expect(store.get(note2.id)!.audio).toBeTruthy();
+
+    cleanup(audioDir);
+  });
+
+  it('does nothing when retentionDays is 0 or negative (keep indefinitely)', () => {
+    const audioDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retention-audio-'));
+    const fakeAudioPath = path.join(audioDir, 'rec.wav');
+    fs.writeFileSync(fakeAudioPath, Buffer.alloc(512));
+
+    const note = store.create({ source: 'recording', audioPath: fakeAudioPath }).data!;
+    const res = store.deleteOldAudioRecordings(0);
+    expect(res.deletedCount).toBe(0);
+    expect(res.freedBytes).toBe(0);
+    expect(fs.existsSync(note.audio!)).toBe(true);
+
+    cleanup(audioDir);
   });
 });

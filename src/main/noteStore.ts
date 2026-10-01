@@ -35,6 +35,7 @@ export interface NoteFrontmatter {
   created: string; // ISO 8601
   source: NoteSource;
   folder: string;  // '' = Unfiled
+  tags?: string[];
   duration: number; // seconds, 0 if unknown
   model: string;   // HF repo id of the model used to transcribe, '' if none
   transcribed_at?: string; // ISO 8601, set after first transcription
@@ -48,6 +49,7 @@ export interface NoteRecord {
   created: Date;
   source: NoteSource;
   folder: string;
+  tags: string[];
   duration: number;
   model: string;
   transcribed_at?: Date;
@@ -68,6 +70,7 @@ export interface NoteCreateOptions {
   title?: string;
   source: NoteSource;
   folder?: string;
+  tags?: string[];
   duration?: number;
   model?: string;
   transcript?: string;
@@ -78,6 +81,7 @@ export interface NoteCreateOptions {
 export interface NoteUpdateOptions {
   title?: string;
   folder?: string;
+  tags?: string[];
   transcript?: string;
   summary?: string;
   model?: string;
@@ -111,6 +115,9 @@ function serializeFrontmatter(fm: NoteFrontmatter): string {
   lines.push(`folder: ${yamlString(fm.folder)}`);
   lines.push(`duration: ${fm.duration}`);
   lines.push(`model: ${yamlString(fm.model)}`);
+  if (fm.tags && fm.tags.length > 0) {
+    lines.push(`tags: [${fm.tags.map((t) => yamlString(t)).join(', ')}]`);
+  }
   if (fm.transcribed_at) {
     lines.push(`transcribed_at: ${fm.transcribed_at}`);
   }
@@ -156,6 +163,17 @@ function parseFrontmatter(raw: string): { fm: Partial<NoteFrontmatter>; body: st
       case 'audio':
         (fm as Record<string, string>)[key] = value;
         break;
+      case 'tags': {
+        let tagStr = value;
+        if (tagStr.startsWith('[') && tagStr.endsWith(']')) {
+          tagStr = tagStr.slice(1, -1);
+        }
+        fm.tags = tagStr
+          .split(',')
+          .map((t) => t.trim().replace(/^["']|["']$/g, ''))
+          .filter(Boolean);
+        break;
+      }
       case 'source':
         fm.source = value as NoteSource;
         break;
@@ -168,6 +186,72 @@ function parseFrontmatter(raw: string): { fm: Partial<NoteFrontmatter>; body: st
     }
   }
   return { fm, body };
+}
+
+// ---------------------------------------------------------------------------
+// Tag & Folder extraction helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract tags and determine primary folder from text, title, or source.
+ * Extracts hashtags (#meeting, #ideas) and common keywords.
+ */
+export function extractTagsAndFolder(
+  text: string,
+  title?: string,
+  source?: NoteSource
+): { tags: string[]; folder: string } {
+  const combined = `${title ?? ''} ${text ?? ''}`;
+  const tagsSet = new Set<string>();
+
+  // 1. Extract hashtags: e.g. #meeting, #work, #idea-1
+  const hashtagRegex = /#([a-zA-Z0-9_\-]+)/g;
+  let match;
+  let hashtagFolder = '';
+  while ((match = hashtagRegex.exec(combined)) !== null) {
+    const rawTag = match[1];
+    if (rawTag.length > 0) {
+      const normalized = rawTag.charAt(0).toUpperCase() + rawTag.slice(1);
+      tagsSet.add(normalized);
+      if (!hashtagFolder) {
+        hashtagFolder = normalized;
+      }
+    }
+  }
+
+  // 2. Keyword rules for auto-tagging
+  const lower = combined.toLowerCase();
+  const keywordMap: Array<{ keywords: string[]; tag: string; folder: string }> = [
+    { keywords: ['meeting', 'standup', 'sync', 'agenda', 'minutes of the meeting', 'all-hands'], tag: 'Meeting', folder: 'Meetings' },
+    { keywords: ['interview', 'candidate', 'resume', 'hiring', 'applicant'], tag: 'Interview', folder: 'Interviews' },
+    { keywords: ['lecture', 'class', 'course', 'professor', 'homework', 'syllabus'], tag: 'Lecture', folder: 'Lectures' },
+    { keywords: ['brainstorm', 'idea', 'concept', 'proposal'], tag: 'Ideas', folder: 'Ideas' },
+    { keywords: ['sprint', 'jira', 'task', 'project', 'deadline', 'client'], tag: 'Work', folder: 'Work' },
+    { keywords: ['journal', 'diary', 'personal', 'reflection'], tag: 'Personal', folder: 'Personal' },
+  ];
+
+  let detectedFolder = hashtagFolder;
+
+  for (const rule of keywordMap) {
+    if (rule.keywords.some((kw) => lower.includes(kw))) {
+      tagsSet.add(rule.tag);
+      if (!detectedFolder) {
+        detectedFolder = rule.folder;
+      }
+    }
+  }
+
+  if (source === 'dictation-log') {
+    tagsSet.add('Dictation');
+    if (!detectedFolder) detectedFolder = 'Dictation';
+  }
+
+  const tags = Array.from(tagsSet);
+  if (!detectedFolder && tags.length > 0) {
+    detectedFolder = tags[0];
+  }
+
+  return { tags, folder: detectedFolder };
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +273,7 @@ function iso(date: Date = new Date()): string {
 const NOTE_MD = 'note.md';
 const SUMMARY_MD = 'summary.md';
 const NOTES_SUBDIR = 'notes';
+const FOLDERS_SUBDIR = 'folders';
 
 // ---------------------------------------------------------------------------
 // NoteStore
@@ -197,11 +282,13 @@ const NOTES_SUBDIR = 'notes';
 export class NoteStore {
   private dataDir: string;
   private notesDir: string;
+  private foldersDir: string;
   private index: Map<string, NoteRecord> = new Map();
 
   constructor(dataDir: string) {
     this.dataDir = dataDir;
     this.notesDir = path.join(dataDir, NOTES_SUBDIR);
+    this.foldersDir = path.join(dataDir, FOLDERS_SUBDIR);
   }
 
   /**
@@ -213,20 +300,22 @@ export class NoteStore {
     if (dataDir !== this.dataDir) {
       this.dataDir = dataDir;
       this.notesDir = path.join(dataDir, NOTES_SUBDIR);
+      this.foldersDir = path.join(dataDir, FOLDERS_SUBDIR);
     }
     return this.reindex();
   }
 
   /**
-   * Ensure the notes directory exists and rebuild the in-memory index from
-   * disk.  Call once on startup (and after the user changes their data dir).
+   * Ensure the notes and folders directory exist and rebuild the in-memory index from
+   * disk. Call once on startup (and after the user changes their data dir).
    * Never throws; errors are logged to stderr.
    */
   reindex(): NoteStoreResult<NoteRecord[]> {
     try {
       fs.mkdirSync(this.notesDir, { recursive: true });
+      fs.mkdirSync(this.foldersDir, { recursive: true });
     } catch (err) {
-      return { success: false, error: `Cannot create notes dir: ${errorMsg(err)}` };
+      return { success: false, error: `Cannot create notes or folders dir: ${errorMsg(err)}` };
     }
 
     const records: NoteRecord[] = [];
@@ -260,6 +349,7 @@ export class NoteStore {
           created: new Date(fm.created),
           source: fm.source || 'unknown',
           folder: fm.folder || '',
+          tags: fm.tags || [],
           duration: fm.duration || 0,
           model: fm.model || '',
           transcribed_at: fm.transcribed_at ? new Date(fm.transcribed_at) : undefined,
@@ -292,11 +382,25 @@ export class NoteStore {
     return this.index.get(id);
   }
 
-  /** Unique list of non-empty folder names, sorted alphabetically. */
+  /** Unique list of non-empty folder names from index and disk, sorted alphabetically. */
   folders(): string[] {
     const set = new Set<string>();
+    // Collect from indexed notes
     for (const r of this.index.values()) {
       if (r.folder) set.add(r.folder);
+    }
+    // Collect from folders directory on disk
+    if (fs.existsSync(this.foldersDir)) {
+      try {
+        const entries = fs.readdirSync(this.foldersDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !entry.name.startsWith('.')) {
+            set.add(entry.name);
+          }
+        }
+      } catch (err) {
+        console.error(`[NoteStore] Failed to read foldersDir:`, err);
+      }
     }
     return Array.from(set).sort();
   }
@@ -304,6 +408,9 @@ export class NoteStore {
   /** Count of notes in each folder. */
   folderCounts(): Record<string, number> {
     const counts: Record<string, number> = {};
+    for (const f of this.folders()) {
+      counts[f] = 0;
+    }
     for (const r of this.index.values()) {
       const f = r.folder || '';
       counts[f] = (counts[f] || 0) + 1;
@@ -311,13 +418,61 @@ export class NoteStore {
     return counts;
   }
 
-  /** Simple full-text search over titles and transcript bodies. */
+  /**
+   * Create a folder on disk in folders/ and transcripts/.
+   */
+  createFolder(name: string): NoteStoreResult<string> {
+    const clean = name.trim().replace(/[\\/:*?"<>|]/g, '');
+    if (!clean) {
+      return { success: false, error: 'Folder name cannot be empty or contain invalid characters' };
+    }
+    try {
+      const folderPath = path.join(this.foldersDir, clean);
+      fs.mkdirSync(folderPath, { recursive: true });
+      const transcriptsFolderPath = path.join(this.dataDir, 'transcripts', clean);
+      fs.mkdirSync(transcriptsFolderPath, { recursive: true });
+      return { success: true, data: clean };
+    } catch (err) {
+      return { success: false, error: `Failed to create folder: ${errorMsg(err)}` };
+    }
+  }
+
+  /**
+   * Delete a folder from disk and move any notes in it to Unfiled.
+   */
+  deleteFolder(name: string): NoteStoreResult {
+    const clean = name.trim();
+    if (!clean) {
+      return { success: false, error: 'Invalid folder name' };
+    }
+    try {
+      const folderPath = path.join(this.foldersDir, clean);
+      if (fs.existsSync(folderPath)) {
+        fs.rmSync(folderPath, { recursive: true, force: true });
+      }
+      // Re-assign all notes in this folder to unfiled ('')
+      for (const record of this.index.values()) {
+        if (record.folder === clean) {
+          this.update(record.id, { folder: '' });
+        }
+      }
+      return { success: true };
+    } catch (err) {
+      return { success: false, error: `Failed to delete folder: ${errorMsg(err)}` };
+    }
+  }
+
+  /** Simple full-text search over titles, transcript bodies, folders, and tags. */
   search(query: string): NoteRecord[] {
     if (!query.trim()) return this.list();
     const q = query.toLowerCase();
     const results: NoteRecord[] = [];
     for (const r of this.index.values()) {
-      if (r.title.toLowerCase().includes(q)) {
+      if (
+        r.title.toLowerCase().includes(q) ||
+        r.folder.toLowerCase().includes(q) ||
+        (r.tags && r.tags.some((t) => t.toLowerCase().includes(q)))
+      ) {
         results.push(r);
         continue;
       }
@@ -396,12 +551,37 @@ export class NoteStore {
       }
     }
 
+    let folder = options.folder ?? '';
+    let tags = options.tags ? [...options.tags] : [];
+
+    // If tags or folder not specified, auto-detect from content/title
+    if (tags.length === 0 || !folder) {
+      const auto = extractTagsAndFolder(options.transcript ?? '', options.title, options.source);
+      if (tags.length === 0 && auto.tags.length > 0) {
+        tags = auto.tags;
+      }
+      if (!folder && auto.folder) {
+        folder = auto.folder;
+      }
+    }
+
+    // Ensure folder exists on disk if non-empty
+    if (folder) {
+      try {
+        fs.mkdirSync(path.join(this.foldersDir, folder), { recursive: true });
+        fs.mkdirSync(path.join(this.dataDir, 'transcripts', folder), { recursive: true });
+      } catch (err) {
+        console.error(`[NoteStore] Could not create folder directory for ${folder}:`, err);
+      }
+    }
+
     const fm: NoteFrontmatter = {
       id,
       title: options.title || defaultTitle(options.source, now),
       created: iso(now),
       source: options.source,
-      folder: options.folder || '',
+      folder,
+      tags: tags.length > 0 ? tags : undefined,
       duration: options.duration || 0,
       model: options.model || '',
       audio: audioBasename,
@@ -426,6 +606,7 @@ export class NoteStore {
       created: now,
       source: fm.source,
       folder: fm.folder,
+      tags,
       duration: fm.duration,
       model: fm.model,
       transcribed_at: fm.transcribed_at ? new Date(fm.transcribed_at) : undefined,
@@ -469,13 +650,32 @@ export class NoteStore {
         }
       }
 
+      let tags = options.tags !== undefined ? options.tags : (existingFm.tags ?? record.tags ?? []);
+      let folder = options.folder !== undefined ? options.folder : (existingFm.folder ?? record.folder ?? '');
+
+      // If user added tags and the note currently has no folder, automatically move note to primary tag's folder
+      if (options.tags && options.tags.length > 0 && options.folder === undefined && !folder) {
+        folder = options.tags[0];
+      }
+
+      // Ensure folder exists on disk if non-empty
+      if (folder) {
+        try {
+          fs.mkdirSync(path.join(this.foldersDir, folder), { recursive: true });
+          fs.mkdirSync(path.join(this.dataDir, 'transcripts', folder), { recursive: true });
+        } catch (err) {
+          console.error(`[NoteStore] Could not create folder directory for ${folder}:`, err);
+        }
+      }
+
       // Rebuild frontmatter with updates.
       const fm: NoteFrontmatter = {
         id,
         title: options.title ?? existingFm.title ?? record.title,
         created: existingFm.created ?? iso(record.created),
         source: existingFm.source ?? record.source,
-        folder: options.folder !== undefined ? options.folder : (existingFm.folder ?? record.folder),
+        folder,
+        tags: tags.length > 0 ? tags : undefined,
         duration: options.duration ?? existingFm.duration ?? record.duration,
         model: options.model ?? existingFm.model ?? record.model,
         transcribed_at: options.transcript !== undefined ? iso() : existingFm.transcribed_at,
@@ -502,6 +702,7 @@ export class NoteStore {
         ...record,
         title: fm.title,
         folder: fm.folder,
+        tags,
         duration: fm.duration,
         model: fm.model,
         transcribed_at: fm.transcribed_at ? new Date(fm.transcribed_at) : undefined,
@@ -531,6 +732,76 @@ export class NoteStore {
     }
     this.index.delete(id);
     return { success: true };
+  }
+
+  /**
+   * Delete audio recording files older than `retentionDays`.
+   * IMPORTANT: Note markdown files (note.md, summary.md, transcripts, words, metadata)
+   * are NEVER deleted — only the large audio recordings on disk are removed.
+   */
+  deleteOldAudioRecordings(retentionDays: number): { deletedCount: number; freedBytes: number } {
+    if (!retentionDays || retentionDays <= 0) {
+      return { deletedCount: 0, freedBytes: 0 };
+    }
+    const cutoffTime = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+    let deletedCount = 0;
+    let freedBytes = 0;
+
+    for (const record of this.index.values()) {
+      if (record.created.getTime() < cutoffTime) {
+        let noteModified = false;
+
+        // 1. Delete audio referenced in record
+        if (record.audio && fs.existsSync(record.audio)) {
+          try {
+            const stat = fs.statSync(record.audio);
+            freedBytes += stat.size;
+            fs.unlinkSync(record.audio);
+            deletedCount += 1;
+            noteModified = true;
+          } catch (err) {
+            console.error(`[NoteStore] Failed to delete audio for note ${record.id}:`, err);
+          }
+        }
+
+        // 2. Also check noteDir for any audio files (*.wav, *.mp3, *.m4a, *.ogg, *.flac)
+        if (fs.existsSync(record.noteDir)) {
+          try {
+            const files = fs.readdirSync(record.noteDir);
+            for (const file of files) {
+              if (/\.(wav|mp3|m4a|aac|ogg|flac)$/i.test(file)) {
+                const filePath = path.join(record.noteDir, file);
+                try {
+                  const stat = fs.statSync(filePath);
+                  freedBytes += stat.size;
+                  fs.unlinkSync(filePath);
+                  deletedCount += 1;
+                  noteModified = true;
+                } catch { /* skip */ }
+              }
+            }
+          } catch { /* skip */ }
+        }
+
+        if (noteModified) {
+          record.audio = undefined;
+          // Update frontmatter on disk to clear audio field, preserving note.md content
+          try {
+            const raw = fs.readFileSync(record.noteFile, 'utf8');
+            const parsed = parseFrontmatter(raw);
+            if (parsed && parsed.fm) {
+              parsed.fm.audio = undefined;
+              const newFrontmatter = serializeFrontmatter(parsed.fm as NoteFrontmatter);
+              fs.writeFileSync(record.noteFile, newFrontmatter + parsed.body, 'utf8');
+            }
+          } catch (err) {
+            console.error(`[NoteStore] Failed to update frontmatter for note ${record.id}:`, err);
+          }
+        }
+      }
+    }
+
+    return { deletedCount, freedBytes };
   }
 
   /**

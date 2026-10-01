@@ -20,6 +20,7 @@ import {
   NoteActionResult,
   ReTranscribeRequest,
   ReTranscribeResult,
+  CleanOldAudioResult,
 } from '../shared/ipc';
 import { isSupportedAudioFile } from '../shared/audioFormats';
 import { AudioRecorder } from './audioRecorder';
@@ -50,7 +51,7 @@ import {
   DictationTakeReason,
   TOO_SHORT_NOTICE,
 } from './dictation';
-import { NoteStore, NoteRecord } from './noteStore';
+import { NoteStore, NoteRecord, extractTagsAndFolder } from './noteStore';
 import { pasteTextAtCursor } from './paste';
 import { ImportQueue } from './importQueue';
 import { WatchFolder } from './watchFolder';
@@ -78,6 +79,7 @@ function toNoteInfo(record: NoteRecord): NoteInfo {
     created: record.created.toISOString(),
     source: record.source,
     folder: record.folder,
+    tags: record.tags || [],
     duration: record.duration,
     model: record.model,
     transcribed_at: record.transcribed_at?.toISOString(),
@@ -532,7 +534,11 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     };
 
     if (settings.dataDir) {
-      const saved = saveTranscriptToDataDir(settings.dataDir, text);
+      const extracted = extractTagsAndFolder(text);
+      if (extracted.tags.length > 0) {
+        withSaves = { ...withSaves, tags: extracted.tags };
+      }
+      const saved = saveTranscriptToDataDir(settings.dataDir, text, extracted.folder);
       if (saved.success) {
         withSaves = { ...withSaves, savedTranscriptPath: saved.filePath };
       } else {
@@ -758,6 +764,22 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         }
       }
 
+      if (typeof patch.audioRetentionDays === 'number' || typeof (patch as any).audioRetentionDays === 'string') {
+        const val = typeof patch.audioRetentionDays === 'number'
+          ? patch.audioRetentionDays
+          : parseInt((patch as any).audioRetentionDays, 10);
+        if (!Number.isNaN(val)) {
+          accepted.audioRetentionDays = Math.max(0, val);
+          if (val > 0) {
+            try {
+              noteStore.deleteOldAudioRecordings(val);
+            } catch (err) {
+              console.error('[AudioRetention] Cleanup on settings change failed:', err);
+            }
+          }
+        }
+      }
+
       try {
         const settings = settingsStore.update(accepted);
         const activeDataDir = settings.dataDir;
@@ -977,6 +999,19 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
   // dependency exists.
   applyDictationSetting();
 
+  // Automatic audio retention cleanup on startup if configured
+  const startupSettings = settingsStore.get();
+  if (startupSettings.audioRetentionDays && startupSettings.audioRetentionDays > 0) {
+    try {
+      const cleaned = noteStore.deleteOldAudioRecordings(startupSettings.audioRetentionDays);
+      if (cleaned.deletedCount > 0) {
+        console.log(`[AudioRetention] Startup cleaned up ${cleaned.deletedCount} recording(s) (${(cleaned.freedBytes / (1024 * 1024)).toFixed(1)} MB freed)`);
+      }
+    } catch (err) {
+      console.error('[AudioRetention] Startup cleanup error:', err);
+    }
+  }
+
   // ---- Note store (Stage 1) ------------------------------------------------
 
   ipcMain.handle(IpcChannel.ListNotes, async (): Promise<NoteListResult> => {
@@ -1021,6 +1056,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
         title: typeof req.title === 'string' ? req.title : undefined,
         source,
         folder: typeof req.folder === 'string' ? req.folder : undefined,
+        tags: Array.isArray(req.tags) ? req.tags : undefined,
         transcript: typeof req.transcript === 'string' ? req.transcript : undefined,
         words: req.words,
         // Note field 'model' (plan): which STT model produced this transcript.
@@ -1044,6 +1080,7 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       const result = noteStore.update(req.id, {
         title: req.title,
         folder: req.folder,
+        tags: Array.isArray(req.tags) ? req.tags : undefined,
         transcript: req.transcript,
         summary: req.summary,
         model: req.model,
@@ -1074,6 +1111,14 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     return { note: toNoteInfo(record), content: content.data, error: content.error };
   });
 
+  ipcMain.handle(IpcChannel.CreateFolder, async (_event: unknown, name: string): Promise<{ success: boolean; data?: string; error?: string }> => {
+    return noteStore.createFolder(typeof name === 'string' ? name : '');
+  });
+
+  ipcMain.handle(IpcChannel.DeleteFolder, async (_event: unknown, name: string): Promise<{ success: boolean; error?: string }> => {
+    return noteStore.deleteFolder(typeof name === 'string' ? name : '');
+  });
+
   ipcMain.handle(IpcChannel.ListFolders, async (): Promise<{ folders: string[]; counts: Record<string, number> }> => {
     return { folders: noteStore.folders(), counts: noteStore.folderCounts() };
   });
@@ -1082,6 +1127,26 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     const notes = noteStore.search(typeof query === 'string' ? query : '').map(toNoteInfo);
     return { notes, folders: noteStore.folders(), folderCounts: noteStore.folderCounts() };
   });
+
+  ipcMain.handle(
+    IpcChannel.CleanOldAudio,
+    async (_event: unknown, days?: number): Promise<CleanOldAudioResult> => {
+      const settings = settingsStore.get();
+      const retentionDays =
+        typeof days === 'number' && Number.isFinite(days)
+          ? days
+          : settings.audioRetentionDays ?? 90;
+      if (retentionDays <= 0) {
+        return { success: true, deletedCount: 0, freedBytes: 0 };
+      }
+      try {
+        const result = noteStore.deleteOldAudioRecordings(retentionDays);
+        return { success: true, deletedCount: result.deletedCount, freedBytes: result.freedBytes };
+      } catch (err) {
+        return { success: false, deletedCount: 0, freedBytes: 0, error: describeError(err) };
+      }
+    }
+  );
 
   ipcMain.handle(
     IpcChannel.ReTranscribe,

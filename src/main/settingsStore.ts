@@ -249,6 +249,7 @@ export function defaultSettings(
     customPrompts: DEFAULT_CUSTOM_PROMPTS.map((p) => ({ ...p })),
     defaultPromptId: 'general',
     recordingShortcut: DEFAULT_RECORDING_SHORTCUT,
+    audioRetentionDays: 90,
   };
 }
 
@@ -311,6 +312,14 @@ export function mergeSettings(
   // Guarantee recordingShortcut is never empty string
   if (!merged.recordingShortcut) {
     merged.recordingShortcut = DEFAULT_RECORDING_SHORTCUT;
+  }
+  if (typeof patch.audioRetentionDays === 'number' && Number.isFinite(patch.audioRetentionDays)) {
+    merged.audioRetentionDays = Math.max(0, Math.floor(patch.audioRetentionDays));
+  } else if (typeof (patch as any).audioRetentionDays === 'string') {
+    const parsed = parseInt((patch as any).audioRetentionDays, 10);
+    if (!Number.isNaN(parsed)) {
+      merged.audioRetentionDays = Math.max(0, parsed);
+    }
   }
   return merged;
 }

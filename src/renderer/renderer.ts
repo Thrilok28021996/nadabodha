@@ -46,6 +46,7 @@ interface NoteInfo {
   created: string;
   source: 'recording' | 'import' | 'dictation-log' | 'unknown';
   folder: string;
+  tags?: string[];
   duration: number;
   model: string;
   transcribed_at?: string;
@@ -69,6 +70,7 @@ interface TranscriptionEvent {
   file?: string;
   bytesDone?: number;
   bytesTotal?: number;
+  tags?: string[];
   /** D3: system-audio (catap) capture failed; the mic recording continues. */
   meetingError?: string;
   /** D4: run token — completion routing prefers this over the local slot. */
@@ -93,6 +95,7 @@ interface AppSettings {
   customPrompts?: CustomPrompt[];
   defaultPromptId?: string;
   recordingShortcut?: string;
+  audioRetentionDays?: number;
 }
 interface CustomPrompt {
   id: string;
@@ -150,14 +153,17 @@ interface ElectronAPI {
   requestDictationAccess(): Promise<DictationStatusInfo>;
   listNotes(): Promise<NoteListResult>;
   getNote(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
-  createNote(req: { title?: string; source: string; folder?: string; transcript?: string; audioPath?: string }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
-  updateNote(req: { id: string; title?: string; folder?: string; transcript?: string; summary?: string; model?: string; audioPath?: string; markSummaryStale?: boolean; clearSummaryStale?: boolean }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
+  createNote(req: { title?: string; source: string; folder?: string; tags?: string[]; transcript?: string; audioPath?: string; words?: {word: string, start: number, end: number}[] }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
+  updateNote(req: { id: string; title?: string; folder?: string; tags?: string[]; transcript?: string; summary?: string; model?: string; audioPath?: string; markSummaryStale?: boolean; clearSummaryStale?: boolean; words?: {word: string, start: number, end: number}[] }): Promise<{ success: boolean; note?: NoteInfo; error?: string }>;
   deleteNote(id: string): Promise<{ success: boolean; error?: string }>;
   readNoteContent(id: string): Promise<{ note?: NoteInfo; content?: NoteContent; error?: string }>;
   listFolders(): Promise<{ folders: string[]; counts: Record<string, number> }>;
+  createFolder(name: string): Promise<{ success: boolean; data?: string; error?: string }>;
+  deleteFolder(name: string): Promise<{ success: boolean; error?: string }>;
   searchNotes(q: string): Promise<NoteListResult>;
   reTranscribe(noteId: string): Promise<{ started: boolean; error?: string; runId?: number }>;
   onToggleRecording?(cb: () => void): () => void;
+  cleanOldAudio(days?: number): Promise<{ success: boolean; deletedCount: number; freedBytes: number; error?: string }>;
 }
 
 const api = window.electronAPI;
@@ -202,6 +208,8 @@ const noteDate          = document.getElementById('noteDate') as HTMLSpanElement
 const noteDuration      = document.getElementById('noteDuration') as HTMLSpanElement;
 const noteSource        = document.getElementById('noteSource') as HTMLSpanElement;
 const noteFolderSelect  = document.getElementById('noteFolderSelect') as HTMLSelectElement;
+const noteTagsList      = document.getElementById('noteTagsList') as HTMLElement;
+const addTagBtn         = document.getElementById('addTagBtn') as HTMLButtonElement;
 const reTranscribeBtn   = document.getElementById('reTranscribeBtn') as HTMLButtonElement;
 const deleteNoteBtn     = document.getElementById('deleteNoteBtn') as HTMLButtonElement;
 
@@ -272,6 +280,9 @@ const watchFolderClearBtn = document.getElementById('watchFolderClearBtn') as HT
 const cacheDirInput     = document.getElementById('cacheDirInput') as HTMLInputElement;
 const cacheDirBrowseBtn = document.getElementById('cacheDirBrowseBtn') as HTMLButtonElement;
 const cacheDirStatus    = document.getElementById('cacheDirStatus') as HTMLParagraphElement;
+const audioRetentionDaysInput = document.getElementById('audioRetentionDaysInput') as HTMLInputElement;
+const cleanOldAudioBtn = document.getElementById('cleanOldAudioBtn') as HTMLButtonElement;
+const audioRetentionStatus = document.getElementById('audioRetentionStatus') as HTMLParagraphElement;
 const summarizeEnabledChk = document.getElementById('summarizeEnabledChk') as HTMLInputElement;
 const autoSummarizeChk  = document.getElementById('autoSummarizeChk') as HTMLInputElement;
 const promptPurposeSelect = document.getElementById('promptPurposeSelect') as HTMLSelectElement;
@@ -536,11 +547,10 @@ function renderFolderList(): void {
         : `Delete folder "${folder}"?`;
       if (!confirm(msg)) return;
 
-      if (count > 0) {
-        const notesInFolder = notes.filter(n => n.folder === folder);
-        for (const n of notesInFolder) {
-          await api.updateNote({ id: n.id, folder: '' });
-        }
+      try {
+        await api.deleteFolder(folder);
+      } catch (err) {
+        console.error('Failed to delete folder on disk:', err);
       }
 
       const saved = getSavedCustomFolders().filter(f => f !== folder);
@@ -619,6 +629,16 @@ function renderNoteList(): void {
 
     meta.appendChild(date);
     meta.appendChild(badge);
+
+    if (note.tags && note.tags.length > 0) {
+      for (const t of note.tags.slice(0, 3)) {
+        const tagSpan = document.createElement('span');
+        tagSpan.className = 'note-item-tag';
+        tagSpan.textContent = `#${t}`;
+        meta.appendChild(tagSpan);
+      }
+    }
+
     li.appendChild(title);
     li.appendChild(meta);
 
@@ -674,6 +694,9 @@ async function openNote(id: string): Promise<void> {
     noteSource.textContent = sourceLabel(note.source);
     noteSource.className = `note-source-badge ${note.source}`;
 
+    // Tags
+    renderNoteTags(note);
+
     // Folder select
     refreshFolderSelect(note.folder);
     noteFolderSelect.value = note.folder || '';
@@ -707,6 +730,57 @@ async function openNote(id: string): Promise<void> {
     showError(String(err));
   }
 }
+
+function renderNoteTags(note: NoteInfo): void {
+  if (!noteTagsList) return;
+  noteTagsList.innerHTML = '';
+  const tags = note.tags || [];
+  for (const tag of tags) {
+    const badge = document.createElement('span');
+    badge.className = 'tag-badge';
+    badge.textContent = `#${tag} `;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'tag-remove-btn';
+    removeBtn.type = 'button';
+    removeBtn.title = `Remove tag #${tag}`;
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const updatedTags = (note.tags || []).filter((t) => t !== tag);
+      const res = await api.updateNote({ id: note.id, tags: updatedTags });
+      if (res.success && res.note) {
+        note.tags = res.note.tags;
+        renderNoteTags(note);
+        await loadNotes(currentSearchQuery);
+      }
+    });
+    badge.appendChild(removeBtn);
+    noteTagsList.appendChild(badge);
+  }
+}
+
+addTagBtn?.addEventListener('click', async () => {
+  if (!selectedNoteId) return;
+  const note = notes.find((n) => n.id === selectedNoteId);
+  if (!note) return;
+  const input = prompt('Enter tag (e.g. Meeting, Work, Ideas):');
+  if (!input || !input.trim()) return;
+  const cleanTag = input.trim().replace(/^#/, '');
+  const existing = note.tags || [];
+  if (existing.map((t) => t.toLowerCase()).includes(cleanTag.toLowerCase())) return;
+  const updatedTags = [...existing, cleanTag];
+  const res = await api.updateNote({ id: note.id, tags: updatedTags });
+  if (res.success && res.note) {
+    note.tags = res.note.tags;
+    if (res.note.folder) {
+      note.folder = res.note.folder;
+      noteFolderSelect.value = res.note.folder;
+    }
+    renderNoteTags(note);
+    await loadNotes(currentSearchQuery);
+  }
+});
 
 function refreshFolderSelect(currentFolder: string): void {
   noteFolderSelect.innerHTML = '<option value="">Unfiled</option>';
@@ -992,7 +1066,7 @@ async function handleTranscriptionCompleted(text: string, event: TranscriptionEv
 
   // Create a new note for this transcription
   const source = 'recording'; // default; import sets this differently
-  const result = await api.createNote({ source, transcript: text });
+  const result = await api.createNote({ source, transcript: text, tags: event.tags });
   if (result.success && result.note) {
     await loadNotes();
     openNote(result.note.id);
@@ -1524,6 +1598,12 @@ async function loadSettings(): Promise<void> {
     updateShortcutBadges(shortcut);
     if (recordingShortcutStatus) setHint(recordingShortcutStatus, '');
 
+    // Audio retention
+    if (audioRetentionDaysInput) {
+      audioRetentionDaysInput.value = String(currentSettings.audioRetentionDays ?? 90);
+    }
+    if (audioRetentionStatus) setHint(audioRetentionStatus, '');
+
     // Prompt templates
     editingPrompts = (currentSettings.customPrompts && currentSettings.customPrompts.length > 0)
       ? currentSettings.customPrompts.map(p => ({ ...p }))
@@ -1688,6 +1768,7 @@ async function saveSettings(): Promise<void> {
     customPrompts: editingPrompts,
     defaultPromptId: editingDefaultPromptId,
     recordingShortcut: recordingShortcutInput ? recordingShortcutInput.value.trim() || 'CommandOrControl+Shift+R' : undefined,
+    audioRetentionDays: audioRetentionDaysInput ? Math.max(0, parseInt(audioRetentionDaysInput.value, 10) || 0) : 90,
   };
   if (activeModel) patch.activeModel = activeModel;
 
@@ -1934,10 +2015,19 @@ navDictation.addEventListener('click', async () => {
   await loadNotes();
 });
 
-addFolderBtn.addEventListener('click', () => {
+addFolderBtn.addEventListener('click', async () => {
   const name = prompt('Folder name:');
   if (!name || !name.trim()) return;
   const folderName = name.trim();
+  try {
+    const res = await api.createFolder(folderName);
+    if (!res.success && res.error) {
+      showError(res.error);
+      return;
+    }
+  } catch (err) {
+    console.error('Failed to create folder on disk:', err);
+  }
   const saved = getSavedCustomFolders();
   if (!saved.includes(folderName)) {
     saved.push(folderName);
@@ -2277,6 +2367,34 @@ watchFolderClearBtn.addEventListener('click', () => {
 cacheDirBrowseBtn.addEventListener('click', async () => {
   const p = await api.pickDirectory('Choose model cache directory');
   if (p) cacheDirInput.value = p;
+});
+
+cleanOldAudioBtn?.addEventListener('click', async () => {
+  setHint(audioRetentionStatus, 'Cleaning up old audio recordings…');
+  const days = parseInt(audioRetentionDaysInput.value, 10);
+  const effectiveDays = Number.isNaN(days) ? 90 : Math.max(0, days);
+  if (effectiveDays <= 0) {
+    setHint(audioRetentionStatus, 'Retention is set to 0 (Keep indefinitely). No audio deleted.', 'info');
+    return;
+  }
+  try {
+    const res = await api.cleanOldAudio(effectiveDays);
+    if (res.success) {
+      const mb = (res.freedBytes / (1024 * 1024)).toFixed(1);
+      const msg = res.deletedCount > 0
+        ? `✓ Deleted ${res.deletedCount} audio recording(s) older than ${effectiveDays} days (${mb} MB freed). Note transcripts and summaries preserved.`
+        : `✓ No audio recordings older than ${effectiveDays} days found.`;
+      setHint(audioRetentionStatus, msg, 'ok');
+      await loadNotes(currentSearchQuery);
+      if (selectedNoteId) {
+        await openNote(selectedNoteId);
+      }
+    } else {
+      setHint(audioRetentionStatus, res.error || 'Cleanup failed', 'error');
+    }
+  } catch (err) {
+    setHint(audioRetentionStatus, String(err), 'error');
+  }
 });
 
 llmRefreshBtn.addEventListener('click', async () => {

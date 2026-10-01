@@ -32,6 +32,8 @@ export enum IpcChannel {
   DeleteNote = 'delete-note',
   ReadNoteContent = 'read-note-content',
   ListFolders = 'list-folders',
+  CreateFolder = 'create-folder',
+  DeleteFolder = 'delete-folder',
   SearchNotes = 'search-notes',
   ReTranscribe = 're-transcribe',
   EnqueueImports = 'enqueue-imports',
@@ -39,6 +41,7 @@ export enum IpcChannel {
   RemoveImportItem = 'remove-import-item',
   ImportQueueEvent = 'import-queue-event',
   PickWatchFolder = 'pick-watch-folder',
+  CleanOldAudio = 'clean-old-audio',
 }
 
 export interface ImportItem {
@@ -86,6 +89,8 @@ export interface TranscriptionEvent {
   savedTranscriptPath?: string;
   savedSummaryPath?: string;
   saveError?: string;
+  tags?: string[];
+  folder?: string;
   // Word level timestamps
   words?: {word: string, start: number, end: number}[];
   /** D3: system-audio (catap) capture failed; the mic recording continues. */
@@ -151,6 +156,15 @@ export interface AppSettings {
   defaultPromptId?: string;
   /** Global recording toggle accelerator (e.g. 'CommandOrControl+Shift+R'). */
   recordingShortcut?: string;
+  /** Days to retain audio recordings (default 90). 0 or undefined = keep indefinitely. */
+  audioRetentionDays?: number;
+}
+
+export interface CleanOldAudioResult {
+  success: boolean;
+  deletedCount: number;
+  freedBytes: number;
+  error?: string;
 }
 
 export interface CustomPrompt {
@@ -241,6 +255,7 @@ export interface NoteInfo {
   created: string; // ISO 8601
   source: NoteSource;
   folder: string;
+  tags: string[];
   duration: number;
   model: string;
   transcribed_at?: string;
@@ -271,6 +286,7 @@ export interface NoteCreateRequest {
   title?: string;
   source: NoteSource;
   folder?: string;
+  tags?: string[];
   transcript?: string;
   audioPath?: string;
   words?: {word: string, start: number, end: number}[];
@@ -280,6 +296,7 @@ export interface NoteUpdateRequest {
   id: string;
   title?: string;
   folder?: string;
+  tags?: string[];
   transcript?: string;
   summary?: string;
   model?: string;

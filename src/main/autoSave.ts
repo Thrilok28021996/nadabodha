@@ -11,6 +11,7 @@ import path from 'path';
 export const TRANSCRIPTS_DIR = 'transcripts';
 export const SUMMARIES_DIR = 'summaries';
 export const SCRIPTS_DIR = 'scripts';
+export const FOLDERS_DIR = 'folders';
 export const PROMPT_TEMPLATE_FILE = 'summarize-prompt.md';
 
 export const DEFAULT_PROMPT_TEMPLATE = `# Summarization prompt
@@ -70,12 +71,14 @@ export function timestampForDate(date: Date): string {
   );
 }
 
-export function transcriptFilePath(dataDir: string, date: Date = new Date()): string {
-  return path.join(dataDir, TRANSCRIPTS_DIR, `transcript_${timestampForDate(date)}.txt`);
+export function transcriptFilePath(dataDir: string, date: Date = new Date(), folder: string = ''): string {
+  const f = folder && folder.trim() ? folder.trim() : '';
+  return path.join(dataDir, TRANSCRIPTS_DIR, f, `transcript_${timestampForDate(date)}.txt`);
 }
 
-export function summaryFilePath(dataDir: string, date: Date = new Date()): string {
-  return path.join(dataDir, SUMMARIES_DIR, `summary_${timestampForDate(date)}.md`);
+export function summaryFilePath(dataDir: string, date: Date = new Date(), folder: string = ''): string {
+  const f = folder && folder.trim() ? folder.trim() : '';
+  return path.join(dataDir, SUMMARIES_DIR, f, `summary_${timestampForDate(date)}.md`);
 }
 
 /** Appends -1, -2, ... when a same-second file already exists. */
@@ -109,27 +112,47 @@ export function writeTextFile(filePath: string, contents: string): SaveFileResul
 export function saveTranscriptToDataDir(
   dataDir: string,
   text: string,
-  date: Date = new Date()
+  dateOrFolder?: Date | string,
+  folderArg?: string
 ): SaveFileResult {
   if (!dataDir || !dataDir.trim()) {
     return { success: false, error: 'No data directory configured' };
   }
-  return writeTextFile(transcriptFilePath(dataDir, date), text);
+  let date: Date;
+  let folder: string;
+  if (typeof dateOrFolder === 'string') {
+    date = new Date();
+    folder = dateOrFolder;
+  } else {
+    date = dateOrFolder instanceof Date ? dateOrFolder : new Date();
+    folder = typeof folderArg === 'string' ? folderArg : '';
+  }
+  return writeTextFile(transcriptFilePath(dataDir, date, folder), text);
 }
 
 export function saveSummaryToDataDir(
   dataDir: string,
   text: string,
-  date: Date = new Date()
+  dateOrFolder?: Date | string,
+  folderArg?: string
 ): SaveFileResult {
   if (!dataDir || !dataDir.trim()) {
     return { success: false, error: 'No data directory configured' };
   }
-  return writeTextFile(summaryFilePath(dataDir, date), text);
+  let date: Date;
+  let folder: string;
+  if (typeof dateOrFolder === 'string') {
+    date = new Date();
+    folder = dateOrFolder;
+  } else {
+    date = dateOrFolder instanceof Date ? dateOrFolder : new Date();
+    folder = typeof folderArg === 'string' ? folderArg : '';
+  }
+  return writeTextFile(summaryFilePath(dataDir, date, folder), text);
 }
 
 /**
- * Creates <dataDir>/{transcripts,summaries,scripts} and writes the default
+ * Creates <dataDir>/{transcripts,summaries,scripts,folders} and writes the default
  * summarization prompt template on first run.
  */
 export function ensureDataDirLayout(dataDir: string): LayoutResult {
@@ -138,7 +161,7 @@ export function ensureDataDirLayout(dataDir: string): LayoutResult {
   }
   const created: string[] = [];
   try {
-    for (const sub of [TRANSCRIPTS_DIR, SUMMARIES_DIR, SCRIPTS_DIR]) {
+    for (const sub of [TRANSCRIPTS_DIR, SUMMARIES_DIR, SCRIPTS_DIR, FOLDERS_DIR]) {
       const dir = path.join(dataDir, sub);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });

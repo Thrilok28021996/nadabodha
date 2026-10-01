@@ -677,6 +677,69 @@ kbd {
 .note-source-badge.import    { background: #1e2540; color: var(--accent); }
 .note-source-badge.dictation-log { background: #2a1e30; color: #c892ff; }
 
+/* Tags styling */
+.note-tags-list {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.tag-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: rgba(100, 160, 255, 0.15);
+  color: #7cb3ff;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 500;
+}
+
+.tag-remove-btn {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0 1px;
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.6;
+  border-radius: 2px;
+}
+
+.tag-remove-btn:hover {
+  opacity: 1;
+  color: #ff6b6b;
+}
+
+.add-tag-btn {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--text-hint);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.add-tag-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(100, 160, 255, 0.08);
+}
+
+.note-item-tag {
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: rgba(100, 160, 255, 0.12);
+  color: #7cb3ff;
+  white-space: nowrap;
+}
+
 .note-header-actions {
   display: flex;
   align-items: center;
