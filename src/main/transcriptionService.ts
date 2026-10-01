@@ -210,11 +210,7 @@ export class TranscriptionService {
   }
 
   startStreaming(inputStream: NodeJS.ReadableStream, options: StartTranscriptionOptions = {}): void {
-    if (this.state === 'recording' || this.state === 'transcribing') {
-      throw new Error(`Cannot start streaming while in state ${this.state}`);
-    }
-
-    // Reap a child left over from a previous run before starting a new one.
+    // Reap any child left over from a previous run before starting a new one.
     this.finishRun(this.adapter);
 
     this.currentOrigin = options.origin;
@@ -271,7 +267,7 @@ export class TranscriptionService {
       if (this.pipedInputStream && this.pipedStdin) {
         try {
           this.pipedInputStream.unpipe(this.pipedStdin);
-        } catch {}
+        } catch { /* ignore */ }
       }
     };
 
@@ -292,7 +288,7 @@ export class TranscriptionService {
     if (this.pipedInputStream && this.pipedStdin) {
       try {
         this.pipedInputStream.unpipe(this.pipedStdin);
-      } catch {}
+      } catch { /* ignore */ }
       this.pipedInputStream = null;
       this.pipedStdin = null;
     }
@@ -392,7 +388,7 @@ export class TranscriptionService {
     if (this.pipedInputStream && this.pipedStdin) {
       try {
         this.pipedInputStream.unpipe(this.pipedStdin);
-      } catch {}
+      } catch { /* ignore */ }
       this.pipedInputStream = null;
       this.pipedStdin = null;
     }

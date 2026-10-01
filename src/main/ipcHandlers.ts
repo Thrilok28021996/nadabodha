@@ -32,7 +32,7 @@ import {
 import { TranscriptionService } from './transcriptionService';
 import { saveTranscript } from './exportText';
 import { SettingsStore, resolvePythonExecutable, validatePythonInterpreter, resolvePromptTemplate } from './settingsStore';
-import { ensureDataDirLayout, readPromptTemplate, saveSummaryToDataDir, saveTranscriptToDataDir, SCRIPTS_DIR, PROMPT_TEMPLATE_FILE } from './autoSave';
+import { ensureDataDirLayout, saveSummaryToDataDir, saveTranscriptToDataDir, SCRIPTS_DIR, PROMPT_TEMPLATE_FILE } from './autoSave';
 import { Summarizer, listLlmModels } from './summarizer';
 import { ModelDownloadService } from './modelDownloadService';
 import { classifyRepo, searchHfModels } from './hfModels';
@@ -488,6 +488,10 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     if (recorder.getState().status === 'recording' || recorder.getStream()) {
       return { outputPath: recorder.getState().outputPath || '' };
     }
+    // If transcription is currently in progress, reject recording start gracefully
+    if (transcriptionService.getState() === 'transcribing') {
+      return { outputPath: null, error: 'Transcription in progress. Please wait for it to finish.' };
+    }
     // Microphone permission first: a denial must never spawn ffmpeg (a
     // blocked capture device fails with a cryptic avfoundation error or a
     // hung device open). The guidance goes out on the same error-event route
@@ -509,7 +513,11 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     const paths = recorder.start({ meetingMode: request?.meetingMode });
     const stream = recorder.getStream();
     if (stream) {
-      transcriptionService.startStreaming(stream, { origin: 'transcription' });
+      try {
+        transcriptionService.startStreaming(stream, { origin: 'transcription' });
+      } catch (err) {
+        console.warn('[StartRecording] startStreaming preview failed:', err);
+      }
     }
     emit({ status: 'recording' });
     return { outputPath: paths.micPath };

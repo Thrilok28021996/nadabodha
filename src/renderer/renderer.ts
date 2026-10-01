@@ -117,7 +117,7 @@ interface Window {
 }
 
 interface ElectronAPI {
-  startRecording(options?: { meetingMode?: boolean }): Promise<{ outputPath: string }>;
+  startRecording(options?: { meetingMode?: boolean }): Promise<{ outputPath: string | null; error?: string }>;
   stopRecording(): Promise<{ outputPath: string | null }>;
   importAudio(fp: string): Promise<{ filePath: string }>;
   cancelTranscription(): Promise<{ cancelled: boolean }>;
@@ -325,6 +325,7 @@ let pendingTranscriptNoteId: string | null = null; // note to update after re-tr
  * (and a second trigger is ignored) until the run reaches a terminal event.
  */
 let retranscribeInFlight = false;
+let isTranscribing = false;
 
 /** Exact hint string required by the approved plan. */
 const DICTATION_HINT = 'Hold the Option key anywhere to dictate';
@@ -811,6 +812,7 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
   // D4: the run ends on a terminal status — release the re-transcribe
   // guard so the button reflects the open note again.
   if (status === 'completed' || status === 'error' || status === 'cancelled') {
+    isTranscribing = false;
     retranscribeInFlight = false;
     syncReTranscribeButton();
   }
@@ -829,6 +831,7 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
       // Progress lines from the file pass mean the recording UI is already
       // done — but while a recording is live these are warm-up progress, and
       // tearing the pill down here hid the Stop button seconds after start.
+      isTranscribing = true;
       stopRecordingUI();
     }
   } else if (status === 'completed' && text) {
@@ -1676,10 +1679,18 @@ addFolderBtn.addEventListener('click', () => {
 let startingRecording = false;
 async function startRecording(): Promise<void> {
   if (startingRecording || isRecording) return;
+  if (isTranscribing) {
+    showError('Transcription in progress. Please wait for it to finish.');
+    return;
+  }
   startingRecording = true;
   try {
     const meetingModeChk = document.getElementById('meetingModeChk') as HTMLInputElement;
-    await api.startRecording({ meetingMode: meetingModeChk ? meetingModeChk.checked : false });
+    const res = await api.startRecording({ meetingMode: meetingModeChk ? meetingModeChk.checked : false });
+    if (res && res.error) {
+      showError(res.error);
+      return;
+    }
     // The recording event will arrive via onTranscriptionEvent
     pendingTranscriptNoteId = null;
   } catch (err) {
@@ -1696,6 +1707,10 @@ async function handleRecordBtnClick(): Promise<void> {
     } catch (err) {
       showError(String(err));
     }
+    return;
+  }
+  if (isTranscribing) {
+    showError('Transcription in progress. Please wait for it to finish.');
     return;
   }
   await startRecording();
@@ -2061,6 +2076,9 @@ async function init(): Promise<void> {
   // Restore status
   try {
     const status = await api.requestStatus();
+    if (status.status === 'transcribing') {
+      isTranscribing = true;
+    }
     updateStatusBar({ status: status.status });
     if (status.text) {
       transcriptArea.value = status.text;

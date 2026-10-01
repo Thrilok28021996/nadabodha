@@ -218,7 +218,7 @@ interface NoteActionResult {
 }
 
 export interface ElectronApi {
-  startRecording: (options?: { meetingMode?: boolean }) => Promise<{ outputPath: string }>;
+  startRecording: (options?: { meetingMode?: boolean }) => Promise<{ outputPath: string | null; error?: string }>;
   stopRecording: () => Promise<{ outputPath: string | null }>;
   importAudio: (filePath: string) => Promise<{ filePath: string }>;
   cancelTranscription: () => Promise<{ cancelled: boolean }>;

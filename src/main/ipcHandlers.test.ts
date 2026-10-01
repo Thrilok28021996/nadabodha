@@ -71,6 +71,7 @@ const recorder = {
     recorderStatus = 'idle';
     return null;
   }),
+  getStream: jest.fn(() => null),
 };
 
 const transcriptionService = {
@@ -450,3 +451,34 @@ describe('Re-transcribe run token (D4)', () => {
     expect(transcriptionService.startTranscription).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('StartRecording transcription guard', () => {
+  it('rejects start recording if transcription is currently in progress', async () => {
+    setup(true);
+    transcriptionService.getState = () => 'transcribing' as unknown as 'idle';
+
+    const startRecordingHandler = handlerFor(IpcChannel.StartRecording);
+    const result = (await startRecordingHandler()) as { outputPath: string | null; error?: string };
+
+    expect(result.outputPath).toBeNull();
+    expect(result.error).toBe('Transcription in progress. Please wait for it to finish.');
+    expect(recorder.start).not.toHaveBeenCalled();
+
+    // Reset
+    transcriptionService.getState = () => 'idle';
+  });
+
+  it('allows start recording if transcription is idle', async () => {
+    setup(true);
+    transcriptionService.getState = () => 'idle';
+    (recorder.start as jest.Mock).mockReturnValueOnce({ micPath: '/tmp/test.wav' });
+
+    const startRecordingHandler = handlerFor(IpcChannel.StartRecording);
+    const result = (await startRecordingHandler()) as { outputPath: string | null; error?: string };
+
+    expect(result.outputPath).toBe('/tmp/test.wav');
+    expect(result.error).toBeUndefined();
+    expect(recorder.start).toHaveBeenCalled();
+  });
+});
+
