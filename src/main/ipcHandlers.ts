@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences, globalShortcut } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences, globalShortcut, shell } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -477,17 +477,18 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
     // it flip false->true runs the guarded start before the status is built.
     dictation?.reconcileAccessibility();
     const enabled = settingsStore.get().dictationEnabled !== false;
-    const accessibilityTrusted = isAccessibilityTrusted(false);
+    const running = dictation !== null && dictation.isRunning();
+    const accessibilityTrusted = running || isAccessibilityTrusted(false);
     let reason: string | undefined;
     if (!dictation) reason = 'uiohook-napi failed to load';
     else if (!enabled) reason = 'disabled';
     else if (!accessibilityTrusted) reason = 'no-accessibility';
-    else if (!dictation.isRunning()) reason = dictation.getLastOutcome();
+    else if (!running) reason = dictation.getLastOutcome();
     return {
       supported: dictation !== null,
       enabled,
       accessibilityTrusted,
-      running: dictation !== null && dictation.isRunning(),
+      running,
       reason,
     };
   };
@@ -972,7 +973,14 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       // the current (usually still false) trust state while the user decides,
       // which is why the renderer polls afterwards.
       if (process.env.NADABODHA_DICTATION_NO_ACCESSIBILITY !== '1') {
-        systemPreferences.isTrustedAccessibilityClient(true);
+        try {
+          systemPreferences.isTrustedAccessibilityClient(true);
+        } catch { /* ignore */ }
+        try {
+          if (process.platform === 'darwin') {
+            await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility');
+          }
+        } catch { /* ignore */ }
       }
       applyDictationSetting();
       return dictationStatus();

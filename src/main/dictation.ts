@@ -245,6 +245,9 @@ export class DictationController {
    * start() itself re-checks trust immediately before hook.start().
    */
   reconcileAccessibility(): void {
+    if (this.running) {
+      return;
+    }
     let trusted = false;
     try {
       trusted = this.isTrustedAccessibilityClient(false);
@@ -253,7 +256,7 @@ export class DictationController {
     }
     const wasTrusted = this.wasTrusted;
     this.wasTrusted = trusted;
-    if (!trusted || wasTrusted) {
+    if (!trusted || (wasTrusted && this.lastOutcome !== 'no-accessibility')) {
       return;
     }
     this.start();
