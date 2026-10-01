@@ -148,15 +148,36 @@ describe('resolvePythonExecutable', () => {
     expect(resolvePythonExecutable(undefined, env)).toBe('/env/python3');
   });
 
-  it('falls back to python3 on PATH', () => {
-    expect(resolvePythonExecutable({ pythonPath: '' }, {} as NodeJS.ProcessEnv)).toBe('python3');
-    expect(resolvePythonExecutable({ pythonPath: '' }, { NADABODHA_PYTHON: '   ' } as NodeJS.ProcessEnv)).toBe('python3');
+  it('falls back to misc python if available', () => {
+    expect(
+      resolvePythonExecutable({ pythonPath: '' }, {} as NodeJS.ProcessEnv, { miscPython: '/conda/misc/bin/python3' })
+    ).toBe('/conda/misc/bin/python3');
+  });
+
+  it('falls back to python3 on PATH when misc is not available', () => {
+    expect(
+      resolvePythonExecutable({ pythonPath: '' }, {} as NodeJS.ProcessEnv, { miscPython: '' })
+    ).toBe('python3');
+    expect(
+      resolvePythonExecutable({ pythonPath: '' }, { NADABODHA_PYTHON: '   ' } as NodeJS.ProcessEnv, { miscPython: '' })
+    ).toBe('python3');
   });
 });
 
 describe('validatePythonInterpreter', () => {
-  it('treats an empty path as unset but valid', async () => {
-    const result = await validatePythonInterpreter('', async () => ({ ok: true, message: 'unused' }));
+  it('treats an empty path with default misc python as valid', async () => {
+    const result = await validatePythonInterpreter('', async () => ({ ok: true, message: 'OK' }), {
+      defaultPython: '/conda/misc/bin/python3',
+    });
+    expect(result.ok).toBe(true);
+    expect(result.blocking).toBe(false);
+    expect(result.message).toContain('Default (misc) active: /conda/misc/bin/python3');
+  });
+
+  it('treats an empty path without default misc as unset but valid', async () => {
+    const result = await validatePythonInterpreter('', async () => ({ ok: true, message: 'unused' }), {
+      defaultPython: '',
+    });
     expect(result.ok).toBe(true);
     expect(result.blocking).toBe(false);
     expect(result.message).toContain('python3 from PATH');

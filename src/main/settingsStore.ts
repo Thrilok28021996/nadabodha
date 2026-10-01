@@ -166,13 +166,41 @@ export function settingsFilePath(userDataDir: string): string {
   return path.join(userDataDir, SETTINGS_FILE_NAME);
 }
 
+/**
+ * Looks for the default 'misc' conda environment python interpreter.
+ * Checks known locations where the conda env 'misc' resides.
+ */
+export function findDefaultMiscPython(homedir: string = os.homedir()): string {
+  const candidates = [
+    '/Volumes/personal/conda_envs/misc/bin/python3',
+    '/Volumes/personal/conda_envs/misc/bin/python',
+    path.join(homedir, 'miniconda3', 'envs', 'misc', 'bin', 'python3'),
+    path.join(homedir, 'anaconda3', 'envs', 'misc', 'bin', 'python3'),
+    path.join(homedir, '.conda', 'envs', 'misc', 'bin', 'python3'),
+    path.join(homedir, 'opt', 'anaconda3', 'envs', 'misc', 'bin', 'python3'),
+    path.join(homedir, 'opt', 'miniconda3', 'envs', 'misc', 'bin', 'python3'),
+    path.join('/opt', 'miniconda3', 'envs', 'misc', 'bin', 'python3'),
+    path.join('/opt', 'anaconda3', 'envs', 'misc', 'bin', 'python3'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch { /* ignore */ }
+  }
+  return '';
+}
+
 export function defaultSettings(
   env: NodeJS.ProcessEnv = process.env,
   homedir: string = os.homedir()
 ): AppSettings {
   const hfHome = (env.HF_HOME || '').trim() || path.join(homedir, '.cache', 'huggingface');
+  const miscPython = findDefaultMiscPython(homedir);
   return {
     pythonPath: '',
+    defaultPythonPath: miscPython,
     llmBaseUrl: DEFAULT_LLM_BASE_URL,
     // Out-of-the-box auto-summarize against LM Studio: this model is loaded
     // and served at 127.0.0.1:1234/v1 (a saved user value still wins —
@@ -208,7 +236,7 @@ export function mergeSettings(
   for (const key of STRING_KEYS) {
     const value = patch[key];
     if (typeof value === 'string') {
-      merged[key] = value;
+      merged[key] = value.trim();
     }
   }
   for (const key of BOOLEAN_KEYS) {
@@ -348,7 +376,11 @@ export class SettingsStore {
   ) {}
 
   get(): AppSettings {
-    return loadSettings(this.filePath, this.env, this.homedir);
+    const loaded = loadSettings(this.filePath, this.env, this.homedir);
+    if (!loaded.defaultPythonPath) {
+      loaded.defaultPythonPath = findDefaultMiscPython(this.homedir);
+    }
+    return loaded;
   }
 
   update(patch: Partial<Record<keyof AppSettings, unknown>>): AppSettings {
@@ -359,11 +391,12 @@ export class SettingsStore {
 }
 
 /**
- * Interpreter precedence: saved setting -> NADABODHA_PYTHON -> python3.
+ * Interpreter precedence: saved setting -> NADABODHA_PYTHON -> misc conda env -> python3.
  */
 export function resolvePythonExecutable(
   settings: Pick<AppSettings, 'pythonPath'> | null | undefined,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  options?: { miscPython?: string; homedir?: string }
 ): string {
   const saved = (settings?.pythonPath || '').trim();
   if (saved) {
@@ -372,6 +405,13 @@ export function resolvePythonExecutable(
   const fromEnv = (env.NADABODHA_PYTHON || '').trim();
   if (fromEnv) {
     return fromEnv;
+  }
+  if (options?.miscPython !== undefined) {
+    return options.miscPython || 'python3';
+  }
+  const misc = findDefaultMiscPython(options?.homedir);
+  if (misc) {
+    return misc;
   }
   return 'python3';
 }
@@ -430,10 +470,22 @@ export function probePythonImport(
  */
 export async function validatePythonInterpreter(
   pythonPath: string,
-  probe: PythonProbe = probePythonImport
+  probe: PythonProbe = probePythonImport,
+  options?: { defaultPython?: string }
 ): Promise<PythonValidation> {
   const trimmed = (pythonPath || '').trim();
   if (!trimmed) {
+    const defaultPath = options?.defaultPython !== undefined ? options.defaultPython : findDefaultMiscPython();
+    if (defaultPath) {
+      const result = await probe(defaultPath);
+      return {
+        ok: result.ok,
+        blocking: false,
+        message: result.ok
+          ? `Default (misc) active: ${defaultPath}`
+          : `Default (misc): ${defaultPath} (${result.message})`,
+      };
+    }
     return {
       ok: true,
       blocking: false,

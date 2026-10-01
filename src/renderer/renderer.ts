@@ -77,6 +77,7 @@ interface TranscriptionEvent {
 }
 interface AppSettings {
   pythonPath: string;
+  defaultPythonPath?: string;
   llmBaseUrl: string;
   llmModel: string;
   llmApiKey: string;
@@ -252,6 +253,7 @@ const settingsSaveBtn   = document.getElementById('settingsSaveBtn') as HTMLButt
 const settingsStatus    = document.getElementById('settingsStatus') as HTMLParagraphElement;
 const pythonPathInput   = document.getElementById('pythonPathInput') as HTMLInputElement;
 const pythonBrowseBtn   = document.getElementById('pythonBrowseBtn') as HTMLButtonElement;
+const pythonDefaultBtn  = document.getElementById('pythonDefaultBtn') as HTMLButtonElement;
 const pythonValidateBtn = document.getElementById('pythonValidateBtn') as HTMLButtonElement;
 const pythonStatus      = document.getElementById('pythonStatus') as HTMLParagraphElement;
 const llmBaseUrlInput   = document.getElementById('llmBaseUrlInput') as HTMLInputElement;
@@ -1478,6 +1480,12 @@ async function loadSettings(): Promise<void> {
     currentSettings = await api.getSettings();
     if (!currentSettings) return;
     pythonPathInput.value = currentSettings.pythonPath || '';
+    if (currentSettings.defaultPythonPath) {
+      pythonPathInput.placeholder = currentSettings.defaultPythonPath;
+      if (!pythonPathInput.value) {
+        setHint(pythonStatus, `Default: ${currentSettings.defaultPythonPath}`, 'info');
+      }
+    }
     llmBaseUrlInput.value = currentSettings.llmBaseUrl || '';
     llmApiKeyInput.value = currentSettings.llmApiKey || '';
     dataDirInput.value = currentSettings.dataDir || '';
@@ -2111,6 +2119,12 @@ settingsSaveBtn.addEventListener('click', saveSettings);
 pythonBrowseBtn.addEventListener('click', async () => {
   const p = await api.pickPythonFile();
   if (p) pythonPathInput.value = p;
+});
+
+pythonDefaultBtn?.addEventListener('click', () => {
+  const def = currentSettings?.defaultPythonPath || '/Volumes/personal/conda_envs/misc/bin/python3';
+  pythonPathInput.value = def;
+  setHint(pythonStatus, 'Set to default misc conda environment. Click Save settings to persist.', 'ok');
 });
 
 pythonValidateBtn.addEventListener('click', async () => {

@@ -123,8 +123,10 @@ export interface SaveTranscriptResult {
 /** Persisted user settings (userData/settings.json). */
 export interface AppSettings {
   /** Python interpreter used to run the adapter. Empty = fall back to
-   *  NADABODHA_PYTHON, then `python3` on PATH. */
+   *  NADABODHA_PYTHON, then default misc environment, then `python3` on PATH. */
   pythonPath: string;
+  /** Resolved default Python interpreter (e.g. from conda misc environment). */
+  defaultPythonPath?: string;
   /** OpenAI-compatible base URL, e.g. http://127.0.0.1:1234/v1 */
   llmBaseUrl: string;
   llmModel: string;
