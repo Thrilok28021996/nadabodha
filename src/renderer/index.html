@@ -466,6 +466,21 @@
   <input type="file" id="fileInput" accept="audio/*" multiple hidden>
   <input type="file" id="reTranscribeFileInput" accept="audio/*" hidden>
 
+  <!-- Reusable input modal dialog -->
+  <div id="inputModal" class="modal-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="inputModalTitle">
+    <div class="modal-card">
+      <h3 id="inputModalTitle" class="modal-title">Prompt</h3>
+      <p id="inputModalHint" class="modal-hint" hidden></p>
+      <div class="modal-body">
+        <input type="text" id="inputModalField" class="modal-input" placeholder="" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="inputModalCancel" class="btn-secondary">Cancel</button>
+        <button type="button" id="inputModalConfirm" class="btn-primary">OK</button>
+      </div>
+    </div>
+  </div>
+
   <script src="marked.umd.js"></script>
   <script src="purify.min.js"></script>
   <script src="renderer.js"></script>

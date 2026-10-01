@@ -213,6 +213,63 @@ const addTagBtn         = document.getElementById('addTagBtn') as HTMLButtonElem
 const reTranscribeBtn   = document.getElementById('reTranscribeBtn') as HTMLButtonElement;
 const deleteNoteBtn     = document.getElementById('deleteNoteBtn') as HTMLButtonElement;
 
+// Input modal
+const inputModal        = document.getElementById('inputModal') as HTMLDivElement;
+const inputModalTitle   = document.getElementById('inputModalTitle') as HTMLHeadingElement;
+const inputModalHint    = document.getElementById('inputModalHint') as HTMLParagraphElement;
+const inputModalField   = document.getElementById('inputModalField') as HTMLInputElement;
+const inputModalCancel  = document.getElementById('inputModalCancel') as HTMLButtonElement;
+const inputModalConfirm = document.getElementById('inputModalConfirm') as HTMLButtonElement;
+
+function showInputDialog(title: string, placeholder = '', hint = '', defaultValue = ''): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (!inputModal || !inputModalField) {
+      resolve(null);
+      return;
+    }
+    inputModalTitle.textContent = title;
+    inputModalField.placeholder = placeholder;
+    inputModalField.value = defaultValue;
+    if (hint) {
+      inputModalHint.textContent = hint;
+      inputModalHint.hidden = false;
+    } else {
+      inputModalHint.hidden = true;
+    }
+    inputModal.hidden = false;
+    inputModalField.focus();
+    inputModalField.select();
+
+    const cleanup = () => {
+      inputModal.hidden = true;
+      inputModalConfirm.onclick = null;
+      inputModalCancel.onclick = null;
+      inputModalField.onkeydown = null;
+    };
+
+    inputModalConfirm.onclick = () => {
+      const val = inputModalField.value;
+      cleanup();
+      resolve(val);
+    };
+
+    inputModalCancel.onclick = () => {
+      cleanup();
+      resolve(null);
+    };
+
+    inputModalField.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        inputModalConfirm.click();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        inputModalCancel.click();
+      }
+    };
+  });
+}
+
 // Recording pill
 const recordingPill     = document.getElementById('recordingPill') as HTMLElement;
 const pillLabel         = document.getElementById('pillLabel') as HTMLSpanElement;
@@ -764,7 +821,7 @@ addTagBtn?.addEventListener('click', async () => {
   if (!selectedNoteId) return;
   const note = notes.find((n) => n.id === selectedNoteId);
   if (!note) return;
-  const input = prompt('Enter tag (e.g. Meeting, Work, Ideas):');
+  const input = await showInputDialog('Add Tag', 'e.g. Meeting, Work, Ideas', 'Tags help organize and automatically file your notes.');
   if (!input || !input.trim()) return;
   const cleanTag = input.trim().replace(/^#/, '');
   const existing = note.tags || [];
@@ -2010,7 +2067,7 @@ navDictation.addEventListener('click', async () => {
 });
 
 addFolderBtn.addEventListener('click', async () => {
-  const name = prompt('Folder name:');
+  const name = await showInputDialog('New Folder', 'Folder name…', 'Create a new folder to organize your notes.');
   if (!name || !name.trim()) return;
   const folderName = name.trim();
   try {
