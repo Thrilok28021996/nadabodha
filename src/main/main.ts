@@ -1,4 +1,5 @@
 import { app, BrowserWindow, globalShortcut } from 'electron';
+import fs from 'fs';
 import path from 'path';
 import { setupIpcHandlers } from './ipcHandlers';
 import { AudioRecorder } from './audioRecorder';
@@ -18,13 +19,46 @@ process.on('uncaughtException', (err: Error) => {
 
 let mainWindow: BrowserWindow | null = null;
 
+function resolveAppIcon(): string | undefined {
+  const candidates = [
+    path.join(__dirname, '../assets/icon.png'),
+    path.join(__dirname, '../../assets/icon.png'),
+    path.join(app.getAppPath(), 'assets/icon.png'),
+    path.join(app.getAppPath(), 'dist/assets/icon.png'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function resolveDockIcon(): string | undefined {
+  const candidates = [
+    path.join(__dirname, '../assets/icon.icns'),
+    path.join(__dirname, '../../assets/icon.icns'),
+    path.join(app.getAppPath(), 'assets/icon.icns'),
+    path.join(app.getAppPath(), 'dist/assets/icon.icns'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return resolveAppIcon();
+}
+
 function createWindow(): void {
+  const iconPath = resolveAppIcon();
+
   mainWindow = new BrowserWindow({
     // Plan-fixed default window (v3 plan / test plan §3): 1180x760.
     width: 1180,
     height: 760,
     minWidth: 960,
     minHeight: 640,
+    ...(iconPath ? { icon: iconPath } : {}),
     webPreferences: {
       preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
@@ -45,6 +79,18 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // Set native macOS dock icon if running on macOS
+  if (process.platform === 'darwin' && app.dock) {
+    const dockIcon = resolveDockIcon();
+    if (dockIcon) {
+      try {
+        app.dock.setIcon(dockIcon);
+      } catch (err) {
+        console.warn('[Dock] Failed to set dock icon:', err);
+      }
+    }
+  }
+
   createWindow();
 
   const recorder = new AudioRecorder();

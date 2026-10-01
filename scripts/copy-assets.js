@@ -17,6 +17,21 @@ function copyFile(name) {
   console.log(`Copied ${src} -> ${dest}`);
 }
 
+const assetsDir = path.join(root, 'assets');
+const distAssetsDir = path.join(root, 'dist', 'assets');
+
+function copyAsset(name, targetDir = distAssetsDir) {
+  const src = path.join(assetsDir, name);
+  const dest = path.join(targetDir, name);
+  if (!fs.existsSync(src)) {
+    console.warn(`Asset not found: ${src}`);
+    return;
+  }
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.copyFileSync(src, dest);
+  console.log(`Copied ${src} -> ${dest}`);
+}
+
 /**
  * Copy a file from a dependency into dist/renderer/.
  *
@@ -39,8 +54,14 @@ function vendorIntoRenderer(src, label) {
 copyFile('index.html');
 copyFile('styles.css');
 
+// App icons
+copyAsset('icon.png', distAssetsDir);
+copyAsset('icon.icns', distAssetsDir);
+copyAsset('icon.png', destDir);
+
 // Markdown rendering for the summary preview (workstream 2).
 vendorIntoRenderer(path.join(root, 'node_modules', 'marked', 'lib', 'marked.umd.js'), 'marked');
 vendorIntoRenderer(path.join(root, 'node_modules', 'marked', 'lib', 'marked.umd.js.map'), 'marked sourcemap');
 vendorIntoRenderer(path.join(root, 'node_modules', 'dompurify', 'dist', 'purify.min.js'), 'dompurify');
 vendorIntoRenderer(path.join(root, 'node_modules', 'dompurify', 'dist', 'purify.min.js.map'), 'dompurify sourcemap');
+
