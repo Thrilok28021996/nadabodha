@@ -194,8 +194,8 @@ const settingsBtn       = document.getElementById('settingsBtn') as HTMLButtonEl
 const dictationHint     = document.getElementById('dictationHint') as HTMLParagraphElement;
 const dictationBadge    = document.getElementById('dictationBadge') as HTMLParagraphElement;
 const dictationNotice   = document.getElementById('dictationNotice') as HTMLParagraphElement;
-const dictationBanner   = document.getElementById('dictationBanner') as HTMLElement;
-const dictationGrantBtn = document.getElementById('dictationGrantBtn') as HTMLButtonElement;
+const dictationBanner   = document.getElementById('dictationBanner') as HTMLElement | null;
+const dictationGrantBtn = document.getElementById('dictationGrantBtn') as HTMLButtonElement | null;
 const dictationEnabledChk = document.getElementById('dictationEnabledChk') as HTMLInputElement;
 
 // Main content
@@ -423,8 +423,8 @@ let pendingTranscriptNoteId: string | null = null; // note to update after re-tr
 let retranscribeInFlight = false;
 let isTranscribing = false;
 
-/** Exact hint string required by the approved plan. */
-const DICTATION_HINT = 'Hold the Option key anywhere to dictate';
+/** Exact hint string for global dictation. */
+const DICTATION_HINT = 'Press ⌥ Space anywhere to dictate';
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -657,7 +657,7 @@ function renderNoteList(): void {
     } else if (currentView === 'folder') {
       noteListEmpty.textContent = `No notes in "${currentFolder}".`;
     } else if (currentView === 'dictation') {
-      noteListEmpty.textContent = 'No dictation notes yet. Hold ⌥ to dictate.';
+      noteListEmpty.textContent = 'No dictation notes yet. Press ⌥ Space to dictate.';
     } else {
       noteListEmpty.innerHTML = 'No notes yet.<br>Record, import, or dictate to create one.';
     }
@@ -967,14 +967,12 @@ function stopRecordingUI(): void {
 function applyDictationStatus(info: DictationStatusInfo): void {
   const supported = info.supported;
   const enabled = info.enabled;
-  const trusted = info.accessibilityTrusted;
 
-  // Banner: show when supported + enabled but not trusted
-  dictationBanner.hidden = !(supported && enabled && !trusted);
-  // Hint: the standard hint when idle and trusted
-  dictationHint.hidden = !supported || !enabled || !trusted || !info.running;
+  if (dictationBanner) {
+    dictationBanner.hidden = true;
+  }
+  dictationHint.hidden = !supported || !enabled;
   dictationHint.textContent = DICTATION_HINT;
-  // Checkbox kept for backward compatibility
   dictationEnabledChk.checked = enabled;
 
   const dictationStrip = document.getElementById('dictationStrip');
@@ -1017,7 +1015,7 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
       dictationBadge.textContent = '🎙️ ' + text;
       dictationBadge.style.opacity = '0.7';
     } else if (status === 'recording') {
-      dictationBadge.textContent = '🎙️ Dictation active';
+      dictationBadge.textContent = '🎙️ Dictation active — Press ⌥ Space to stop';
       dictationBadge.style.opacity = '1';
     }
 
@@ -2360,7 +2358,7 @@ deleteNoteBtn.addEventListener('click', async () => {
 });
 
 // Dictation
-dictationGrantBtn.addEventListener('click', async () => {
+dictationGrantBtn?.addEventListener('click', async () => {
   await api.requestDictationAccess();
   const status = await api.getDictationStatus();
   applyDictationStatus(status);

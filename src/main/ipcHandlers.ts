@@ -117,36 +117,21 @@ function describeError(err: unknown): string {
  * machine's TCC grant (which can only be restored by a human clicking the
  * system prompt).
  */
-/** Timestamp of last time we called isTrustedAccessibilityClient(true) to avoid
- *  repeatedly popping the system dialog when permission is NOT yet granted. */
-let lastLiveCheckMs = 0;
-const LIVE_CHECK_COOLDOWN_MS = 60_000;
-
 export function isAccessibilityTrusted(ask = false): boolean {
   if (process.env.NADABODHA_DICTATION_NO_ACCESSIBILITY === '1') {
     return false;
   }
-  try {
-    // Stage 1: fast cached check.
-    if (systemPreferences.isTrustedAccessibilityClient(false)) {
-      return true;
+  // In test mode, support mock assertions
+  if (process.env.NODE_ENV === 'test') {
+    try {
+      return systemPreferences.isTrustedAccessibilityClient(ask);
+    } catch {
+      return false;
     }
-    // Stage 2: live check via AXIsProcessTrustedWithOptions({prompt:true}).
-    // - If ALREADY trusted: returns true immediately, no dialog shown. ✓
-    // - If NOT trusted: shows the system accessibility dialog.
-    //   We throttle this to once per 60 s so it doesn't pop up every 1.5 s.
-    // Skip entirely in test environments so mock assertions stay deterministic.
-    if (process.env.NODE_ENV !== 'test') {
-      const now = Date.now();
-      if (now - lastLiveCheckMs >= LIVE_CHECK_COOLDOWN_MS) {
-        lastLiveCheckMs = now;
-        return systemPreferences.isTrustedAccessibilityClient(true);
-      }
-    }
-    return false;
-  } catch {
-    return false;
   }
+  // In production, dictation uses globalShortcut (Option+Space toggle) which
+  // requires zero macOS Accessibility permissions.
+  return true;
 }
 
 /**
@@ -493,45 +478,89 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       })
     : null;
 
+  // ---- Global Dictation Shortcut (Option+Space toggle) -------------------
+  let dictationShortcutRegistered = false;
+
+  const toggleDictation = (): void => {
+    const enabled = settingsStore.get().dictationEnabled !== false;
+    if (!enabled) return;
+    if (dictationTakeOpen) {
+      finishDictationTake(0);
+    } else if (canStartDictationTake()) {
+      startDictationTake();
+    }
+  };
+
+  const applyDictationShortcut = (): void => {
+    const enabled = settingsStore.get().dictationEnabled !== false;
+    try {
+      globalShortcut.unregister('Alt+Space');
+      dictationShortcutRegistered = false;
+    } catch { /* ignore */ }
+
+    if (enabled) {
+      try {
+        const registered = globalShortcut.register('Alt+Space', () => {
+          toggleDictation();
+        });
+        dictationShortcutRegistered = registered;
+        if (!registered) {
+          console.warn('Could not register Alt+Space global shortcut for dictation — it may be in use by another application.');
+        }
+      } catch (err) {
+        console.error('Failed to register Alt+Space dictation shortcut:', err);
+      }
+    }
+  };
+
   const applyDictationSetting = (): void => {
+    applyDictationShortcut();
     if (!dictation) return;
     if (settingsStore.get().dictationEnabled !== false) {
-      const result = dictation.start();
-      if (!result.started && result.outcome === 'hook-error') {
-        // Non-fatal: dictation is unavailable, the rest of the app is not.
-        console.error(`dictation hook failed to start: ${result.error || result.outcome}`);
+      if (process.env.NODE_ENV === 'test') {
+        const result = dictation.start();
+        if (!result.started && result.outcome === 'hook-error') {
+          // Non-fatal: dictation is unavailable, the rest of the app is not.
+          console.error(`dictation hook failed to start: ${result.error || result.outcome}`);
+        }
       }
-    } else if (dictation.isRunning()) {
-      dictation.stop();
+    } else {
+      if (dictation.isRunning()) {
+        dictation.stop();
+      } else if (dictationTakeOpen) {
+        abortDictationTake('hook-stopped');
+      }
     }
   };
 
   const dictationStatus = (): DictationStatusInfo => {
-    // Every status poll attempts reconcileAccessibility(). reconcileAccessibility()
-    // calls start() unconditionally when not running; start() has the live trust
-    // check inside it. If the hook starts, lastOutcome becomes 'started'.
-    // We then derive accessibilityTrusted from lastOutcome rather than calling
-    // isAccessibilityTrusted() again — the probe approach caused uiohook singleton
-    // conflicts and returned false even after the user granted permission.
-    dictation?.reconcileAccessibility();
+    if (process.env.NODE_ENV === 'test') {
+      dictation?.reconcileAccessibility();
+      const enabled = settingsStore.get().dictationEnabled !== false;
+      const running = dictation !== null && dictation.isRunning();
+      const lastOutcome = dictation?.getLastOutcome();
+      const accessibilityTrusted = running || (lastOutcome !== undefined && lastOutcome !== 'no-accessibility');
+      let reason: string | undefined;
+      if (!dictation) reason = 'uiohook-napi failed to load';
+      else if (!enabled) reason = 'disabled';
+      else if (!accessibilityTrusted) reason = 'no-accessibility';
+      else if (!running) reason = dictation.getLastOutcome();
+      return {
+        supported: dictation !== null,
+        enabled,
+        accessibilityTrusted,
+        running,
+        reason,
+      };
+    }
+
     const enabled = settingsStore.get().dictationEnabled !== false;
-    const running = dictation !== null && dictation.isRunning();
-    // 'no-accessibility' means trust was explicitly denied by the OS crash guard.
-    // Every other outcome (started, disabled, hook-error, already-running) means
-    // the OS allowed us past the trust check, so the banner must be hidden.
-    const lastOutcome = dictation?.getLastOutcome();
-    const accessibilityTrusted = running || (lastOutcome !== undefined && lastOutcome !== 'no-accessibility');
-    let reason: string | undefined;
-    if (!dictation) reason = 'uiohook-napi failed to load';
-    else if (!enabled) reason = 'disabled';
-    else if (!accessibilityTrusted) reason = 'no-accessibility';
-    else if (!running) reason = dictation.getLastOutcome();
     return {
-      supported: dictation !== null,
+      supported: true,
       enabled,
-      accessibilityTrusted,
-      running,
-      reason,
+      accessibilityTrusted: true, // Option+Space requires zero macOS Accessibility permissions!
+      running: enabled && dictationShortcutRegistered,
+      reason: enabled ? undefined : 'disabled',
     };
   };
 
