@@ -21,60 +21,55 @@ export async function isSecureInputEnabled(): Promise<boolean> {
 }
 
 /**
- * Executes a paste using uiohook-napi to send Cmd+V.
- * The hook must already be loaded and running.
+ * Executes a paste of the dictated text.
+ * Always ensures the transcript is placed on the system clipboard.
+ * If Nadabodha has focus, returns 'own-window' so the renderer directly inserts it.
+ * Otherwise, attempts to synthesize Cmd+V via AppleScript or native keytap.
  */
 export async function pasteTextAtCursor(text: string): Promise<'pasted' | 'secure-input' | 'own-window' | 'error'> {
   if (!text) return 'error';
 
-  // 1. Guard rail: don't paste if secure input is enabled
+  // 1. Always copy text to clipboard so it is immediately available
+  clipboard.writeText(text);
+
+  // 2. Guard rail: don't paste if secure input is enabled (e.g. password field)
   const secure = await isSecureInputEnabled();
   if (secure) {
-    console.log('[paste] Secure input enabled, skipping paste');
-    return 'secure-input'; // Skip paste
+    console.log('[paste] Secure input enabled, skipping synthetic paste');
+    return 'secure-input';
   }
 
-  // 2. Guard rail: don't paste if our own window has focus
+  // 3. Guard rail: if our own window has focus, let the renderer insert it directly
   const focusedWin = BrowserWindow.getFocusedWindow();
   if (focusedWin) {
-    console.log('[paste] Our window has focus, skipping programmatic paste to avoid doubling');
+    console.log('[paste] Our window has focus, renderer will handle display');
     return 'own-window';
   }
 
-  // Ensure uiohook is available. Required lazily (not at module top level)
-  // so a native-module load failure degrades to a failed paste instead of
-  // taking the Electron main process down — scoped disable, not file-wide.
-  let uIOhook;
+  // 4. In external applications, attempt AppleScript Cmd+V
+  if (process.platform === 'darwin') {
+    try {
+      await execAsync("osascript -e 'tell application \"System Events\" to keystroke \"v\" using command down'", { timeout: 1500 });
+      return 'pasted';
+    } catch {
+      // If AppleScript fails/is blocked, text remains on clipboard for user ⌘V
+      console.log('[paste] AppleScript paste bypassed; text is ready on clipboard');
+    }
+  }
+
+  // 5. Fallback: try uiohook keytap if available
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require('uiohook-napi');
-    uIOhook = mod.uIOhook;
+    if (mod && mod.uIOhook) {
+      mod.uIOhook.keyToggle(3675, 'down');
+      mod.uIOhook.keyTap(47);
+      mod.uIOhook.keyToggle(3675, 'up');
+      return 'pasted';
+    }
   } catch {
-    return 'error';
+    // ignore
   }
-
-  if (!uIOhook) return 'error';
-
-  // 3. Save current clipboard
-  const previousText = clipboard.readText();
-  
-  // 4. Write transcript to clipboard
-  clipboard.writeText(text);
-
-  // 5. Synthesize Cmd+V
-  // Give the OS a tiny moment to register the clipboard change
-  await new Promise(resolve => setTimeout(resolve, 50));
-  
-  // UiohookKey.V = 47, UiohookKey.Meta = 3675
-  // We press Cmd down, V down, V up, Cmd up
-  uIOhook.keyToggle(3675, 'down');
-  uIOhook.keyTap(47);
-  uIOhook.keyToggle(3675, 'up');
-
-  // 6. Restore previous clipboard after a short delay
-  setTimeout(() => {
-    clipboard.writeText(previousText || '');
-  }, 500);
 
   return 'pasted';
 }

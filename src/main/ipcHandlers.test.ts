@@ -24,6 +24,9 @@ jest.mock('electron', () => ({
     unregisterAll: jest.fn(),
     isRegistered: jest.fn(() => false),
   },
+  Notification: {
+    isSupported: jest.fn(() => false),
+  },
 }));
 
 jest.mock('uiohook-napi', () => {

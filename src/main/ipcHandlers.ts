@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences, globalShortcut, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, clipboard, systemPreferences, globalShortcut, shell, Notification } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -594,9 +594,23 @@ export function setupIpcHandlers(options: IpcSetupOptions): IpcSetupResult {
       
       if (pasteResult === 'secure-input') {
         dictationNotice = 'Skipped paste (Secure Input active)';
-      } else if (pasteResult === 'error') {
-        dictationNotice = 'Paste failed, saved to log';
+      } else if (pasteResult === 'pasted') {
+        dictationNotice = 'Dictated & copied to clipboard';
       }
+    }
+
+    if (event.origin === 'dictation' && text) {
+      try {
+        if (typeof Notification !== 'undefined' && Notification.isSupported && Notification.isSupported()) {
+          if (!mainWindow.isFocused()) {
+            new Notification({
+              title: 'Nadabodha Dictation',
+              body: text.length > 100 ? text.slice(0, 97) + '…' : text,
+              silent: true,
+            }).show();
+          }
+        }
+      } catch { /* ignore notification errors */ }
     }
 
     let withSaves: TranscriptionEvent = {

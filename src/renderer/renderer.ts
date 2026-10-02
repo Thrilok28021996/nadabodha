@@ -1030,9 +1030,12 @@ function handleTranscriptionEvent(event: TranscriptionEvent): void {
       showError(error);
     }
     if (status === 'completed' && text) {
-      dictationBadge.textContent = '🎙️ Dictation active';
-      // Append to today's dictation log note (which updates transcriptArea
-      // immediately if the dictation log note is currently selected).
+      dictationBadge.hidden = false;
+      dictationBadge.textContent = '✓ ' + (text.length > 50 ? text.slice(0, 47) + '…' : text);
+      dictationBadge.style.opacity = '1';
+      setTimeout(() => {
+        dictationBadge.hidden = true;
+      }, 4000);
       appendDictationText(text);
     }
     return;
@@ -1152,43 +1155,54 @@ async function handleTranscriptionCompleted(text: string, event: TranscriptionEv
 }
 
 async function appendDictationText(text: string): Promise<void> {
-  // Find today's dictation log note
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  // Case 1: A note is currently open in the editor — print/append directly to it!
+  if (selectedNoteId) {
+    const existing = currentNoteContent.transcript || transcriptArea.value || '';
+    const spacer = existing.length > 0 && !existing.endsWith('\n') ? (existing.endsWith(' ') ? '' : ' ') : '';
+    const updated = existing + spacer + trimmed;
+
+    currentNoteContent.transcript = updated;
+    transcriptArea.value = updated;
+    copyBtn.disabled = false;
+    saveBtn.disabled = false;
+    saveSrtBtn.disabled = false;
+    saveVttBtn.disabled = false;
+
+    await api.updateNote({ id: selectedNoteId, transcript: updated });
+    await loadNotes();
+    return;
+  }
+
+  // Case 2: No note is selected — create or update today's Dictation Log note and OPEN it immediately!
   const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
   const title = `Dictation Log - ${today}`;
-  
+
   let logNote = notes.find(n => n.source === 'dictation-log' && n.title === title);
-  
+
   if (logNote) {
     const result = await api.readNoteContent(logNote.id);
     const existing = result.content?.transcript || '';
-    const updated = existing ? existing + '\n\n' + text : text;
+    const spacer = existing.length > 0 && !existing.endsWith('\n') ? '\n\n' : '';
+    const updated = existing + spacer + trimmed;
     await api.updateNote({ id: logNote.id, transcript: updated });
-    
-    // If it's the currently selected note, update UI immediately
-    if (selectedNoteId === logNote.id) {
-      currentNoteContent.transcript = updated;
-      transcriptArea.value = updated;
-      copyBtn.disabled = false;
-      saveBtn.disabled = false;
-      saveSrtBtn.disabled = false;
-      saveVttBtn.disabled = false;
-    }
+    await loadNotes();
+    await openNote(logNote.id);
   } else {
-    // Create new log note for today
     const req = {
       title,
-      source: 'dictation-log',
+      source: 'dictation-log' as const,
       folder: 'Dictation',
-      transcript: text
+      transcript: trimmed,
     };
     const result = await api.createNote(req);
+    await loadNotes();
     if (result.success && result.note) {
-      logNote = result.note;
+      await openNote(result.note.id);
     }
   }
-  
-  // Reload notes to reflect new size/content
-  await loadNotes();
 }
 
 function handleSummaryEvent(event: TranscriptionEvent): void {
