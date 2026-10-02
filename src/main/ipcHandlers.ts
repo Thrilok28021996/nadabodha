@@ -102,17 +102,48 @@ function describeError(err: unknown): string {
  * macOS event tap that takes the process down when the app is not trusted, so
  * this is consulted BEFORE the hook starts.
  *
+ * Two-stage check:
+ *  1. ask=false  →  AXIsProcessTrusted() — silent, but macOS caches the result
+ *     per-process at launch time. After an ad-hoc re-sign (new cdhash) this
+ *     always returns false for the lifetime of the process, even if the user
+ *     has already granted permission for the new binary.
+ *  2. ask=true   →  AXIsProcessTrustedWithOptions({prompt: true}) — live,
+ *     never cached. If the app IS already trusted this returns true immediately
+ *     with NO dialog. Only shows a dialog when NOT trusted. We use this as a
+ *     fallback so that a user who granted permission doesn't have to restart.
+ *
  * NADABODHA_DICTATION_NO_ACCESSIBILITY=1 forces the "not trusted" branch. It
  * exists so the banner + no-start path can be exercised without revoking the
  * machine's TCC grant (which can only be restored by a human clicking the
  * system prompt).
  */
+/** Timestamp of last time we called isTrustedAccessibilityClient(true) to avoid
+ *  repeatedly popping the system dialog when permission is NOT yet granted. */
+let lastLiveCheckMs = 0;
+const LIVE_CHECK_COOLDOWN_MS = 60_000;
+
 export function isAccessibilityTrusted(ask = false): boolean {
   if (process.env.NADABODHA_DICTATION_NO_ACCESSIBILITY === '1') {
     return false;
   }
   try {
-    return systemPreferences.isTrustedAccessibilityClient(ask);
+    // Stage 1: fast cached check.
+    if (systemPreferences.isTrustedAccessibilityClient(false)) {
+      return true;
+    }
+    // Stage 2: live check via AXIsProcessTrustedWithOptions({prompt:true}).
+    // - If ALREADY trusted: returns true immediately, no dialog shown. ✓
+    // - If NOT trusted: shows the system accessibility dialog.
+    //   We throttle this to once per 60 s so it doesn't pop up every 1.5 s.
+    // Skip entirely in test environments so mock assertions stay deterministic.
+    if (process.env.NODE_ENV !== 'test') {
+      const now = Date.now();
+      if (now - lastLiveCheckMs >= LIVE_CHECK_COOLDOWN_MS) {
+        lastLiveCheckMs = now;
+        return systemPreferences.isTrustedAccessibilityClient(true);
+      }
+    }
+    return false;
   } catch {
     return false;
   }
