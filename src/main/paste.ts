@@ -1,8 +1,38 @@
-import { clipboard, BrowserWindow } from 'electron';
-import { exec } from 'child_process';
+import { clipboard, BrowserWindow, app } from 'electron';
+import fs from 'fs';
+import path from 'path';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+/**
+ * Resolves the path to the native mac-paste binary helper.
+ */
+export function resolveMacPasteHelper(): string {
+  if (process.platform !== 'darwin') return '';
+  const candidates: string[] = [];
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'assets', 'bin', 'mac-paste'));
+    candidates.push(path.join(process.resourcesPath, 'app', 'assets', 'bin', 'mac-paste'));
+    candidates.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'assets', 'bin', 'mac-paste'));
+  }
+  candidates.push(path.join(__dirname, '../../assets/bin/mac-paste'));
+  candidates.push(path.join(__dirname, '../assets/bin/mac-paste'));
+  try {
+    if (app && typeof app.getAppPath === 'function') {
+      candidates.push(path.join(app.getAppPath(), 'assets', 'bin', 'mac-paste'));
+    }
+  } catch { /* ignore */ }
+
+  for (const c of candidates) {
+    if (fs.existsSync(c)) {
+      return c;
+    }
+  }
+  return '';
+}
 
 /**
  * Checks if macOS Secure Input is enabled (e.g. user is in a password field).
@@ -24,7 +54,7 @@ export async function isSecureInputEnabled(): Promise<boolean> {
  * Executes a paste of the dictated text.
  * Always ensures the transcript is placed on the system clipboard.
  * If Nadabodha has focus, returns 'own-window' so the renderer directly inserts it.
- * Otherwise, attempts to synthesize Cmd+V via AppleScript or native keytap.
+ * Otherwise, synthesizes Cmd+V via native CoreGraphics CGEventPost or AppleScript.
  */
 export async function pasteTextAtCursor(text: string): Promise<'pasted' | 'secure-input' | 'own-window' | 'error'> {
   if (!text) return 'error';
@@ -46,29 +76,30 @@ export async function pasteTextAtCursor(text: string): Promise<'pasted' | 'secur
     return 'own-window';
   }
 
-  // 4. In external applications, attempt AppleScript Cmd+V
-  if (process.platform === 'darwin') {
+  // Short delay (80ms) to ensure OS pasteboard synchronization has completed
+  await new Promise(resolve => setTimeout(resolve, 80));
+
+  // 4. Primary: use native macOS CGEventPost helper binary (native hardware Cmd+V)
+  const helper = resolveMacPasteHelper();
+  if (helper) {
     try {
-      await execAsync("osascript -e 'tell application \"System Events\" to keystroke \"v\" using command down'", { timeout: 1500 });
+      await execFileAsync(helper, { timeout: 1500 });
+      console.log('[paste] Native CGEventPost helper executed Cmd+V successfully');
       return 'pasted';
-    } catch {
-      // If AppleScript fails/is blocked, text remains on clipboard for user ⌘V
-      console.log('[paste] AppleScript paste bypassed; text is ready on clipboard');
+    } catch (err) {
+      console.warn('[paste] Native helper failed, trying AppleScript fallback:', err);
     }
   }
 
-  // 5. Fallback: try uiohook keytap if available
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const mod = require('uiohook-napi');
-    if (mod && mod.uIOhook) {
-      mod.uIOhook.keyToggle(3675, 'down');
-      mod.uIOhook.keyTap(47);
-      mod.uIOhook.keyToggle(3675, 'up');
+  // 5. Secondary fallback: AppleScript virtual key code 9 (V) with command down
+  if (process.platform === 'darwin') {
+    try {
+      await execAsync("/usr/bin/osascript -e 'tell application \"System Events\" to key code 9 using command down'", { timeout: 1500 });
+      console.log('[paste] AppleScript key code 9 executed successfully');
       return 'pasted';
+    } catch (err) {
+      console.warn('[paste] AppleScript paste also bypassed; text is ready on clipboard:', err);
     }
-  } catch {
-    // ignore
   }
 
   return 'pasted';

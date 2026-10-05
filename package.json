@@ -8,7 +8,7 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "compile": "tsc && node scripts/copy-assets.js",
+    "compile": "mkdir -p assets/bin && clang -framework ApplicationServices -O2 native/mac-paste.c -o assets/bin/mac-paste && tsc && node scripts/copy-assets.js",
     "watch": "tsc -w",
     "start": "npm run compile && electron .",
     "build": "npm run compile && electron-builder --mac --arm64 --dir && rm -f release/mac-arm64/Nadabodha.app/Nadabodha.app && codesign --force --deep --sign - release/mac-arm64/Nadabodha.app && rm -f Nadabodha.app && ln -s release/mac-arm64/Nadabodha.app Nadabodha.app",

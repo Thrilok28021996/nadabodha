@@ -59,6 +59,16 @@ copyAsset('icon.png', distAssetsDir);
 copyAsset('icon.icns', distAssetsDir);
 copyAsset('icon.png', destDir);
 
+// Native helpers
+const macPasteSrc = path.join(assetsDir, 'bin', 'mac-paste');
+if (fs.existsSync(macPasteSrc)) {
+  const macPasteDest = path.join(distAssetsDir, 'bin', 'mac-paste');
+  fs.mkdirSync(path.join(distAssetsDir, 'bin'), { recursive: true });
+  fs.copyFileSync(macPasteSrc, macPasteDest);
+  fs.chmodSync(macPasteDest, 0o755);
+  console.log(`Copied mac-paste -> ${macPasteDest}`);
+}
+
 // Markdown rendering for the summary preview (workstream 2).
 vendorIntoRenderer(path.join(root, 'node_modules', 'marked', 'lib', 'marked.umd.js'), 'marked');
 vendorIntoRenderer(path.join(root, 'node_modules', 'marked', 'lib', 'marked.umd.js.map'), 'marked sourcemap');
