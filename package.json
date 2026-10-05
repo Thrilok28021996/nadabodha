@@ -38,7 +38,8 @@
       "gatekeeperAssess": false,
       "identity": null,
       "extendInfo": {
-        "NSMicrophoneUsageDescription": "Nadabodha needs microphone access to record audio and dictate text."
+        "NSMicrophoneUsageDescription": "Nadabodha needs microphone access to record audio and dictate text.",
+        "NSAppleEventsUsageDescription": "Nadabodha needs permission to control System Events to automatically paste dictated text at your cursor."
       }
     },
     "files": [
