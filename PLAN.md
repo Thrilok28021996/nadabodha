@@ -133,7 +133,11 @@ Meeting/file transcription speed, summary speed, smaller models, the stale
 ## Results (measured)
 
 Baseline captured before any change with `scripts/bench_dictation.py`; same
-machine, same audio, same run.
+machine, same audio, same run. The table was written at `3d4319d` and last
+edited at `a314c1a`, both before the second-review fixes landed in `72d31fd`.
+The recording used was never written down -- the bench picks the newest `.wav`
+by mtime -- so the rows below are a point-in-time record, not numbers
+reproducible from today's tree (see the re-run note under the gates).
 
 | Case | Before | After | |
 | --- | --- | --- | --- |
@@ -148,8 +152,41 @@ The clean-speech clip is the honest dictation number: the 5s real clip is faint
 and repeatedly fails Whisper's logprob threshold, which triggers temperature
 fallback re-decodes in both backends and inflates every figure.
 
-Gates: `pytest tests -q` 139 passed (119 before), `--self-test` 6/6, SRT export
-verified to still carry real timecodes through the MLX path.
+Gates: `pytest tests -q` 148 passed (119 before), `--self-test` 6/6, SRT export
+verified to still carry real timecodes through the MLX path. Re-verified at
+`72d31fd` on 2026-11-26 with the sovereign interpreter
+(`/Volumes/personal/conda_envs/sovereign/bin/python3`, `PYTHONPATH` unset):
+148 passed, self-test 6/6. The 119 baseline was re-checked the same day on
+`main` (79b1137) and holds.
+
+### Re-run at 72d31fd (2026-11-26): the 5s-clip rows do not reproduce
+
+All three bench commands re-run at `72d31fd` on the newest recording,
+`recording-2026-11-26T15-53-13-555026.wav` (peak 2149/32767 -- the faint clip
+the caveat above warns about); transcripts checked with `--text`:
+
+| Command | Cold | Warm | Transcript |
+| --- | --- | --- | --- |
+| CPU, auto language, timestamps on | 8.80s | 10.97s median | `''` |
+| CPU, `language=en`, no timestamps | 0.03s | 0.01s median | `''` |
+| MLX, auto language, timestamps on | 7.59s | 7.28s median | `'Hello?'` |
+
+The 5.33s/5.38s figures for the 5s real clip did not reproduce, and the fresh
+CPU figures are not latency measurements at all: the CPU path hardcodes
+`vad_filter=True` (present since 79b1137, unchanged by both fix commits) and VAD
+rejects this clip as non-speech before any decode happens. Isolation probe
+against the shipped code, same model and knobs: `language=en` with VAD on ->
+0.03s, `text ''`; VAD off -> 12.04s, `text 'For more information, visit
+www.fema.org'`. The MLX path passes no VAD, so its row is the only run above
+that actually decoded.
+
+Two reasons the published rows cannot be regenerated from this tree: the clip
+filename was never recorded while the bench auto-picks the newest `.wav` by
+mtime, and the faint-clip CPU figures depend on a VAD rejection this plan never
+measured. The clean-clip rows (the honest dictation number) and the meeting row
+were **not re-verified at `72d31fd`** -- the commands above only cover the
+newest recording. Treat the table above as the original measurement, not as a
+current one; the fresh figures are not a replacement for it.
 
 ### Phase 2 outcome: kept, for dictation only
 
@@ -180,3 +217,12 @@ into the default HF home. The backend now resolves the snapshot inside
 The fullscreen banner fix cannot be verified headlessly. It needs a human to go
 fullscreen in a real app and dictate, confirming the banner shows both while
 transcribing and for the result.
+
+Nothing from the second review is outstanding: the `--transcribe` GPU-routing
+bug, the `pt-BR` tokenizer rejection, the stuck download progress bar, and the
+two false accuracy claims (README and transcriber docstring) were fixed in
+`a314c1a` and `72d31fd`, with tests pinning the routing and tokenizer fixes.
+One new finding from the 2026-11-26 re-run is open but out of scope here: the
+CPU path's hardcoded `vad_filter=True` rejects very faint clips and returns an
+empty transcript (present since `79b1137`; neither introduced nor fixed by
+this plan).

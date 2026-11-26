@@ -164,9 +164,14 @@ on a memory-constrained machine.
 ## Verification
 
 ```bash
-python3 -m pytest tests -q          # unit tests
-python3 -m svara --self-test        # headless app/build checks
+unset PYTHONPATH   # if your shell exports one (a stale one breaks numpy/cffi)
+/Volumes/personal/conda_envs/sovereign/bin/python3 -m pytest tests -q    # unit tests
+/Volumes/personal/conda_envs/sovereign/bin/python3 -m svara --self-test  # headless app/build checks
 ```
+
+Both need the sovereign interpreter (the default `SVARA_PYTHON` in
+`scripts/run-svara.sh`): `pytest` is not in `requirements.txt`, and a bare
+`python3` has neither it nor the app's dependencies.
 
 The self-test verifies logging, settings round-trips, the summarizer request
 shape, ffmpeg/helper presence, the transcriber import, and that the Qt window
