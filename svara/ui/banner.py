@@ -21,12 +21,20 @@ ERROR = "error"
 _DOT_COLORS = {BUSY: "#cba6f7", SUCCESS: "#a6e3a1", ERROR: "#f38ba8"}
 
 
-def pin_window_to_every_space(widget: QWidget) -> None:
+def pin_window_to_every_space(widget: QWidget, *, order_front: bool = False) -> None:
     """Order a macOS window above other apps, on every Space and fullscreen.
 
     A plain Qt.Tool window is ordered on Svara's own Space, so a maximised or
     fullscreen app on another Space hides it. AppKit collection behaviour is the
     only way to join every Space and sit above a fullscreen window.
+
+    This must run *before* the window is ordered on screen. Setting the
+    collection behaviour on a window macOS has already placed does not move it
+    into the active fullscreen Space, which is why the banner used to appear on
+    ordinary desktops but never over a fullscreen app. ``order_front`` adds the
+    matching ``orderFrontRegardless()``, because Qt's ``raise_()`` respects the
+    app's own ordering rules and will not put a window over another app's
+    fullscreen Space.
     """
     application = QGuiApplication.instance()
     if application is None or application.platformName() != "cocoa":
@@ -39,6 +47,7 @@ def pin_window_to_every_space(widget: QWidget) -> None:
             NSStatusWindowLevel,
             NSWindowCollectionBehaviorCanJoinAllSpaces,
             NSWindowCollectionBehaviorFullScreenAuxiliary,
+            NSWindowCollectionBehaviorIgnoresCycle,
             NSWindowCollectionBehaviorStationary,
         )
     except Exception:  # noqa: BLE001 - non-macOS or PyObjC missing
@@ -52,10 +61,14 @@ def pin_window_to_every_space(widget: QWidget) -> None:
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
             | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorIgnoresCycle
         )
         window.setCollectionBehavior_(behaviour)
         window.setLevel_(NSStatusWindowLevel)
         window.setHidesOnDeactivate_(False)
+        window.setCanHide_(False)
+        if order_front:
+            window.orderFrontRegardless()
     except Exception:  # noqa: BLE001 - cosmetic; never break dictation
         return
 
@@ -126,13 +139,18 @@ class StatusBanner(QWidget):
         if timeout_ms > 0:
             self._hide_timer.start(timeout_ms)
         self._place()
-        self.show()
+        # Pin before ordering: macOS will otherwise place the window on Svara's
+        # own Space, and setting the behaviour afterwards does not move it into
+        # the active fullscreen Space.
         self._pin_to_every_space()
+        self.show()
         self.raise_()
+        # Re-assert, then order above whatever app currently owns the screen.
+        self._pin_to_every_space(order_front=True)
 
-    def _pin_to_every_space(self) -> None:
+    def _pin_to_every_space(self, *, order_front: bool = False) -> None:
         """Make the banner float over other apps, their windows and their spaces."""
-        pin_window_to_every_space(self)
+        pin_window_to_every_space(self, order_front=order_front)
 
     def _tick(self) -> None:
         self._dot.setText("○" if self._dot.text() == "●" else "●")

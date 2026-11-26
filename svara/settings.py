@@ -98,6 +98,18 @@ def _migrate_recording_hotkey(value: str) -> str:
     return "+".join(parts) if parts else "<cmd>+<shift>+r"
 
 
+def _normalise_language(value: str) -> str:
+    """Dictation language: a code, or ``auto`` to let Whisper detect it.
+
+    Anything empty falls back to English because that is what this app is used
+    for, and pinning the language skips a whole encoder pass per dictation.
+    """
+    candidate = (value or "").strip().lower()
+    if not candidate:
+        return "en"
+    return candidate
+
+
 #: Electron-era camelCase keys that map onto current settings fields.
 _LEGACY_KEYS = {
     "model_repo": "activeModel",
@@ -118,6 +130,7 @@ _LEGACY_KEYS = {
 class Settings:
     model_repo: str = DEFAULT_MODEL_REPO
     stt_cache_dir: str = field(default_factory=default_cache_dir)
+    stt_backend: str = "auto"
     output_dir: str = "/Volumes/personal/meetings"
     theme: str = "mocha"
     llm_base_url: str = "http://127.0.0.1:1234/v1"
@@ -136,6 +149,8 @@ class Settings:
     input_device: str = ""
     audio_source: str = "microphone"
     watch_folder: str = ""
+    dictation_language: str = "en"
+    preload_model: bool = True
     prompt_template: str = DEFAULT_PROMPT
     prompt_presets: List[Dict[str, str]] = field(
         default_factory=lambda: [{"name": "General summary", "template": DEFAULT_PROMPT}]
@@ -194,6 +209,9 @@ class Settings:
             settings.theme = "mocha"
         if settings.audio_source not in {"microphone", "system", "both"}:
             settings.audio_source = "microphone"
+        if settings.stt_backend not in {"auto", "mlx", "cpu"}:
+            settings.stt_backend = "auto"
+        settings.dictation_language = _normalise_language(settings.dictation_language)
         return settings
 
     # -- persistence -------------------------------------------------------

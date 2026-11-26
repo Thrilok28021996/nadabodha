@@ -51,20 +51,63 @@ AUDIO_FILTER = "Audio (*.wav *.mp3 *.m4a *.ogg *.flac *.aac *.aiff *.wma)"
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".aiff", ".wma"}
 
 
+def transcribe_options(origin: str, settings: Settings) -> dict:
+    """Per-origin transcription flags.
+
+    Dictation is a few seconds long and only ever pasted as plain text, so two
+    fixed per-call costs can go: Whisper's language-detection pass (skipped by
+    pinning the language) and timestamp-token decoding. Minutes-long recordings
+    and imports keep timestamps because SRT/VTT export depends on them, and they
+    keep auto-detection because they may not be English.
+    """
+    if origin != "dictation":
+        return {}
+    options: dict = {"without_timestamps": True}
+    language = (settings.dictation_language or "").strip()
+    if language and language.lower() != "auto":
+        options["language"] = language
+    return options
+
+
 class _TranscribeWorker(QThread):
     ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, transcriber: Transcriber, audio: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        transcriber: Transcriber,
+        audio: Path,
+        options: dict | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._transcriber = transcriber
         self._audio = audio
+        self._options = dict(options or {})
 
     def run(self) -> None:  # noqa: D401 - Qt override
         try:
-            self.ready.emit(self._transcriber.transcribe_result(self._audio))
+            self.ready.emit(self._transcriber.transcribe_result(self._audio, **self._options))
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
             self.failed.emit(str(error))
+
+
+class _PreloadWorker(QThread):
+    """Load the speech model off the UI thread so the first take is fast."""
+
+    done = Signal(str)
+
+    def __init__(self, transcriber: Transcriber, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._transcriber = transcriber
+
+    def run(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self._transcriber.preload()
+        except Exception as error:  # noqa: BLE001 - preloading is an optimisation
+            self.done.emit(str(error))
+            return
+        self.done.emit("")
 
 
 class _SummaryWorker(QThread):
@@ -119,6 +162,8 @@ class MainWindow(QMainWindow):
         self.recorder = Recorder(input_device=settings.input_device)
         self.system_recorder = SystemAudioRecorder()
         self._transcriber_instance: Transcriber | None = None
+        self._transcriber_key: tuple[str, str, str] | None = None
+        self._preload_worker: _PreloadWorker | None = None
         self._transcribe_worker: _TranscribeWorker | None = None
         self._summary_worker: _SummaryWorker | None = None
         self._model_worker: _ModelDownloadWorker | None = None
@@ -384,7 +429,6 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------- settings/app
 
     def _apply_settings(self) -> None:
-        self._transcriber_instance = None
         self.recorder.set_input_device(self.settings.input_device)
         self.watch.set_folder(self.settings.watch_folder)
         self.dictation.apply(self.settings.dictation_hotkey, self.settings.dictation_enabled)
@@ -816,12 +860,47 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------- transcription
 
     def _transcriber(self) -> Transcriber:
-        if self._transcriber_instance is None:
+        # Rebuild only when the model or its cache actually changed. Dropping
+        # the instance unconditionally cost a full model reload (seconds, plus
+        # 1.6 GB of re-allocation) every time Settings was saved, even for an
+        # unrelated change such as the theme.
+        key = (self.settings.model_repo, self.settings.stt_cache_dir, self.settings.stt_backend)
+        if self._transcriber_instance is None or self._transcriber_key != key:
             self._transcriber_instance = Transcriber(
                 model_repo=self.settings.model_repo,
                 cache_dir=self.settings.stt_cache_dir,
+                backend=self.settings.stt_backend,
             )
+            self._transcriber_key = key
         return self._transcriber_instance
+
+    def preload_speech_model(self) -> None:
+        """Warm the model in the background so the first dictation is fast.
+
+        Called by ``python3 -m svara`` after the window is shown. It is not
+        started from the constructor so the headless self-test never loads a
+        1.6 GB model while merely asserting that the window builds.
+        """
+        if not self.settings.preload_model or self._preload_worker is not None:
+            return
+        transcriber = self._transcriber()
+        if not transcriber.is_cached():
+            return
+        worker = _PreloadWorker(transcriber, self)
+        worker.done.connect(self._on_preload_done)
+        worker.finished.connect(worker.deleteLater)
+        self._preload_worker = worker
+        self.log.info("transcription", "Preloading speech model")
+        worker.start()
+
+    def _on_preload_done(self, error: str) -> None:
+        self._preload_worker = None
+        if error:
+            # Preloading is an optimisation; a failure here is not a failure of
+            # transcription, which loads the model on demand instead.
+            self.log.warn("transcription", "Speech model preload failed", error)
+            return
+        self.log.info("transcription", "Speech model preloaded")
 
     def _ensure_model_ready(self) -> bool:
         transcriber = self._transcriber()
@@ -900,7 +979,7 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(True)
         self._set_idle_status(f"Transcribing {Path(audio).name}…", kind="busy")
-        worker = _TranscribeWorker(self._transcriber(), Path(audio), self)
+        worker = _TranscribeWorker(self._transcriber(), Path(audio), transcribe_options(origin, self.settings), self)
         worker.ready.connect(lambda result: self._on_transcribed(result, origin))
         worker.failed.connect(lambda message: self._on_transcribe_failed(message, origin))
         worker.finished.connect(worker.deleteLater)

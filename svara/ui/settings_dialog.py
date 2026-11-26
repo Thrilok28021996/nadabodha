@@ -54,6 +54,18 @@ class SettingsDialog(QDialog):
         cache_row.addWidget(self._cache, 1)
         cache_row.addWidget(browse)
 
+        self._backend = QComboBox()
+        self._backend.addItem("Automatic (GPU when available)", "auto")
+        self._backend.addItem("Apple GPU (MLX)", "mlx")
+        self._backend.addItem("CPU only", "cpu")
+        index = self._backend.findData(settings.stt_backend)
+        self._backend.setCurrentIndex(index if index >= 0 else 0)
+        self._backend.setToolTip(
+            "The Apple GPU path runs the same large-v3-turbo weights in float16 and\n"
+            "measured about 5x faster than the CPU path on a dictation-length clip.\n"
+            "CPU is the fallback whenever MLX or Metal is unavailable."
+        )
+
         self._output = QLineEdit(settings.output_dir)
         self._output.setPlaceholderText("/Volumes/personal/meetings")
         browse_output = QPushButton("Browse…")
@@ -144,6 +156,20 @@ class SettingsDialog(QDialog):
         self._recording_hotkey = QLineEdit(settings.recording_hotkey)
         self._recording_hotkey.setPlaceholderText("<cmd>+<shift>+r")
 
+        self._language = QLineEdit(settings.dictation_language)
+        self._language.setPlaceholderText("en")
+        self._language.setToolTip(
+            "A language code such as en, or auto to let Whisper detect it.\n"
+            "Detection is a whole extra pass over the 30s window, which is why a\n"
+            "pinned language makes dictation noticeably faster."
+        )
+        self._preload = QCheckBox("Load the speech model at startup (faster first dictation)")
+        self._preload.setChecked(settings.preload_model)
+        self._preload.setToolTip(
+            "Keeps about 1.6 GB resident so the first dictation does not wait for\n"
+            "the model to load. Turn off on a memory-constrained machine."
+        )
+
         self._prompt = QPlainTextEdit(settings.prompt_template)
         self._prompt.setMinimumHeight(170)
 
@@ -166,6 +192,7 @@ class SettingsDialog(QDialog):
         form.setSpacing(10)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         form.addRow("Speech model", self._model)
+        form.addRow("Transcription engine", self._backend)
         form.addRow("Model cache", cache_row)
         form.addRow("Output folder", output_row)
         form.addRow("Appearance", self._theme)
@@ -185,6 +212,8 @@ class SettingsDialog(QDialog):
         form.addRow(group("DICTATION"))
         form.addRow("Recording hotkey", self._recording_hotkey)
         form.addRow("Dictation hotkey", self._hotkey)
+        form.addRow("Dictation language", self._language)
+        form.addRow("", self._preload)
         form.addRow("", self._dictation)
         form.addRow("", self._paste)
         form.addRow("", self._chime)
@@ -336,6 +365,14 @@ class SettingsDialog(QDialog):
         if self._dictation.isChecked() and not hotkey:
             QMessageBox.warning(self, "Settings", "Enter a hotkey, for example <alt>+<space>.")
             return
+        language = self._language.text().strip()
+        if language and not (language.lower() == "auto" or language.replace("-", "").isalnum()):
+            QMessageBox.warning(
+                self,
+                "Settings",
+                "Dictation language must be a code such as en, pt-BR, or auto.",
+            )
+            return
         recording_hotkey = self._recording_hotkey.text().strip()
         if recording_hotkey and recording_hotkey.lower() == hotkey.lower():
             QMessageBox.warning(self, "Settings", "The recording and dictation hotkeys must differ.")
@@ -351,6 +388,7 @@ class SettingsDialog(QDialog):
 
         self._settings.model_repo = model
         self._settings.stt_cache_dir = self._cache.text().strip()
+        self._settings.stt_backend = self._backend.currentData() or "auto"
         self._settings.output_dir = output
         self._settings.theme = self._theme.currentData() or "mocha"
         self._settings.input_device = self._device.currentData() or ""
@@ -369,6 +407,8 @@ class SettingsDialog(QDialog):
         self._settings.dictation_notification = self._notification.isChecked()
         self._settings.dictation_hotkey = hotkey or "<alt>+<space>"
         self._settings.recording_hotkey = recording_hotkey or "<cmd>+<shift>+r"
+        self._settings.dictation_language = self._language.text().strip() or "en"
+        self._settings.preload_model = self._preload.isChecked()
         self._settings.prompt_template = self._prompt.toPlainText() or self._settings.prompt_template
         self.accept()
 

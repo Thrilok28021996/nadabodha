@@ -109,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
     window = _build_window(settings, paths.settings_path(), logger)
     window.show()
     logger.info("app", "Window shown")
+    # Warm the speech model in the background: a dictation take is short, so a
+    # cold model load would be most of the wait. Deliberately not in the
+    # MainWindow constructor, which --self-test also builds.
+    window.preload_speech_model()
     return app.exec()
 
 

@@ -129,3 +129,36 @@ Meeting/file transcription speed, summary speed, smaller models, the stale
 - Preloading raises idle memory by ~1.6 GB on a machine already at 7.27 GB
   swap. Preload must be optional (`preload_model` setting) and off by default
   if it causes pressure.
+
+## Results (measured)
+
+Baseline captured before any change with `scripts/bench_dictation.py`; same
+machine, same audio, same run.
+
+| Case | Before | After | |
+| --- | --- | --- | --- |
+| Dictation, 5s real clip (cold) | 14.49s | 5.33s | Phases 1 |
+| Dictation, 5s real clip (warm) | 12.75s | 5.38s | Phase 1 |
+| Dictation, 6.4s clean clip, CPU | 5.90s | 5.90s | unchanged |
+| Dictation, 6.4s clean clip, GPU | n/a | **1.12s** | Phase 2, 5.0x vs CPU |
+| Meeting, 74.5s, GPU | 12.06s | **3.47s** | Phase 2, 3.5x vs CPU |
+
+The clean-speech clip is the honest dictation number: the 5s real clip is faint
+and repeatedly fails Whisper's logprob threshold, which triggers temperature
+fallback re-decodes in both backends and inflates every figure.
+
+Gates: `pytest tests -q` 139 passed (119 before), `--self-test` 6/6, SRT export
+verified to still carry real timecodes through the MLX path.
+
+### Phase 2 outcome: kept
+
+MLX beat the CPU path on both dictation and meeting lengths and produced the
+more complete transcript on the meeting file, so the default engine is now
+`auto` -> GPU when available. The CPU path is untouched and remains the
+fallback; `stt_backend=cpu` forces it.
+
+### Still outstanding
+
+The fullscreen banner fix cannot be verified headlessly. It needs a human to go
+fullscreen in a real app and dictate, confirming the banner shows both while
+transcribing and for the result.

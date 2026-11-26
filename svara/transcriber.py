@@ -27,6 +27,16 @@ import numpy as np
 
 from .models import DEFAULT_MODEL_REPO
 
+#: MLX (Apple GPU) build of the same large-v3-turbo weights. Same architecture
+#: and licence, but stored as float16 for Metal, which on this hardware is both
+#: faster and more accurate than the int8 CTranslate2 build the CPU path uses.
+DEFAULT_MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+
+#: Marker file that proves a model snapshot is complete, per backend. CTranslate2
+#: ships ``model.bin``; MLX ships ``weights.safetensors``.
+CT2_MODEL_FILE = "model.bin"
+MLX_MODEL_FILE = "weights.safetensors"
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -168,19 +178,32 @@ def repo_cache_dir(repo: str, cache_dir: str) -> Path:
     return Path(hub) / ("models--" + (repo or "").replace("/", "--"))
 
 
-def is_model_cached(repo: str, cache_dir: str) -> bool:
+def is_model_cached(repo: str, cache_dir: str, filename: str = CT2_MODEL_FILE) -> bool:
     root = repo_cache_dir(repo, cache_dir)
     snapshots = root / "snapshots"
     if not snapshots.is_dir():
         return False
     for snapshot in snapshots.iterdir():
-        model = snapshot / "model.bin"
+        model = snapshot / filename
         try:
             if model.is_file() and model.stat().st_size > 1_000_000:
                 return True
         except OSError:
             continue
     return False
+
+
+def mlx_available() -> bool:
+    """True when Apple's MLX runtime and its Metal backend can actually run."""
+    try:
+        import mlx.core as mx  # noqa: PLC0415 - optional dependency
+        import mlx_whisper  # noqa: F401,PLC0415 - presence check only
+    except Exception:  # noqa: BLE001 - absent on non-Apple hardware
+        return False
+    try:
+        return bool(mx.metal.is_available())
+    except Exception:  # noqa: BLE001 - older mlx builds
+        return False
 
 
 def cache_bytes(repo: str, cache_dir: str) -> int:
@@ -199,32 +222,71 @@ def cache_bytes(repo: str, cache_dir: str) -> int:
 
 
 class Transcriber:
+    """Transcribe audio, on the GPU (MLX) when possible and the CPU otherwise.
+
+    Both backends run the same large-v3-turbo weights. The GPU path is selected
+    automatically on Apple Silicon because it measured ~5x faster on a clean
+    dictation clip (1.06s vs 5.63s) and runs float16 instead of the CPU path's
+    int8, so it is more accurate as well. The CPU path stays available and is
+    the fallback whenever MLX is missing or Metal is unavailable.
+    """
+
     def __init__(
         self,
         model_repo: str = DEFAULT_MODEL_REPO,
         cache_dir: str = "",
         ffmpeg_path: str = "ffmpeg",
+        backend: str = "auto",
+        mlx_model_repo: str = DEFAULT_MLX_MODEL_REPO,
     ) -> None:
         self.model_repo = (model_repo or "").strip() or DEFAULT_MODEL_REPO
         self.cache_dir = (cache_dir or "").strip()
         self.ffmpeg_path = ffmpeg_path
+        self.backend = (backend or "auto").strip().lower()
+        self.mlx_model_repo = (mlx_model_repo or "").strip() or DEFAULT_MLX_MODEL_REPO
         self._model = None
         self._lock = threading.Lock()
+        self._use_mlx: bool | None = None
+
+    # -- backend -----------------------------------------------------------
+
+    @property
+    def use_mlx(self) -> bool:
+        """Whether transcriptions go through the Apple GPU."""
+        if self._use_mlx is None:
+            if self.backend == "cpu":
+                self._use_mlx = False
+            elif self.backend == "mlx":
+                # Trust the explicit request; a missing runtime surfaces as a
+                # TranscriptionError with a fixable message at transcribe time
+                # rather than silently falling back to a slower backend.
+                self._use_mlx = True
+            else:
+                self._use_mlx = mlx_available()
+        return self._use_mlx
+
+    @property
+    def active_repo(self) -> str:
+        return self.mlx_model_repo if self.use_mlx else self.model_repo
+
+    @property
+    def model_file(self) -> str:
+        return MLX_MODEL_FILE if self.use_mlx else CT2_MODEL_FILE
 
     # -- model -------------------------------------------------------------
 
     def is_cached(self) -> bool:
-        return is_model_cached(self.model_repo, self.cache_dir)
+        return is_model_cached(self.active_repo, self.cache_dir, self.model_file)
 
     def cached_bytes(self) -> int:
-        return cache_bytes(self.model_repo, self.cache_dir)
+        return cache_bytes(self.active_repo, self.cache_dir)
 
     def expected_bytes(self) -> int | None:
         """Total download size from the Hub, or None when offline."""
         try:
             from huggingface_hub import HfApi
 
-            info = HfApi().model_info(self.model_repo, files_metadata=True)
+            info = HfApi().model_info(self.active_repo, files_metadata=True)
             sizes = [sibling.size for sibling in info.siblings or [] if sibling.size]
             return int(sum(sizes)) or None
         except Exception:  # noqa: BLE001 - offline is fine, caller falls back
@@ -238,11 +300,11 @@ class Transcriber:
             raise TranscriptionError("Downloading the model needs huggingface_hub") from error
         try:
             snapshot_download(
-                repo_id=self.model_repo,
+                repo_id=self.active_repo,
                 cache_dir=hub_cache_dir(self.cache_dir),
             )
         except Exception as error:  # noqa: BLE001 - surfaced to the UI
-            raise TranscriptionError(f"Could not download {self.model_repo}: {error}") from error
+            raise TranscriptionError(f"Could not download {self.active_repo}: {error}") from error
 
     def _load_model(self):
         with self._lock:
@@ -269,10 +331,88 @@ class Transcriber:
 
     # -- transcription -----------------------------------------------------
 
-    def transcribe(self, path: Path) -> str:
-        return self.transcribe_result(path).text
+    def preload(self) -> None:
+        """Load the model now so the first transcription does not pay for it.
 
-    def transcribe_result(self, path: Path) -> TranscriptionResult:
+        Dictation is short and the model load is several seconds, so loading it
+        up front in a worker thread removes that wait from the first take.
+        """
+        if self.use_mlx:
+            self._load_mlx_model()
+            return
+        self._load_model()
+
+    def _load_mlx_model(self):
+        """Populate mlx_whisper's own model cache so a warm call skips the load."""
+        try:
+            import mlx.core as mx
+            from mlx_whisper.transcribe import ModelHolder
+        except ImportError as error:
+            raise TranscriptionError(
+                "The GPU backend needs mlx-whisper. Run: pip install mlx-whisper "
+                "(or set the speech backend to CPU in Settings)."
+            ) from error
+        try:
+            return ModelHolder.get_model(self.mlx_model_repo, mx.float16)
+        except Exception as error:  # noqa: BLE001 - surfaced to the UI
+            raise TranscriptionError(
+                f"Could not load GPU speech model {self.mlx_model_repo!r}: {error}"
+            ) from error
+
+    def _transcribe_mlx(
+        self,
+        audio: np.ndarray,
+        language: str | None,
+        without_timestamps: bool,
+    ) -> list[Segment]:
+        try:
+            import mlx_whisper
+        except ImportError as error:
+            raise TranscriptionError(
+                "The GPU backend needs mlx-whisper. Run: pip install mlx-whisper "
+                "(or set the speech backend to CPU in Settings)."
+            ) from error
+        self._load_mlx_model()
+        try:
+            result = mlx_whisper.transcribe(
+                audio,
+                path_or_hf_repo=self.mlx_model_repo,
+                language=language or None,
+                without_timestamps=without_timestamps,
+                verbose=None,
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced to the UI verbatim
+            raise TranscriptionError(f"Transcription failed: {error}") from error
+        collected: list[Segment] = []
+        for segment in result.get("segments") or []:
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            collected.append(
+                Segment(float(segment.get("start", 0.0)), float(segment.get("end", 0.0)), text)
+            )
+        return collected
+
+    def transcribe(self, path: Path, **options: object) -> str:
+        return self.transcribe_result(path, **options).text
+
+    def transcribe_result(
+        self,
+        path: Path,
+        *,
+        language: str | None = None,
+        without_timestamps: bool = False,
+    ) -> TranscriptionResult:
+        """Transcribe ``path``.
+
+        ``language`` skips Whisper's language-detection pass, which is a whole
+        extra encoder run over the 30s window and therefore the single largest
+        fixed cost of a short dictation take. ``None`` keeps auto-detection.
+
+        ``without_timestamps`` stops the decoder emitting timestamp tokens. Turn
+        it on only where timings are unused (dictation): SRT/VTT export needs
+        them.
+        """
         path = Path(path)
         if not path.is_file():
             raise TranscriptionError(f"Audio file not found: {path}")
@@ -288,12 +428,20 @@ class Transcriber:
                     normalized = normalize_audio(path, self.ffmpeg_path)
                     temporary = normalized if normalized != path else None
                     audio = load_wav_float32(normalized)
+            if self.use_mlx:
+                collected = self._transcribe_mlx(audio, language, without_timestamps)
+                return TranscriptionResult(
+                    text=" ".join(segment.text for segment in collected).strip(),
+                    segments=collected,
+                )
             model = self._load_model()
             try:
                 segments, _info = model.transcribe(
                     audio,
                     beam_size=5,
                     vad_filter=True,
+                    language=(language or None),
+                    without_timestamps=without_timestamps,
                 )
                 collected = [
                     Segment(float(segment.start), float(segment.end), segment.text.strip())

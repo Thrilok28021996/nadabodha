@@ -8,7 +8,8 @@ PySide6** — there is no Electron, no Node.js and no bundled browser runtime.
 
 - **Record** from the microphone (ffmpeg) or **import** an audio file.
 - **Transcribe** locally with Whisper [large-v3 turbo](https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2)
-  through `faster-whisper`.
+  through `faster-whisper`, on the Apple GPU through MLX when it is available
+  and on the CPU otherwise.
 - **Dictate** system-wide with Option+Space: press once to start, again to
   finish. The text is appended to the transcript and pasted at the cursor.
 - **Summarize** through a local OpenAI-compatible server such as LM Studio.
@@ -122,6 +123,32 @@ default speech model is Whisper large-v3 turbo
 (`deepdml/faster-whisper-large-v3-turbo-ct2`, 1.6 GB). It downloads on first
 use into the configured Hugging Face cache; existing installs that still had
 the old `Systran/faster-whisper-base` default are migrated automatically.
+
+### Speech engine
+
+**Settings → Transcription engine** picks the backend:
+
+- **Automatic** (default) — the Apple GPU through MLX when it is available,
+  otherwise the CPU.
+- **Apple GPU (MLX)** — `mlx-community/whisper-large-v3-turbo`, the same
+  large-v3-turbo weights converted for Metal, run in float16.
+- **CPU only** — CTranslate2, int8.
+
+Both backends run the same model; the GPU one is faster and, because it keeps
+float16 where the CPU path quantizes to int8, slightly more accurate. Measured
+on this machine (M4, macOS 27) for a 6.4 s dictation clip: **1.1 s on the GPU
+vs 5.9 s on the CPU**. On a 74.5 s recording: 3.5 s vs 12.1 s. `scripts/bench_dictation.py`
+reproduces those numbers.
+
+### Dictation
+
+**Dictation language** defaults to `en`. Pinning the language skips Whisper's
+language-detection pass, which is a whole extra encoder run over the 30 s
+window and the largest fixed cost of a short take. Set it to `auto` to detect
+instead, at the cost of that pass. Dictation also skips timestamp tokens, which
+only subtitle export needs. **Load the speech model at startup** holds about
+1.6 GB resident so the first dictation does not wait for the load; turn it off
+on a memory-constrained machine.
 
 ## Verification
 

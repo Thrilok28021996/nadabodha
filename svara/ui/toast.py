@@ -122,9 +122,13 @@ class PasteToast(QWidget):
         x = max(bounds.left() + 8, min(x, bounds.right() - self.width() - 8))
         y = max(bounds.top() + 8, min(y, bounds.bottom() - self.height() - 8))
         self.move(x, y)
-        self.show()
+        # Same ordering rule as the status banner: pin while the window is not
+        # yet ordered, then force it above the frontmost (possibly fullscreen)
+        # app. Pinning after show() leaves it on Svara's own Space.
         pin_window_to_every_space(self)
+        self.show()
         self.raise_()
+        pin_window_to_every_space(self, order_front=True)
         # Showing even a non-activating tool window can bring the app forward
         # on some macOS builds; put the user's app back if that happened.
         QTimer.singleShot(150, lambda: _restore_frontmost(previous))
