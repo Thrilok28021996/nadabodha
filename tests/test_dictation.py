@@ -183,7 +183,8 @@ def test_unknown_origin_keeps_the_cpu_decoding_path():
 
 def test_settings_normalise_dictation_language():
     assert Settings.from_dict({"dictation_language": ""}).dictation_language == "en"
-    assert Settings.from_dict({"dictation_language": "PT-BR"}).dictation_language == "pt-br"
+    # Whisper rejects regional codes outright, so they are shortened, not stored.
+    assert Settings.from_dict({"dictation_language": "PT-BR"}).dictation_language == "pt"
     assert Settings.from_dict({"dictation_language": "auto"}).dictation_language == "auto"
     assert Settings().dictation_language == "en"
 
@@ -212,7 +213,7 @@ def test_carbon_failure_without_accessibility_reports_instead_of_failing_silentl
 
     class BoomCarbon:
         def __init__(self, *args, **kwargs):
-            raise module.CarbonHotkey.__mro__[0].__name__ and RuntimeError("RegisterEventHotKey failed")
+            raise RuntimeError("RegisterEventHotKey failed")
 
     monkeypatch.setattr(module, "CarbonHotkey", BoomCarbon)
     monkeypatch.setattr(module, "accessibility_trusted", lambda: False)
@@ -299,3 +300,32 @@ def test_settings_change_rebuilds_the_transcriber_only_when_the_model_changes():
         finally:
             window.close()
             app.processEvents()
+
+
+def test_cli_transcribe_uses_the_configured_backend_and_never_the_gpu(tmp_path, monkeypatch):
+    """A file on the command line is a meeting-like job, not dictation."""
+    from svara import app as app_module
+    from svara import transcriber as transcriber_module
+
+    calls = {}
+
+    class RecordingTranscriber:
+        def __init__(self, **kwargs):
+            calls["init"] = kwargs
+
+        def transcribe(self, path, **kwargs):
+            calls["transcribe"] = {"path": path, **kwargs}
+            return "ok"
+
+    monkeypatch.setattr(transcriber_module, "Transcriber", RecordingTranscriber)
+    monkeypatch.setattr(
+        app_module,
+        "Settings",
+        type("S", (), {"load": staticmethod(lambda _path: Settings(stt_backend="auto"))}),
+    )
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"\0" * 100)
+
+    assert app_module.main(["--transcribe", str(audio)]) == 0
+    assert calls["init"]["backend"] == "auto"
+    assert calls["transcribe"]["allow_gpu"] is False

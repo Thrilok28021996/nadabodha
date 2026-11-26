@@ -28,8 +28,9 @@ import numpy as np
 from .models import DEFAULT_MODEL_REPO
 
 #: MLX (Apple GPU) build of the same large-v3-turbo weights. Same architecture
-#: and licence, but stored as float16 for Metal, which on this hardware is both
-#: faster and more accurate than the int8 CTranslate2 build the CPU path uses.
+#: and licence, stored as float16 for Metal. Faster than the int8 CTranslate2
+#: build on short audio; not more accurate, because mlx_whisper cannot do beam
+#: search, so it decodes greedily where the CPU path uses beam-5.
 DEFAULT_MLX_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
 
 #: Marker file that proves a model snapshot is complete, per backend. CTranslate2

@@ -449,12 +449,18 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------- settings/app
 
     def _apply_settings(self) -> None:
+        previous_key = self._transcriber_key
         self.recorder.set_input_device(self.settings.input_device)
         self.watch.set_folder(self.settings.watch_folder)
         self.dictation.apply(self.settings.dictation_hotkey, self.settings.dictation_enabled)
         self._apply_recording_hotkey()
         self._update_hint()
         self._update_buttons()
+        if previous_key is not None and previous_key != self._transcriber_key and self.settings.preload_model:
+            # The model or engine changed, so the old instance is no longer the
+            # one dictation will use: warm the new one instead of leaving the
+            # first take after a settings change to pay the load.
+            self.preload_speech_model()
 
     def _apply_recording_hotkey(self) -> None:
         if self._recording_hotkey is not None:
@@ -974,7 +980,7 @@ class MainWindow(QMainWindow):
         timer = QTimer(self)
 
         def tick() -> None:
-            done = transcriber.cached_bytes()
+            done = transcriber.cached_bytes(allow_gpu)
             total = expected["bytes"] or 1_620_000_000
             percent = min(99, int(done * 100 / total)) if total else 0
             dialog.setValue(percent)

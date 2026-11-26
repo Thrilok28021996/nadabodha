@@ -53,8 +53,14 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.load(paths.settings_path())
         from .transcriber import Transcriber
 
-        transcriber = Transcriber(model_repo=settings.model_repo, cache_dir=settings.stt_cache_dir)
-        print(transcriber.transcribe(Path(args.transcribe).expanduser()))
+        transcriber = Transcriber(
+            model_repo=settings.model_repo,
+            cache_dir=settings.stt_cache_dir,
+            backend=settings.stt_backend,
+        )
+        # A file on the command line is a recording-like job, not dictation, so
+        # it keeps the CPU path's beam search and VAD.
+        print(transcriber.transcribe(Path(args.transcribe).expanduser(), allow_gpu=False))
         return 0
     if args.accessibility_check:
         from .macos import accessibility_trusted, secure_input_enabled

@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..hotkey import HotkeyError, parse_hotkey
-from ..settings import KNOWN_LANGUAGES, Settings
+from ..settings import Settings, known_languages
 from ..summarizer import SummarizationError, list_models, probe_model
 from .theme import FLAVOR_LABELS
 
@@ -368,12 +368,12 @@ class SettingsDialog(QDialog):
         language = self._language.text().strip()
         if language and language.lower() != "auto":
             base = language.lower().split("-")[0]
-            if base not in KNOWN_LANGUAGES:
+            if base not in known_languages():
                 QMessageBox.warning(
                     self,
                     "Settings",
-                    f"Unknown dictation language {language!r}. Use a code such as en, "
-                    "pt-BR, or auto.",
+                    f"Unknown dictation language {language!r}. Use a code such as en or "
+                    "pt (regional codes are shortened to their base), or auto.",
                 )
                 return
         recording_hotkey = self._recording_hotkey.text().strip()

@@ -7,9 +7,9 @@ PySide6** — there is no Electron, no Node.js and no bundled browser runtime.
 ## Features
 
 - **Record** from the microphone (ffmpeg) or **import** an audio file.
-- **Transcribe** locally with Whisper [large-v3 turbo](https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2)
-  through `faster-whisper`, on the Apple GPU through MLX when it is available
-  and on the CPU otherwise.
+- **Transcribe** locally with Whisper [large-v3 turbo](https://huggingface.co/deepdml/faster-whisper-large-v3-turbo-ct2):
+  `faster-whisper` on the CPU for recordings and imports, and through MLX on the
+  Apple GPU for dictation, where the fixed per-call cost dominates.
 - **Dictate** system-wide with Option+Space: press once to start, again to
   finish. The text is appended to the transcript and pasted at the cursor.
 - **Summarize** through a local OpenAI-compatible server such as LM Studio.
@@ -128,8 +128,10 @@ the old `Systran/faster-whisper-base` default are migrated automatically.
 
 **Settings → Transcription engine** picks the backend:
 
-- **Automatic** (default) — the Apple GPU through MLX when it is available,
-  otherwise the CPU.
+- **Automatic** (default) — the Apple GPU for dictation when its weights are
+  already cached, otherwise the CPU. An existing install that only has the
+  CTranslate2 weights stays on the CPU rather than triggering a surprise second
+  download.
 - **Apple GPU (MLX)** — `mlx-community/whisper-large-v3-turbo`, the same
   large-v3-turbo weights converted for Metal, run in float16.
 - **CPU only** — CTranslate2, int8.

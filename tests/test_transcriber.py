@@ -278,7 +278,7 @@ class FakeMLX:
         return self.payload
 
 
-def test_mlx_result_is_parsed_into_segments(tmp_path, monkeypatch, mocker=None):
+def test_mlx_result_is_parsed_into_segments(tmp_path, monkeypatch):
     import sys
     import types
 

@@ -99,26 +99,27 @@ def _migrate_recording_hotkey(value: str) -> str:
 
 
 def _normalise_language(value: str) -> str:
-    """Dictation language: a code, or ``auto`` to let Whisper detect it.
+    """Dictation language: a bare code Whisper accepts, or ``auto``.
 
-    Anything empty falls back to English because that is what this app is used
-    for, and pinning the language skips a whole encoder pass per dictation.
-    Anything that is not a language Whisper knows is rejected here rather than
-    left to fail mid-dictation as a raw "Transcription failed" banner.
+    Pinning the language skips a whole encoder pass per dictation, so this is a
+    latency setting. Regional codes are reduced to their base (``pt-BR`` ->
+    ``pt``) because Whisper's tokenizers only accept the 2-3 letter codes and
+    raise ``ValueError`` on ``pt-br`` — which would otherwise surface
+    mid-dictation as a raw "Transcription failed" banner. Anything unknown falls
+    back to English rather than being stored.
     """
     candidate = (value or "").strip().lower()
     if not candidate:
         return "en"
     if candidate == "auto":
         return "auto"
-    base = candidate.split("-")[0]
-    if base in KNOWN_LANGUAGES:
-        return candidate
+    base = candidate.split("-")[0].split("_")[0]
+    if base in known_languages():
+        return base
     return "en"
 
 
-#: ISO-639-1 codes Whisper accepts, plus a few multilingual aliases it knows.
-KNOWN_LANGUAGES = frozenset(
+_DEFAULT_LANGUAGES = frozenset(
     """
     af am ar as az ba be bg bn bo br bs ca cs cy da de el en es et eu fa fi fo fr
     gl gu ha haw he hi hr ht hu hy id is it ja jw ka kk km kn ko la lb ln lo lt lv
@@ -126,6 +127,20 @@ KNOWN_LANGUAGES = frozenset(
     so sq sr su sv sw ta te tg th tk tl tr tt uk ur uz vi yi yo yue zh
     """.split()
 )
+
+
+def known_languages() -> frozenset:
+    """The codes the installed Whisper tokenizer actually accepts.
+
+    Read from faster-whisper when it is importable so this cannot drift from the
+    backend, and fall back to the documented set otherwise.
+    """
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+
+        return frozenset(_LANGUAGE_CODES)
+    except Exception:  # noqa: BLE001 - optional import at settings-load time
+        return _DEFAULT_LANGUAGES
 
 
 #: Electron-era camelCase keys that map onto current settings fields.
