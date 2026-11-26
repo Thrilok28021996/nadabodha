@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build a tiny local "Svara Dev.app" that runs the package from this repo with
-# the sovereign interpreter. The bundle binary never changes when Python code
-# changes, so its TCC (Accessibility/Microphone) grant is not invalidated by
-# ordinary edits — unlike rebuilding the PyInstaller bundle every time.
+# the sovereign interpreter. The launcher is compiled from native/launcher.c
+# and does not change when Python code changes, so the bundle's TCC
+# (Accessibility/Microphone) grant survives ordinary edits — unlike rebuilding
+# the PyInstaller bundle every time.
 #
 # Use dist/Svara.app for the self-contained build; use this dev bundle while
 # iterating.
@@ -47,14 +48,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-cat > "$APP/Contents/MacOS/SvaraDev" <<LAUNCH
-#!/bin/sh
-REPO="\${SVARA_REPO:-$REPO}"
-PY="\${SVARA_PYTHON:-$PY}"
-cd "\$REPO" || exit 1
-exec "\$PY" -m svara "\$@"
-LAUNCH
-chmod +x "$APP/Contents/MacOS/SvaraDev"
+# A shell script carries no Mach-O code directory, so once it exec'd unsigned
+# conda python3.13 macOS resolved the running process to that path instead of
+# ai.svara.dev — and the microphone grant never applied: coreaudiod logged
+# "Client is not granted access to the input device" and the recorder wrote
+# pure silence (peak 0, RMS 0.0) with no error raised. Compile a real Mach-O
+# launcher instead; it is signed as part of the bundle and spawns Python as a
+# child, so TCC attributes the mic request to ai.svara.dev and System Settings
+# shows a single Svara entry rather than separate "Svara" and "python" rows.
+if ! command -v clang >/dev/null 2>&1; then
+    echo "error: clang not found; install the Command Line Tools" >&2
+    exit 1
+fi
+clang -O2 -Wall -Wextra \
+    -DSVARA_REPO="\"$REPO\"" \
+    -DSVARA_PYTHON="\"$PY\"" \
+    -o "$APP/Contents/MacOS/SvaraDev" \
+    native/launcher.c
 
 codesign --force --deep --sign "${SVARA_SIGN_IDENTITY:-Svara Dev}" "$APP"
 
