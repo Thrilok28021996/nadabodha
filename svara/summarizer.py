@@ -88,7 +88,7 @@ def list_models(base_url: str, api_key: str = "", timeout: float = 5.0) -> list[
     return [str(item["id"]) for item in data if isinstance(item, dict) and item.get("id")]
 
 
-def probe_model(base_url: str, model: str, api_key: str = "", timeout: float = 25.0) -> float:
+def probe_model(base_url: str, model: str, api_key: str = "", timeout: float = 60.0) -> float:
     """Send a tiny prompt and return the round-trip seconds.
 
     Detects servers that are reachable but whose selected model never produces
