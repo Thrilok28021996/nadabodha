@@ -261,3 +261,79 @@ def test_settings_reject_unknown_backend():
     assert Settings.from_dict({"stt_backend": "metal"}).stt_backend == "auto"
     assert Settings.from_dict({"stt_backend": "cpu"}).stt_backend == "cpu"
     assert Settings().stt_backend == "auto"
+
+
+# -- MLX result parsing ----------------------------------------------------
+
+
+class FakeMLX:
+    """Stand-in for the mlx_whisper module, so the GPU path is testable."""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.seen = None
+
+    def transcribe(self, audio, **kwargs):
+        self.seen = kwargs
+        return self.payload
+
+
+def test_mlx_result_is_parsed_into_segments(tmp_path, monkeypatch, mocker=None):
+    import sys
+    import types
+
+    wav = make_wav(tmp_path / "audio.wav")
+    fake = FakeMLX(
+        {
+            "text": "ignored",
+            "segments": [
+                {"start": 0.0, "end": 1.5, "text": " hello "},
+                {"start": 1.5, "end": 2.0, "text": "   "},
+                {"start": 2.0, "end": 3.25, "text": "world"},
+            ],
+        }
+    )
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+    transcriber = Transcriber(backend="mlx")
+    monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())
+    monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
+
+    result = transcriber.transcribe_result(wav, language="en", without_timestamps=True, allow_gpu=True)
+
+    assert result.text == "hello world"
+    assert [(s.start, s.end) for s in result.segments] == [(0.0, 1.5), (2.0, 3.25)]
+    assert fake.seen["without_timestamps"] is True
+    assert fake.seen["language"] == "en"
+    # The GPU must be handed a local path, never a repo id: a repo id makes
+    # mlx_whisper download into the default HF home instead of stt_cache_dir.
+    assert fake.seen["path_or_hf_repo"] == "/tmp/fake-model"
+
+
+def test_mlx_is_never_used_when_the_call_forbids_gpu(tmp_path, monkeypatch):
+    wav = make_wav(tmp_path / "audio.wav")
+    transcriber = Transcriber(backend="mlx")
+    called = []
+    monkeypatch.setattr(transcriber, "_transcribe_mlx", lambda *a: called.append(True) or [])
+    model = KwargModel()
+    monkeypatch.setattr(transcriber, "_load_model", lambda: model)
+
+    transcriber.transcribe_result(wav, allow_gpu=False)
+    assert called == []
+    # Recordings keep beam search and VAD, which mlx_whisper does not implement.
+    assert model.kwargs["beam_size"] == 5
+    assert model.kwargs["vad_filter"] is True
+
+
+def test_auto_backend_avoids_a_second_download_for_existing_installs(tmp_path, monkeypatch):
+    from svara import transcriber as module
+
+    monkeypatch.setattr(module, "mlx_available", lambda: True)
+    # CT2 weights present, MLX weights absent: this is every existing install.
+    snapshot = tmp_path / "hub" / "models--deepdml--faster-whisper-large-v3-turbo-ct2" / "snapshots" / "x"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.bin").write_bytes(b"\0" * 2_000_000)
+
+    transcriber = Transcriber(cache_dir=str(tmp_path), backend="auto")
+    use_mlx, repo, filename = transcriber.plan()
+    assert use_mlx is False
+    assert filename == "model.bin"

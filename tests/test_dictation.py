@@ -149,7 +149,7 @@ def test_dictation_pins_language_and_drops_timestamps():
 
     settings = Settings(dictation_language="en")
     options = transcribe_options("dictation", settings)
-    assert options == {"without_timestamps": True, "language": "en"}
+    assert options == {"without_timestamps": True, "language": "en", "allow_gpu": True}
 
 
 def test_dictation_language_auto_lets_whisper_detect():
@@ -157,16 +157,28 @@ def test_dictation_language_auto_lets_whisper_detect():
 
     settings = Settings(dictation_language="auto")
     options = transcribe_options("dictation", settings)
-    assert options == {"without_timestamps": True}
+    assert options["without_timestamps"] is True
     assert "language" not in options
 
 
 def test_meetings_keep_timestamps_and_auto_detection():
+    """The production origin is "transcription" for both recording and import."""
     from svara.ui.main_window import transcribe_options
 
     settings = Settings(dictation_language="en")
-    for origin in ("record", "import", "watch", "library"):
-        assert transcribe_options(origin, settings) == {}
+    options = transcribe_options("transcription", settings)
+    # No language pin (may not be English) and no timestamp stripping (SRT
+    # export needs it) -- and above all, no GPU, because mlx_whisper has no beam
+    # search or VAD and would change how meetings are decoded.
+    assert "language" not in options
+    assert "without_timestamps" not in options
+    assert options["allow_gpu"] is False
+
+
+def test_unknown_origin_keeps_the_cpu_decoding_path():
+    from svara.ui.main_window import transcribe_options
+
+    assert transcribe_options("anything-else", Settings())["allow_gpu"] is False
 
 
 def test_settings_normalise_dictation_language():
@@ -176,9 +188,114 @@ def test_settings_normalise_dictation_language():
     assert Settings().dictation_language == "en"
 
 
+def test_unknown_language_is_rejected_at_save_time_not_mid_dictation():
+    # Handing junk to Whisper raises during the user's next take; catching it
+    # when the settings load keeps the failure at a fixable moment.
+    assert Settings.from_dict({"dictation_language": "banana"}).dictation_language == "en"
+    assert Settings.from_dict({"dictation_language": "123"}).dictation_language == "en"
+    assert Settings.from_dict({"dictation_language": "es"}).dictation_language == "es"
+
+
 def test_preload_defaults_on_and_round_trips(tmp_path):
     path = tmp_path / "settings.json"
     settings = Settings(preload_model=False)
     settings.save(path)
     assert Settings.load(path).preload_model is False
     assert Settings().preload_model is True
+
+
+# -- hotkey listener fallback ---------------------------------------------
+
+
+def test_carbon_failure_without_accessibility_reports_instead_of_failing_silently(monkeypatch):
+    from svara import dictation as module
+
+    class BoomCarbon:
+        def __init__(self, *args, **kwargs):
+            raise module.CarbonHotkey.__mro__[0].__name__ and RuntimeError("RegisterEventHotKey failed")
+
+    monkeypatch.setattr(module, "CarbonHotkey", BoomCarbon)
+    monkeypatch.setattr(module, "accessibility_trusted", lambda: False)
+
+    controller = make_controller()
+    events = []
+    controller.listening_changed.connect(lambda ok, message: events.append((ok, message)))
+    controller.start_listening()
+
+    assert controller.listening is False
+    assert events and events[0][0] is False
+    assert "Accessibility" in events[0][1]
+
+
+def test_carbon_failure_falls_back_to_pynput_when_trusted(monkeypatch):
+    import sys
+    import types
+
+    from svara import dictation as module
+
+    class BoomCarbon:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("carbon unavailable")
+
+    started = []
+
+    class FakeGlobalHotKeys:
+        def __init__(self, mapping):
+            started.append(mapping)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    fake = types.ModuleType("pynput")
+    keyboard = types.ModuleType("pynput.keyboard")
+    keyboard.GlobalHotKeys = FakeGlobalHotKeys
+    fake.keyboard = keyboard
+    monkeypatch.setitem(sys.modules, "pynput", fake)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", keyboard)
+    monkeypatch.setattr(module, "CarbonHotkey", BoomCarbon)
+    monkeypatch.setattr(module, "accessibility_trusted", lambda: True)
+
+    controller = make_controller()
+    events = []
+    controller.listening_changed.connect(lambda ok, message: events.append((ok, message)))
+    controller.start_listening()
+
+    assert started == [{"<alt>+<space>": controller._request_toggle}]
+    assert controller.listening is True
+    assert events == [(True, "")]
+
+
+# -- model reuse -----------------------------------------------------------
+
+
+def test_settings_change_rebuilds_the_transcriber_only_when_the_model_changes():
+    from PySide6.QtWidgets import QApplication
+
+    from svara.logging_setup import init_logging
+    from svara.ui.main_window import MainWindow
+
+    import tempfile
+    from pathlib import Path
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as temporary:
+        logger = init_logging(Path(temporary) / "logs" / "svara.log")
+        settings = Settings(dictation_enabled=False)
+        window = MainWindow(settings=settings, settings_path=Path(temporary) / "settings.json", logger=logger)
+        try:
+            first = window._transcriber()
+            # A theme change must not throw away a loaded 1.6 GB model.
+            window.settings.theme = "latte"
+            window._apply_settings()
+            assert window._transcriber() is first
+
+            # A model change must.
+            window.settings.model_repo = "Systran/faster-whisper-small"
+            window._apply_settings()
+            assert window._transcriber() is not first
+        finally:
+            window.close()
+            app.processEvents()

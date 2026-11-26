@@ -77,6 +77,8 @@ def main() -> int:
     parser.add_argument("--cache-dir", default="", help="override the model cache directory")
     parser.add_argument("--text", action="store_true", help="print the transcript so runs can be diffed")
     args = parser.parse_args()
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
 
     from svara.transcriber import DEFAULT_MODEL_REPO
     from svara.settings import Settings

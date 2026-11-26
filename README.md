@@ -134,11 +134,20 @@ the old `Systran/faster-whisper-base` default are migrated automatically.
   large-v3-turbo weights converted for Metal, run in float16.
 - **CPU only** — CTranslate2, int8.
 
-Both backends run the same model; the GPU one is faster and, because it keeps
-float16 where the CPU path quantizes to int8, slightly more accurate. Measured
-on this machine (M4, macOS 27) for a 6.4 s dictation clip: **1.1 s on the GPU
-vs 5.9 s on the CPU**. On a 74.5 s recording: 3.5 s vs 12.1 s. `scripts/bench_dictation.py`
-reproduces those numbers.
+Both backends run the same model. The GPU is used for **dictation**, where the
+fixed per-call cost dominates: measured on this machine (M4, macOS 27), a 6.4 s
+clip takes **1.1 s on the GPU vs 5.9 s on the CPU**. `scripts/bench_dictation.py`
+reproduces that.
+
+Recordings, imports and the watch folder deliberately stay on the CPU path.
+`mlx_whisper` implements neither beam search nor VAD, so sending meetings through
+it would change how they are decoded — a different algorithm, not just a
+different device. Meetings are also unaffected by the caching behaviour above.
+
+Note that the GPU decodes greedily where the CPU path uses beam-5, so dictated
+text can differ slightly (measured: identical on 1 of 5 real clips, differences
+of a word or a comma elsewhere). Set **Transcription engine → CPU only** if you
+want exactly the previous output.
 
 ### Dictation
 

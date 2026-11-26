@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..hotkey import HotkeyError, parse_hotkey
-from ..settings import Settings
+from ..settings import KNOWN_LANGUAGES, Settings
 from ..summarizer import SummarizationError, list_models, probe_model
 from .theme import FLAVOR_LABELS
 
@@ -366,13 +366,16 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, "Settings", "Enter a hotkey, for example <alt>+<space>.")
             return
         language = self._language.text().strip()
-        if language and not (language.lower() == "auto" or language.replace("-", "").isalnum()):
-            QMessageBox.warning(
-                self,
-                "Settings",
-                "Dictation language must be a code such as en, pt-BR, or auto.",
-            )
-            return
+        if language and language.lower() != "auto":
+            base = language.lower().split("-")[0]
+            if base not in KNOWN_LANGUAGES:
+                QMessageBox.warning(
+                    self,
+                    "Settings",
+                    f"Unknown dictation language {language!r}. Use a code such as en, "
+                    "pt-BR, or auto.",
+                )
+                return
         recording_hotkey = self._recording_hotkey.text().strip()
         if recording_hotkey and recording_hotkey.lower() == hotkey.lower():
             QMessageBox.warning(self, "Settings", "The recording and dictation hotkeys must differ.")

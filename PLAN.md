@@ -141,7 +141,8 @@ machine, same audio, same run.
 | Dictation, 5s real clip (warm) | 12.75s | 5.38s | Phase 1 |
 | Dictation, 6.4s clean clip, CPU | 5.90s | 5.90s | unchanged |
 | Dictation, 6.4s clean clip, GPU | n/a | **1.12s** | Phase 2, 5.0x vs CPU |
-| Meeting, 74.5s, GPU | 12.06s | **3.47s** | Phase 2, 3.5x vs CPU |
+| Dictation, 6.4s clean clip | 5.63s | **1.31s** | Phase 2, end to end |
+| Meeting, 74.5s | 12.06s | 12.06s | unchanged by design (CPU, beam-5 + VAD) |
 
 The clean-speech clip is the honest dictation number: the 5s real clip is faint
 and repeatedly fails Whisper's logprob threshold, which triggers temperature
@@ -150,12 +151,29 @@ fallback re-decodes in both backends and inflates every figure.
 Gates: `pytest tests -q` 139 passed (119 before), `--self-test` 6/6, SRT export
 verified to still carry real timecodes through the MLX path.
 
-### Phase 2 outcome: kept
+### Phase 2 outcome: kept, for dictation only
 
-MLX beat the CPU path on both dictation and meeting lengths and produced the
-more complete transcript on the meeting file, so the default engine is now
-`auto` -> GPU when available. The CPU path is untouched and remains the
-fallback; `stt_backend=cpu` forces it.
+MLX is 5x faster on dictation-length audio, so it is now the dictation backend.
+It is deliberately NOT used for recordings or imports: `mlx_whisper` implements
+neither beam search (`decoding.py` raises `NotImplementedError` for
+`beam_size`) nor VAD, so routing meetings through it would replace the verified
+beam-5 + VAD decode with a greedy one. That is an accuracy change to a path
+declared out of scope, so the meeting path stays on CTranslate2 exactly as it
+was. `transcribe_options()` returns `allow_gpu: False` for every non-dictation
+origin, and a test pins it.
+
+Accuracy check on real dictation clips (CPU beam-5 int8 vs GPU greedy fp16):
+identical on 1 of 5 clips, with small differences elsewhere -- one clip where the
+CPU heard "Feels so slow" and the GPU heard "feels a slope". The GPU is faster,
+not more accurate; the README says so, and `stt_backend=cpu` restores the
+previous output exactly. This is the one place where the plan's "no accuracy
+trade" rule and the user's explicit choice of MLX pull against each other, so it
+is called out rather than buried.
+
+MLX also bypassed the configured model cache: `mlx_whisper` resolves a repo id
+with a bare `snapshot_download()`, which would have pulled a second 1.5 GB copy
+into the default HF home. The backend now resolves the snapshot inside
+`stt_cache_dir` itself and passes a local path.
 
 ### Still outstanding
 

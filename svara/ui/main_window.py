@@ -61,8 +61,11 @@ def transcribe_options(origin: str, settings: Settings) -> dict:
     keep auto-detection because they may not be English.
     """
     if origin != "dictation":
-        return {}
-    options: dict = {"without_timestamps": True}
+        # Recordings and imports keep the CPU path. mlx_whisper implements
+        # neither beam search nor VAD, so routing them through the GPU would
+        # quietly change how meetings are decoded.
+        return {"allow_gpu": False}
+    options: dict = {"without_timestamps": True, "allow_gpu": True}
     language = (settings.dictation_language or "").strip()
     if language and language.lower() != "auto":
         options["language"] = language
@@ -97,13 +100,24 @@ class _PreloadWorker(QThread):
 
     done = Signal(str)
 
-    def __init__(self, transcriber: Transcriber, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        transcriber: Transcriber,
+        allow_gpu: bool | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._transcriber = transcriber
+        self._allow_gpu = allow_gpu
 
     def run(self) -> None:  # noqa: D401 - Qt override
         try:
-            self._transcriber.preload()
+            # Only warm a model that is already on disk. Probing the cache can
+            # import mlx, which is too slow for the Qt main thread.
+            if not self._transcriber.is_cached(self._allow_gpu):
+                self.done.emit("")
+                return
+            self._transcriber.preload(self._allow_gpu)
         except Exception as error:  # noqa: BLE001 - preloading is an optimisation
             self.done.emit(str(error))
             return
@@ -132,16 +146,22 @@ class _ModelDownloadWorker(QThread):
     ok = Signal()
     failed = Signal(str)
 
-    def __init__(self, transcriber: Transcriber, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        transcriber: Transcriber,
+        allow_gpu: bool | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._transcriber = transcriber
+        self._allow_gpu = allow_gpu
 
     def run(self) -> None:  # noqa: D401 - Qt override
         try:
-            size = self._transcriber.expected_bytes()
+            size = self._transcriber.expected_bytes(self._allow_gpu)
             if size:
                 self.total.emit(size)
-            self._transcriber.download()
+            self._transcriber.download(self._allow_gpu)
             self.ok.emit()
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
             self.failed.emit(str(error))
@@ -883,10 +903,7 @@ class MainWindow(QMainWindow):
         """
         if not self.settings.preload_model or self._preload_worker is not None:
             return
-        transcriber = self._transcriber()
-        if not transcriber.is_cached():
-            return
-        worker = _PreloadWorker(transcriber, self)
+        worker = _PreloadWorker(self._transcriber(), True, self)
         worker.done.connect(self._on_preload_done)
         worker.finished.connect(worker.deleteLater)
         self._preload_worker = worker
@@ -902,15 +919,20 @@ class MainWindow(QMainWindow):
             return
         self.log.info("transcription", "Speech model preloaded")
 
-    def _ensure_model_ready(self) -> bool:
+    def _ensure_model_ready(self, origin: str) -> bool:
         transcriber = self._transcriber()
-        if transcriber.is_cached():
+        # Dictation may use the GPU model while recordings use the CPU one, so
+        # the preflight has to ask about the model this operation will load.
+        allow_gpu = transcribe_options(origin, self.settings).get("allow_gpu")
+        use_mlx, repo, _filename = transcriber.plan(allow_gpu)
+        if transcriber.is_cached(allow_gpu):
             return True
+        engine = "Apple GPU" if use_mlx else "CPU"
         answer = QMessageBox.question(
             self,
             "Speech model",
             (
-                f"The speech model ({self.settings.model_repo}) is not downloaded yet.\n\n"
+                f"The speech model for {engine} transcription ({repo}) is not downloaded yet.\n\n"
                 "Download it now? It is about 1.6 GB and only needed once."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -919,9 +941,9 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             self._set_idle_status("Transcription cancelled: the speech model is not downloaded.")
             return False
-        return self._download_model(transcriber)
+        return self._download_model(transcriber, allow_gpu)
 
-    def _download_model(self, transcriber: Transcriber) -> bool:
+    def _download_model(self, transcriber: Transcriber, allow_gpu: bool | None = None) -> bool:
         dialog = QProgressDialog("Preparing download…", None, 0, 100, self)
         dialog.setWindowTitle("Downloading speech model")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -932,7 +954,7 @@ class MainWindow(QMainWindow):
 
         expected = {"bytes": 0}
         success = {"value": False}
-        worker = _ModelDownloadWorker(transcriber, self)
+        worker = _ModelDownloadWorker(transcriber, allow_gpu, self)
         self._model_worker = worker
         worker.total.connect(lambda value: expected.__setitem__("bytes", value))
         loop = QEventLoop(self)
@@ -970,12 +992,12 @@ class MainWindow(QMainWindow):
         dialog.close()
         self._model_worker = None
         if success["value"]:
-            self.log.info("model", "Model downloaded", {"repo": self.settings.model_repo})
+            self.log.info("model", "Model downloaded", {"repo": transcriber.plan(allow_gpu)[1]})
             self._set_idle_status("Speech model downloaded.")
         return success["value"]
 
     def _transcribe(self, audio: Path, origin: str) -> None:
-        if not self._ensure_model_ready():
+        if not self._ensure_model_ready(origin):
             return
         self._set_busy(True)
         self._set_idle_status(f"Transcribing {Path(audio).name}…", kind="busy")
@@ -1356,7 +1378,7 @@ class MainWindow(QMainWindow):
             if self._toast is not None:
                 self._toast.close()
                 self._toast = None
-            for worker in (self._transcribe_worker, self._summary_worker):
+            for worker in (self._transcribe_worker, self._summary_worker, self._preload_worker):
                 if worker is None:
                     continue
                 if worker.isRunning():

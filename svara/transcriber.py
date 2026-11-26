@@ -222,13 +222,16 @@ def cache_bytes(repo: str, cache_dir: str) -> int:
 
 
 class Transcriber:
-    """Transcribe audio, on the GPU (MLX) when possible and the CPU otherwise.
+    """Transcribe audio, on the GPU (MLX) for dictation and the CPU otherwise.
 
-    Both backends run the same large-v3-turbo weights. The GPU path is selected
-    automatically on Apple Silicon because it measured ~5x faster on a clean
-    dictation clip (1.06s vs 5.63s) and runs float16 instead of the CPU path's
-    int8, so it is more accurate as well. The CPU path stays available and is
-    the fallback whenever MLX is missing or Metal is unavailable.
+    Both backends run the same large-v3-turbo weights. The GPU is used for short
+    dictation takes, where the fixed per-call cost dominates: 1.1s against
+    5.9s on the CPU for a 6.4 s clip.
+
+    Recordings and imports deliberately stay on the CPU path. ``mlx_whisper``
+    implements neither beam search nor VAD, so routing them through the GPU
+    would silently change how meetings are decoded -- a different algorithm, not
+    just a different device, and not what this app has been verified against.
     """
 
     def __init__(
@@ -247,12 +250,13 @@ class Transcriber:
         self._model = None
         self._lock = threading.Lock()
         self._use_mlx: bool | None = None
+        self._mlx_path: str | None = None
 
     # -- backend -----------------------------------------------------------
 
     @property
     def use_mlx(self) -> bool:
-        """Whether transcriptions go through the Apple GPU."""
+        """Whether this machine can transcribe on the Apple GPU."""
         if self._use_mlx is None:
             if self.backend == "cpu":
                 self._use_mlx = False
@@ -262,49 +266,82 @@ class Transcriber:
                 # rather than silently falling back to a slower backend.
                 self._use_mlx = True
             else:
-                self._use_mlx = mlx_available()
+                self._use_mlx = self._auto_prefers_mlx()
         return self._use_mlx
+
+    def _auto_prefers_mlx(self) -> bool:
+        """Prefer the GPU, but never ask for a second download to get there.
+
+        An existing install already has the CTranslate2 weights cached and no
+        MLX weights. Silently switching it to the GPU would mean a surprise
+        ~1.5 GB download on the next take, so in that case the cached CPU model
+        wins. When neither is cached the GPU is the better thing to fetch.
+        """
+        if not mlx_available():
+            return False
+        if is_model_cached(self.mlx_model_repo, self.cache_dir, MLX_MODEL_FILE):
+            return True
+        if is_model_cached(self.model_repo, self.cache_dir, CT2_MODEL_FILE):
+            return False
+        return True
+
+    def plan(self, allow_gpu: bool | None = None) -> tuple[bool, str, str]:
+        """``(use_mlx, repo, marker_file)`` for one transcription call.
+
+        ``allow_gpu=False`` forces the CPU path for that call. That is what keeps
+        recordings and imports on exactly the decoding they have always used:
+        mlx_whisper implements neither beam search nor VAD, so sending meetings
+        through it would silently change their accuracy.
+        """
+        use_mlx = self.use_mlx and allow_gpu is not False
+        if use_mlx:
+            return True, self.mlx_model_repo, MLX_MODEL_FILE
+        return False, self.model_repo, CT2_MODEL_FILE
 
     @property
     def active_repo(self) -> str:
-        return self.mlx_model_repo if self.use_mlx else self.model_repo
+        """Repo for the default call path, used for reporting and tests."""
+        return self.plan()[1]
 
     @property
     def model_file(self) -> str:
-        return MLX_MODEL_FILE if self.use_mlx else CT2_MODEL_FILE
+        return self.plan()[2]
 
     # -- model -------------------------------------------------------------
 
-    def is_cached(self) -> bool:
-        return is_model_cached(self.active_repo, self.cache_dir, self.model_file)
+    def is_cached(self, allow_gpu: bool | None = None) -> bool:
+        _mlx, repo, filename = self.plan(allow_gpu)
+        return is_model_cached(repo, self.cache_dir, filename)
 
-    def cached_bytes(self) -> int:
-        return cache_bytes(self.active_repo, self.cache_dir)
+    def cached_bytes(self, allow_gpu: bool | None = None) -> int:
+        return cache_bytes(self.plan(allow_gpu)[1], self.cache_dir)
 
-    def expected_bytes(self) -> int | None:
+    def expected_bytes(self, allow_gpu: bool | None = None) -> int | None:
         """Total download size from the Hub, or None when offline."""
+        repo = self.plan(allow_gpu)[1]
         try:
             from huggingface_hub import HfApi
 
-            info = HfApi().model_info(self.active_repo, files_metadata=True)
+            info = HfApi().model_info(repo, files_metadata=True)
             sizes = [sibling.size for sibling in info.siblings or [] if sibling.size]
             return int(sum(sizes)) or None
         except Exception:  # noqa: BLE001 - offline is fine, caller falls back
             return None
 
-    def download(self) -> None:
+    def download(self, allow_gpu: bool | None = None) -> None:
         """Fetch the model into the configured cache (blocking)."""
+        repo = self.plan(allow_gpu)[1]
         try:
             from huggingface_hub import snapshot_download
         except ImportError as error:
             raise TranscriptionError("Downloading the model needs huggingface_hub") from error
         try:
             snapshot_download(
-                repo_id=self.active_repo,
+                repo_id=repo,
                 cache_dir=hub_cache_dir(self.cache_dir),
             )
         except Exception as error:  # noqa: BLE001 - surfaced to the UI
-            raise TranscriptionError(f"Could not download {self.active_repo}: {error}") from error
+            raise TranscriptionError(f"Could not download {repo}: {error}") from error
 
     def _load_model(self):
         with self._lock:
@@ -331,19 +368,50 @@ class Transcriber:
 
     # -- transcription -----------------------------------------------------
 
-    def preload(self) -> None:
+    def preload(self, allow_gpu: bool | None = None) -> None:
         """Load the model now so the first transcription does not pay for it.
 
         Dictation is short and the model load is several seconds, so loading it
         up front in a worker thread removes that wait from the first take.
         """
-        if self.use_mlx:
+        if self.plan(allow_gpu)[0]:
             self._load_mlx_model()
             return
         self._load_model()
 
+    def _mlx_model_path(self) -> str:
+        """Resolve the MLX snapshot inside *our* cache and hand mlx a local path.
+
+        ``mlx_whisper`` resolves a repo id with a bare ``snapshot_download()``,
+        which ignores the app's configured model cache and would silently fetch a
+        second 1.5 GB copy into the default HF home. Downloading through our own
+        cache directory and passing the resulting path keeps one copy, in the
+        directory the Settings dialog shows.
+        """
+        if self._mlx_path is not None:
+            return self._mlx_path
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as error:
+            raise TranscriptionError("The GPU backend needs huggingface_hub") from error
+        try:
+            self._mlx_path = str(
+                snapshot_download(
+                    repo_id=self.mlx_model_repo,
+                    cache_dir=hub_cache_dir(self.cache_dir),
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced to the UI
+            raise TranscriptionError(f"Could not download {self.mlx_model_repo}: {error}") from error
+        return self._mlx_path
+
     def _load_mlx_model(self):
-        """Populate mlx_whisper's own model cache so a warm call skips the load."""
+        """Populate mlx_whisper's own model cache so a warm call skips the load.
+
+        Called under ``self._lock``: ``ModelHolder.get_model`` has no locking of
+        its own, so a preload racing a dictation would load the 1.6 GB model
+        twice and write the class attribute racily.
+        """
         try:
             import mlx.core as mx
             from mlx_whisper.transcribe import ModelHolder
@@ -352,12 +420,14 @@ class Transcriber:
                 "The GPU backend needs mlx-whisper. Run: pip install mlx-whisper "
                 "(or set the speech backend to CPU in Settings)."
             ) from error
-        try:
-            return ModelHolder.get_model(self.mlx_model_repo, mx.float16)
-        except Exception as error:  # noqa: BLE001 - surfaced to the UI
-            raise TranscriptionError(
-                f"Could not load GPU speech model {self.mlx_model_repo!r}: {error}"
-            ) from error
+        with self._lock:
+            path = self._mlx_model_path()
+            try:
+                return ModelHolder.get_model(path, mx.float16)
+            except Exception as error:  # noqa: BLE001 - surfaced to the UI
+                raise TranscriptionError(
+                    f"Could not load GPU speech model {self.mlx_model_repo!r}: {error}"
+                ) from error
 
     def _transcribe_mlx(
         self,
@@ -373,16 +443,20 @@ class Transcriber:
                 "(or set the speech backend to CPU in Settings)."
             ) from error
         self._load_mlx_model()
-        try:
-            result = mlx_whisper.transcribe(
-                audio,
-                path_or_hf_repo=self.mlx_model_repo,
-                language=language or None,
-                without_timestamps=without_timestamps,
-                verbose=None,
-            )
-        except Exception as error:  # noqa: BLE001 - surfaced to the UI verbatim
-            raise TranscriptionError(f"Transcription failed: {error}") from error
+        # One MLX call at a time: mlx_whisper's model cache is process-global and
+        # unlocked, so a concurrent load/transcribe would double-load the model.
+        with self._lock:
+            path = self._mlx_model_path()
+            try:
+                result = mlx_whisper.transcribe(
+                    audio,
+                    path_or_hf_repo=path,
+                    language=language or None,
+                    without_timestamps=without_timestamps,
+                    verbose=None,
+                )
+            except Exception as error:  # noqa: BLE001 - surfaced to the UI verbatim
+                raise TranscriptionError(f"Transcription failed: {error}") from error
         collected: list[Segment] = []
         for segment in result.get("segments") or []:
             text = str(segment.get("text") or "").strip()
@@ -402,6 +476,7 @@ class Transcriber:
         *,
         language: str | None = None,
         without_timestamps: bool = False,
+        allow_gpu: bool | None = None,
     ) -> TranscriptionResult:
         """Transcribe ``path``.
 
@@ -412,6 +487,10 @@ class Transcriber:
         ``without_timestamps`` stops the decoder emitting timestamp tokens. Turn
         it on only where timings are unused (dictation): SRT/VTT export needs
         them.
+
+        ``allow_gpu`` gates the GPU backend for this call alone. Pass ``False``
+        for recordings and imports so they keep the CPU path's beam search and
+        VAD, neither of which mlx_whisper implements.
         """
         path = Path(path)
         if not path.is_file():
@@ -428,7 +507,7 @@ class Transcriber:
                     normalized = normalize_audio(path, self.ffmpeg_path)
                     temporary = normalized if normalized != path else None
                     audio = load_wav_float32(normalized)
-            if self.use_mlx:
+            if self.plan(allow_gpu)[0]:
                 collected = self._transcribe_mlx(audio, language, without_timestamps)
                 return TranscriptionResult(
                     text=" ".join(segment.text for segment in collected).strip(),
