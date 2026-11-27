@@ -1,0 +1,11 @@
+# Svara — sovereign desktop app dependencies.
+PySide6>=6.8
+faster-whisper>=1.0.0
+numpy>=1.24
+sounddevice>=0.4.6
+pynput>=1.7.6
+
+# Apple GPU transcription (Metal). Optional: Svara falls back to the CPU
+# CTranslate2 path when this is absent or Metal is unavailable. Apple Silicon
+# only, which is why the marker is here rather than in a separate extra.
+mlx-whisper>=0.4.3; sys_platform == "darwin" and platform_machine == "arm64"

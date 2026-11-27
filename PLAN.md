@@ -1,0 +1,228 @@
+# Dictation latency + fullscreen banner
+
+Status: approved by user. Scope is dictation latency and the fullscreen banner.
+Transcription/meeting speed is explicitly out of scope.
+
+## Why
+
+Dictation is the product. Measured on this machine (M4, 10 cores, macOS 27),
+a 5-second utterance currently takes **~12 seconds** to land at the cursor.
+The user's requirement: as fast as possible, **without losing accuracy**.
+
+Measured breakdown for a 5s utterance with the current code:
+
+| Cost | Measured | Source |
+| --- | --- | --- |
+| Language auto-detection (extra encoder pass) | ~4.2s | `transcriber.py:295` omits `language` |
+| `without_timestamps` not set | ~2.0s | same call site |
+| Cold model load, first dictation after launch | 1.8-3.4s | `_load_model()` is lazy |
+| Model discarded on every Settings save | 1.8s | `main_window.py:387` |
+| `beam_size=5` | ~0s | matmul-bound, not beam-bound |
+
+Facts established while measuring, to prevent re-litigating them:
+
+- `compute_type="int8"` is the only viable CPU option (float32 measured 60s,
+  int8_float32 26s, int8 ~6s). CTranslate2 has no Metal on Apple Silicon.
+- A smaller model would be ~15x faster (base: 0.41s vs turbo 6.12s) but the
+  user rejected it: accuracy is non-negotiable.
+- `condition_on_previous_text=False` loses content (48 chars -> 16). Rejected.
+
+## Decisions taken by the user
+
+1. English only. `language="en"` may be passed for dictation.
+2. **Turbo everywhere.** No smaller model, for dictation or meetings.
+3. Accuracy may not be traded for speed.
+4. Banner must appear over a fullscreen app, both while transcribing and for
+   the result.
+5. Commit the pending `summarizer.py` and `build-dev-app.sh` + `native/launcher.c`.
+   Delete the stale `assets/bin/svara-dev-launcher`.
+6. Create `tests/test_dictation.py` (none exists today).
+7. MLX/GPU path is in scope and to be measured, not skipped.
+
+## The model in use (recorded for reference)
+
+`deepdml/faster-whisper-large-v3-turbo-ct2`, 1.62 GB, ~809M params (matches
+large-v3-turbo's 809M). Provenance is two hops from OpenAI:
+`openai/whisper-large-v3-turbo` -> `deepdml/whisper-large-v3-turbo` (210
+downloads) -> CT2 conversion. No official Systran turbo CT2 build exists.
+MIT licence. Loaded as int8, so the app never runs the fp16 weights.
+
+## Phase 1 - dictation latency (no new dependencies)
+
+Expected: ~12s -> ~3.9s for a 5s utterance.
+
+1. `transcriber.transcribe_result(path, *, language="", without_timestamps=False)`
+   passes both through to `model.transcribe`.
+2. Dictation calls with `language="en"` and `without_timestamps=True`.
+   Meetings/imports/watch-folder keep timestamps (SRT/VTT) and keep
+   auto-detect.
+3. New setting `dictation_language`, default `en`, value `auto` allowed.
+4. Preload the model in a background thread after startup so the first
+   dictation does not pay the load.
+5. `_apply_settings()` must keep the loaded model unless `model_repo` or
+   `stt_cache_dir` actually changed.
+
+## Phase 2 - MLX/GPU (measured, gated)
+
+Same turbo weights at fp16 on Metal: more accurate than today's int8 *and*
+faster. Acceptance is a benchmark, not a claim.
+
+1. Add `mlx-whisper` to the sovereign env and the MLX turbo weights to
+   `HF_HOME`, only with explicit go-ahead for the ~1.5 GB download.
+2. `Transcriber` gets a backend selector: MLX when importable and available,
+   else faster-whisper CPU. CPU stays the fallback, never removed.
+3. Gate: MLX must beat CPU faster-whisper on the same real recording. If it
+   does not, it is reverted and Phase 1 stands alone.
+4. Quality check: transcribe the existing recordings on both backends and
+   compare text before switching the default.
+
+## Phase 3 - fullscreen banner
+
+`StatusBanner.show_message()` calls `show()` first, then
+`pin_window_to_every_space()`, then `raise_()`. Once macOS has ordered the
+window into Svara's own Space, setting the collection behaviour afterwards
+does not move it, and `raise_()` is not `orderFrontRegardless()`. The banner
+therefore appears on normal desktops but not over a fullscreen app.
+
+1. Pin collection behaviour and window level **before** `show()`.
+2. Call `orderFrontRegardless()` after showing; re-assert level per show.
+3. Apply the same treatment to `PasteToast`.
+4. Human verification: dictate while a real app is fullscreen, confirm the
+   banner shows for both "Transcribing..." and the result.
+
+## Phase 4 - tests and housekeeping
+
+1. `tests/test_dictation.py`: controller state machine (start/stop/cancel),
+   guard blocks start, never hijack an in-flight recording, Carbon->pynput
+   fallback reporting, and the new language/timestamp plumbing reaching
+   `model.transcribe`.
+2. Commit `svara/summarizer.py` (probe timeout 25s -> 60s; the summary model
+   reasons for 25-65s, so a 25s probe reports a healthy server as broken).
+3. Commit `scripts/build-dev-app.sh` + `native/launcher.c` (Mach-O launcher is
+   what makes the mic TCC grant attribute to the app).
+4. Delete `assets/bin/svara-dev-launcher` (stale; the build compiles the
+   launcher now).
+
+## Out of scope
+
+Meeting/file transcription speed, summary speed, smaller models, the stale
+`svara-v3-end-to-end.md`, live streaming, CI, linter config, LICENSE.
+
+## Acceptance criteria
+
+- Dictation of a 5s utterance: before/after timing captured on real audio.
+- Transcription output for dictation is byte-identical to today's for the
+  same clip (timestamp/language flags must not change the text).
+- Meeting transcription still produces segments and SRT/VTT export still works.
+- Banner visible over a fullscreen app (human-verified).
+- `python3 -m pytest tests -q` green, including the new `test_dictation.py`.
+- `python3 -m svara --self-test` green.
+
+## Risks
+
+- `language="en"` on a non-English speaker degrades output; mitigated by the
+  `dictation_language` setting with `auto` available.
+- `without_timestamps=True` must never reach the meeting path or SRT/VTT
+  export loses timecodes; proved by a test asserting the flag is not set for
+  non-dictation origins.
+- MLX may not beat CPU on this machine; the phase is gated and revertible.
+- Preloading raises idle memory by ~1.6 GB on a machine already at 7.27 GB
+  swap. Preload must be optional (`preload_model` setting) and off by default
+  if it causes pressure.
+
+## Results (measured)
+
+Baseline captured before any change with `scripts/bench_dictation.py`; same
+machine, same audio, same run. The table was written at `3d4319d` and last
+edited at `a314c1a`, both before the second-review fixes landed in `72d31fd`.
+The recording used was never written down -- the bench picks the newest `.wav`
+by mtime -- so the rows below are a point-in-time record, not numbers
+reproducible from today's tree (see the re-run note under the gates).
+
+| Case | Before | After | |
+| --- | --- | --- | --- |
+| Dictation, 5s real clip (cold) | 14.49s | 5.33s | Phases 1 |
+| Dictation, 5s real clip (warm) | 12.75s | 5.38s | Phase 1 |
+| Dictation, 6.4s clean clip, CPU | 5.90s | 5.90s | unchanged |
+| Dictation, 6.4s clean clip, GPU | n/a | **1.12s** | Phase 2, 5.0x vs CPU |
+| Dictation, 6.4s clean clip | 5.63s | **1.31s** | Phase 2, end to end |
+| Meeting, 74.5s | 12.06s | 12.06s | unchanged by design (CPU, beam-5 + VAD) |
+
+The clean-speech clip is the honest dictation number: the 5s real clip is faint
+and repeatedly fails Whisper's logprob threshold, which triggers temperature
+fallback re-decodes in both backends and inflates every figure.
+
+Gates: `pytest tests -q` 148 passed (119 before), `--self-test` 6/6, SRT export
+verified to still carry real timecodes through the MLX path. Re-verified at
+`72d31fd` on 2026-11-26 with the sovereign interpreter
+(`/Volumes/personal/conda_envs/sovereign/bin/python3`, `PYTHONPATH` unset):
+148 passed, self-test 6/6. The 119 baseline was re-checked the same day on
+`main` (79b1137) and holds.
+
+### Re-run at 72d31fd (2026-11-26): the 5s-clip rows do not reproduce
+
+All three bench commands re-run at `72d31fd` on the newest recording,
+`recording-2026-11-26T15-53-13-555026.wav` (peak 2149/32767 -- the faint clip
+the caveat above warns about); transcripts checked with `--text`:
+
+| Command | Cold | Warm | Transcript |
+| --- | --- | --- | --- |
+| CPU, auto language, timestamps on | 8.80s | 10.97s median | `''` |
+| CPU, `language=en`, no timestamps | 0.03s | 0.01s median | `''` |
+| MLX, auto language, timestamps on | 7.59s | 7.28s median | `'Hello?'` |
+
+The 5.33s/5.38s figures for the 5s real clip did not reproduce, and the fresh
+CPU figures are not latency measurements at all: the CPU path hardcodes
+`vad_filter=True` (present since 79b1137, unchanged by both fix commits) and VAD
+rejects this clip as non-speech before any decode happens. Isolation probe
+against the shipped code, same model and knobs: `language=en` with VAD on ->
+0.03s, `text ''`; VAD off -> 12.04s, `text 'For more information, visit
+www.fema.org'`. The MLX path passes no VAD, so its row is the only run above
+that actually decoded.
+
+Two reasons the published rows cannot be regenerated from this tree: the clip
+filename was never recorded while the bench auto-picks the newest `.wav` by
+mtime, and the faint-clip CPU figures depend on a VAD rejection this plan never
+measured. The clean-clip rows (the honest dictation number) and the meeting row
+were **not re-verified at `72d31fd`** -- the commands above only cover the
+newest recording. Treat the table above as the original measurement, not as a
+current one; the fresh figures are not a replacement for it.
+
+### Phase 2 outcome: kept, for dictation only
+
+MLX is 5x faster on dictation-length audio, so it is now the dictation backend.
+It is deliberately NOT used for recordings or imports: `mlx_whisper` implements
+neither beam search (`decoding.py` raises `NotImplementedError` for
+`beam_size`) nor VAD, so routing meetings through it would replace the verified
+beam-5 + VAD decode with a greedy one. That is an accuracy change to a path
+declared out of scope, so the meeting path stays on CTranslate2 exactly as it
+was. `transcribe_options()` returns `allow_gpu: False` for every non-dictation
+origin, and a test pins it.
+
+Accuracy check on real dictation clips (CPU beam-5 int8 vs GPU greedy fp16):
+identical on 1 of 5 clips, with small differences elsewhere -- one clip where the
+CPU heard "Feels so slow" and the GPU heard "feels a slope". The GPU is faster,
+not more accurate; the README says so, and `stt_backend=cpu` restores the
+previous output exactly. This is the one place where the plan's "no accuracy
+trade" rule and the user's explicit choice of MLX pull against each other, so it
+is called out rather than buried.
+
+MLX also bypassed the configured model cache: `mlx_whisper` resolves a repo id
+with a bare `snapshot_download()`, which would have pulled a second 1.5 GB copy
+into the default HF home. The backend now resolves the snapshot inside
+`stt_cache_dir` itself and passes a local path.
+
+### Still outstanding
+
+The fullscreen banner fix cannot be verified headlessly. It needs a human to go
+fullscreen in a real app and dictate, confirming the banner shows both while
+transcribing and for the result.
+
+Nothing from the second review is outstanding: the `--transcribe` GPU-routing
+bug, the `pt-BR` tokenizer rejection, the stuck download progress bar, and the
+two false accuracy claims (README and transcriber docstring) were fixed in
+`a314c1a` and `72d31fd`, with tests pinning the routing and tokenizer fixes.
+One new finding from the 2026-11-26 re-run is open but out of scope here: the
+CPU path's hardcoded `vad_filter=True` rejects very faint clips and returns an
+empty transcript (present since `79b1137`; neither introduced nor fixed by
+this plan).
