@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .logging_setup import get_logger
 from .models import DEFAULT_MODEL_REPO
 
 #: MLX (Apple GPU) build of the same large-v3-turbo weights. Same architecture
@@ -268,6 +269,30 @@ def _run_on_mlx_worker(work):
         return work()
 
     return executor.submit(record_ident_and_run).result()
+
+
+def _is_mlx_stream_affinity_error(error: BaseException) -> bool:
+    """True for MLX's ``There is no Stream(gpu, N) in current thread`` failure.
+
+    The index ``N`` is MLX's process-global stream counter, so it varies; the
+    two ends of the sentence do not. The chain is walked because the
+    ``RuntimeError`` raised inside ``mlx_whisper`` is wrapped as
+    ``TranscriptionError(f"Transcription failed: {error}") from error`` on its
+    way out of ``_transcribe_mlx``, and ``Future.result()`` re-raises that
+    wrapper unchanged.
+    """
+    pending: list[BaseException | None] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        text = str(current)
+        if "There is no Stream(" in text and "in current thread" in text:
+            return True
+        pending.extend((current.__cause__, current.__context__))
+    return False
 
 
 class Transcriber:
@@ -553,6 +578,11 @@ class Transcriber:
         ``allow_gpu`` gates the GPU backend for this call alone. Pass ``False``
         for recordings and imports so they keep the CPU path's beam search and
         VAD, neither of which mlx_whisper implements.
+
+        If the GPU path fails with MLX's thread-affinity error
+        (``There is no Stream(gpu, N) in current thread``) the failure is
+        logged in full and the take is finished on the CPU backend rather than
+        raised; every other GPU error still propagates.
         """
         path = Path(path)
         if not path.is_file():
@@ -570,11 +600,29 @@ class Transcriber:
                     temporary = normalized if normalized != path else None
                     audio = load_wav_float32(normalized)
             if self.plan(allow_gpu)[0]:
-                collected = self._transcribe_mlx(audio, language, without_timestamps)
-                return TranscriptionResult(
-                    text=" ".join(segment.text for segment in collected).strip(),
-                    segments=collected,
-                )
+                try:
+                    collected = self._transcribe_mlx(audio, language, without_timestamps)
+                except TranscriptionError as error:
+                    if not _is_mlx_stream_affinity_error(error):
+                        raise
+                    # Defence in depth: the dedicated MLX thread above is what
+                    # removes the cause, so reaching here means some other lazy
+                    # buffer still belongs to another thread's stream. Log the
+                    # whole failure (message plus traceback) and finish the take
+                    # on the CPU backend instead of failing it; that backend
+                    # decodes with beam search and VAD, exactly what recordings
+                    # and imports already use.
+                    get_logger().error(
+                        "transcription",
+                        "GPU transcription hit a stream owned by another thread; "
+                        "finishing this take on the CPU backend",
+                        error,
+                    )
+                else:
+                    return TranscriptionResult(
+                        text=" ".join(segment.text for segment in collected).strip(),
+                        segments=collected,
+                    )
             model = self._load_model()
             try:
                 segments, _info = model.transcribe(

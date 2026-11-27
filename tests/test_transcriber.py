@@ -425,3 +425,102 @@ def test_cpu_backend_starts_no_mlx_worker(tmp_path, monkeypatch):
     assert model.kwargs["beam_size"] == 5
     assert model.kwargs["vad_filter"] is True
     assert transcriber_module._mlx_executor is None
+
+
+# -- graceful degradation when the stream affinity error still escapes -----
+
+
+class RaisingMLX(FakeMLX):
+    """Fake mlx_whisper whose ``transcribe`` raises the way MLX does cross-thread."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__({})
+        self.error = error
+
+    def transcribe(self, audio, **kwargs):
+        raise self.error
+
+
+class RecordingLogger:
+    """Stand-in for ``logging_setup.get_logger`` that keeps the records."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, object]] = []
+
+    def error(self, scope, message, error=None) -> None:
+        self.records.append((scope, message, error))
+
+
+def test_stream_affinity_error_is_detected_through_the_wrapper_chain():
+    from svara.transcriber import _is_mlx_stream_affinity_error
+
+    # The index is MLX's process-global stream counter and varies run to run.
+    for index in (0, 1, 7):
+        cause = RuntimeError(f"There is no Stream(gpu, {index}) in current thread.")
+        # ...wrapped the way _transcribe_mlx does: ``raise ... from error``.
+        wrapped = TranscriptionError(f"Transcription failed: {cause}")
+        wrapped.__cause__ = cause
+        assert _is_mlx_stream_affinity_error(wrapped) is True
+        assert _is_mlx_stream_affinity_error(cause) is True
+
+    # Anything else keeps the old behaviour: no degradation.
+    assert _is_mlx_stream_affinity_error(TranscriptionError("Transcription failed: boom")) is False
+    assert _is_mlx_stream_affinity_error(RuntimeError("Metal device is out of memory")) is False
+
+
+def test_stream_affinity_failure_is_logged_and_finished_on_the_cpu(tmp_path, monkeypatch):
+    """The identified failure must degrade, not reach the logger as a hard fail.
+
+    mlx_whisper raises MLX's thread-affinity RuntimeError inside
+    ``_transcribe_mlx``; the take must still produce text (via the CPU
+    backend) and the full error must land in the app log.
+    """
+    import sys
+
+    wav = make_wav(tmp_path / "audio.wav")
+    fake = RaisingMLX(RuntimeError("There is no Stream(gpu, 1) in current thread."))
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+    logger = RecordingLogger()
+    monkeypatch.setattr(transcriber_module, "get_logger", lambda: logger)
+
+    transcriber = Transcriber(backend="mlx")
+    monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())
+    monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
+    cpu_model = FakeModel([Segment(" cpu fallback ")])
+    monkeypatch.setattr(transcriber, "_load_model", lambda: cpu_model)
+
+    result = transcriber.transcribe_result(wav, allow_gpu=True)
+
+    # The take completed instead of failing.
+    assert result.text == "cpu fallback"
+    assert cpu_model.seen is not None, "the CPU backend never ran"
+    # ...and the error was logged with its full context.
+    assert len(logger.records) == 1, logger.records
+    scope, message, error = logger.records[0]
+    assert scope == "transcription"
+    assert "another thread" in message
+    assert "There is no Stream(gpu, 1) in current thread" in str(error)
+
+
+def test_unrelated_gpu_errors_still_propagate(tmp_path, monkeypatch):
+    """Only the identified failure degrades; everything else still raises."""
+    import sys
+
+    wav = make_wav(tmp_path / "audio.wav")
+    fake = RaisingMLX(RuntimeError("Metal device is out of memory"))
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+    logger = RecordingLogger()
+    monkeypatch.setattr(transcriber_module, "get_logger", lambda: logger)
+
+    transcriber = Transcriber(backend="mlx")
+    monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())
+    monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
+    cpu_calls: list[bool] = []
+    monkeypatch.setattr(transcriber, "_load_model", lambda: cpu_calls.append(True) or FakeModel([]))
+
+    with pytest.raises(TranscriptionError) as captured:
+        transcriber.transcribe_result(wav, allow_gpu=True)
+
+    assert "Metal device is out of memory" in str(captured.value)
+    assert logger.records == [], "unrelated errors must not be swallowed"
+    assert cpu_calls == [], "unrelated errors must not trigger a silent fallback"

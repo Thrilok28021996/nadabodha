@@ -264,9 +264,29 @@ Both transcriptions returned identical text (`Hello can you hear me? Hello my
 question is 123 Hello can you hear me?`) and both ran on the same dedicated
 worker thread. The no-preload line is measured in a subprocess, because
 `ModelHolder` is process-global and an in-process run would time only the
-decode. Candidate gates: `pytest tests -q` 150 passed (148 + 2 new),
+decode. Gates at that commit: `pytest tests -q` 150 passed (148 + 2 new),
 `--self-test` 6/6, both probe shapes exit 0; the probe exits non-zero with the
 production error string on the base commit.
+
+Defence in depth (added with this card): if the thread-affinity error ever
+escapes again -- some other lazily built buffer outside the one-thread rule --
+`transcribe_result` logs it in full (message plus traceback, scope
+`transcription`) and finishes the take on the CPU backend instead of failing
+it, so a take degrades rather than hard-fails. Only MLX's
+`There is no Stream(gpu, N) in current thread` degrades; every other GPU error
+still propagates unchanged. Pinned by
+`test_stream_affinity_failure_is_logged_and_finished_on_the_cpu`,
+`test_unrelated_gpu_errors_still_propagate` and
+`test_stream_affinity_error_is_detected_through_the_wrapper_chain`.
+
+Re-measured at this candidate (2026-11-27), same probe and same 5s clip, both
+shapes exit 0: `preload-then-transcribe-twice` -> preload 1.15s, dictation B
+3.08s, dictation C 2.03s, no-preload single call 4.33s, all three transcripts
+identical (`Hello, Hello my testing hunter.`), B and C on the same dedicated
+worker thread. The same script run against base `be5ba11` in a scratch
+worktree still exits 1 with `FAIL transcribe B: Transcription failed: There is
+no Stream(gpu, 1) in current thread.` Candidate gates here: `pytest tests -q`
+153 passed (148 + 5 new), `--self-test` 6/6.
 
 ### Still outstanding
 
