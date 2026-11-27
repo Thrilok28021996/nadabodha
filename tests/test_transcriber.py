@@ -1,4 +1,5 @@
 import shutil
+import threading
 import wave
 from pathlib import Path
 
@@ -337,3 +338,90 @@ def test_auto_backend_avoids_a_second_download_for_existing_installs(tmp_path, m
     use_mlx, repo, filename = transcriber.plan()
     assert use_mlx is False
     assert filename == "model.bin"
+
+
+# -- the one MLX thread ----------------------------------------------------
+
+
+class RecordingMLX(FakeMLX):
+    """Fake mlx_whisper that also records the thread it is called from."""
+
+    def __init__(self, payload, idents: list[int]) -> None:
+        super().__init__(payload)
+        self.idents = idents
+
+    def transcribe(self, audio, **kwargs):
+        self.idents.append(threading.get_ident())
+        return super().transcribe(audio, **kwargs)
+
+
+def test_preload_and_mlx_transcription_share_one_thread(tmp_path, monkeypatch):
+    """The model must be materialised and evaluated on the same thread.
+
+    mlx_whisper caches the model process-globally and the compute state belongs
+    to the thread that built it, so a preload on this thread followed by a
+    transcription elsewhere is exactly the production failure
+    ("There is no Stream(gpu, 1) in current thread").
+    """
+    import sys
+
+    wav = make_wav(tmp_path / "audio.wav")
+    run_idents: list[int] = []
+    fake = RecordingMLX(
+        {
+            "text": "ignored",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "ok"}],
+        },
+        run_idents,
+    )
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+    transcriber = Transcriber(backend="mlx")
+    monkeypatch.setattr(
+        transcriber,
+        "_load_mlx_model",
+        lambda: run_idents.append(threading.get_ident()) or object(),
+    )
+    monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
+
+    test_thread_ident = threading.get_ident()
+    transcriber.preload(True)  # phase A: preload from the test thread
+
+    caller_ident: list[int] = []
+    failure: list[BaseException] = []
+
+    def transcribe_from_another_thread():  # phase B: a different thread
+        caller_ident.append(threading.get_ident())
+        try:
+            transcriber.transcribe_result(wav, allow_gpu=True)
+        except BaseException as error:  # noqa: BLE001 - asserted below
+            failure.append(error)
+
+    thread = threading.Thread(target=transcribe_from_another_thread)
+    thread.start()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "transcription deadlocked"
+    assert not failure, failure
+
+    # preload load, in-transcribe load, and the transcribe call itself
+    assert len(run_idents) == 3
+    assert len(set(run_idents)) == 1, f"MLX ran on several threads: {run_idents}"
+    mlx_ident = run_idents[0]
+    assert mlx_ident != test_thread_ident
+    assert mlx_ident != caller_ident[0]
+
+
+def test_cpu_backend_starts_no_mlx_worker(tmp_path, monkeypatch):
+    """The CPU path is untouched: beam-5 + VAD, and no MLX thread is started."""
+    wav = make_wav(tmp_path / "audio.wav")
+    monkeypatch.setattr(transcriber_module, "_mlx_executor", None)
+    monkeypatch.setattr(transcriber_module, "_mlx_worker_ident", None)
+
+    transcriber = Transcriber("Systran/faster-whisper-base", backend="cpu")
+    model = KwargModel()
+    monkeypatch.setattr(transcriber, "_load_model", lambda: model)
+
+    transcriber.transcribe_result(wav)
+    assert model.kwargs is not None
+    assert model.kwargs["beam_size"] == 5
+    assert model.kwargs["vad_filter"] is True
+    assert transcriber_module._mlx_executor is None

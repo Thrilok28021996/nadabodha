@@ -159,6 +159,14 @@ verified to still carry real timecodes through the MLX path. Re-verified at
 148 passed, self-test 6/6. The 119 baseline was re-checked the same day on
 `main` (79b1137) and holds.
 
+Correction (2026-11-27): these gates did **not** verify the preload path, and
+they must not be read as if they had. The bench script and the unit tests both
+preload and transcribe on one thread, so they stayed green while every real
+dictation with the default `preload_model: true` was failing on the MLX
+backend. Green above means the paths those commands exercise, nothing more;
+the preload-then-transcribe defect and its fix are recorded in the section
+below.
+
 ### Re-run at 72d31fd (2026-11-26): the 5s-clip rows do not reproduce
 
 All three bench commands re-run at `72d31fd` on the newest recording,
@@ -211,6 +219,54 @@ MLX also bypassed the configured model cache: `mlx_whisper` resolves a repo id
 with a bare `snapshot_download()`, which would have pulled a second 1.5 GB copy
 into the default HF home. The backend now resolves the snapshot inside
 `stt_cache_dir` itself and passes a local path.
+
+### Preload + dictation on separate threads: broken, then fixed (2026-11-27)
+
+With the default `preload_model: true` on the MLX backend, every dictation
+failed:
+
+```
+Transcription failed: There is no Stream(gpu, 1) in current thread.
+```
+
+`_PreloadWorker` materialised the model on one QThread; every
+`_TranscribeWorker` ran on a different thread. `mlx_whisper` caches the model
+in a process-global `ModelHolder` and the model's compute state belongs to the
+thread that first materialised it, so `mx.async_eval` raised on every other
+thread. Measured on base `be5ba111` before the fix: preload on thread A,
+transcribe on threads B and C -> both fail; `mx.eval` of the model parameters
+in the preload thread does **not** help; setting a fresh default stream on the
+transcribing thread does **not** help either (`new_thread_local_stream` is
+rejected by `set_default_stream`). What works, measured: confine the model
+load and every transcription to one process-wide thread.
+
+Fix (this plan's diff): one module-level `ThreadPoolExecutor(max_workers=1)`
+in `svara/transcriber.py` runs both the GPU plan's model load and the whole
+`_transcribe_mlx` call body, so exactly one thread ever touches the model; the
+CPU path never starts it. Unit tests `test_preload_and_mlx_transcription_share_one_thread`
+and `test_cpu_backend_starts_no_mlx_worker` pin the invariant, and the new
+`scripts/probe_mlx_preload_threads.py` drives the production thread shape
+headlessly -- the bench script cannot see the defect because it preloads and
+transcribes on one thread.
+
+Measured at the candidate with
+`scripts/probe_mlx_preload_threads.py --shape preload-then-transcribe-twice`
+(newest recording, 5s clip, `backend=auto` -> MLX):
+
+| Phase | Measured |
+| --- | --- |
+| preload, thread A | 0.40s |
+| first dictation, fresh thread B | 2.16s |
+| second dictation, fresh thread C | 2.02s |
+| no-preload single call (cold, one thread) | 5.28s |
+
+Both transcriptions returned identical text (`Hello can you hear me? Hello my
+question is 123 Hello can you hear me?`) and both ran on the same dedicated
+worker thread. The no-preload line is measured in a subprocess, because
+`ModelHolder` is process-global and an in-process run would time only the
+decode. Candidate gates: `pytest tests -q` 150 passed (148 + 2 new),
+`--self-test` 6/6, both probe shapes exit 0; the probe exits non-zero with the
+production error string on the base commit.
 
 ### Still outstanding
 
