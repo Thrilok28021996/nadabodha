@@ -524,3 +524,118 @@ def test_unrelated_gpu_errors_still_propagate(tmp_path, monkeypatch):
     assert "Metal device is out of memory" in str(captured.value)
     assert logger.records == [], "unrelated errors must not be swallowed"
     assert cpu_calls == [], "unrelated errors must not trigger a silent fallback"
+
+
+def test_stream_error_reached_only_through_context_does_not_degrade(
+    tmp_path, monkeypatch
+):
+    """A1: ``__context__`` alone must never be mistaken for the affinity failure.
+
+    An unrelated GPU failure raised *while* a stream error was being handled
+    carries that stream error in ``__context__``. Classifying it as the
+    affinity failure would finish the take silently on the CPU and hide the
+    real error; it must propagate instead.
+    """
+    import sys
+
+    wav = make_wav(tmp_path / "audio.wav")
+
+    class ContextRaisingMLX(FakeMLX):
+        """Fake mlx_whisper raising an unrelated error under a stream error."""
+
+        def __init__(self) -> None:
+            super().__init__({})
+
+        def transcribe(self, audio, **kwargs):
+            try:
+                raise RuntimeError("There is no Stream(gpu, 1) in current thread.")
+            except RuntimeError:
+                # Raising inside the handler sets __context__ to the stream
+                # error, exactly as a second failure during handling would.
+                raise RuntimeError("Metal device is out of memory")
+
+    monkeypatch.setitem(sys.modules, "mlx_whisper", ContextRaisingMLX())
+    logger = RecordingLogger()
+    monkeypatch.setattr(transcriber_module, "get_logger", lambda: logger)
+
+    transcriber = Transcriber(backend="mlx")
+    monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())
+    monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
+    cpu_calls: list[bool] = []
+    monkeypatch.setattr(
+        transcriber, "_load_model", lambda: cpu_calls.append(True) or FakeModel([])
+    )
+
+    with pytest.raises(TranscriptionError) as captured:
+        transcriber.transcribe_result(wav, allow_gpu=True)
+
+    assert "Metal device is out of memory" in str(captured.value)
+    assert logger.records == [], "a __context__-only stream error must not degrade"
+    assert cpu_calls == [], "the take must not silently fall back to the CPU"
+
+
+# -- the probe's confinement check -----------------------------------------
+
+
+def _load_probe_module():
+    """Import ``scripts/probe_mlx_preload_threads.py`` by path."""
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "scripts"
+        / "probe_mlx_preload_threads.py"
+    )
+    spec = importlib.util.spec_from_file_location("probe_mlx_preload_threads", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_probe_helper_reports_the_worker_ident_not_the_caller(monkeypatch):
+    """The probe must report ``_mlx_worker_ident``, never its own caller thread.
+
+    Before B1 the probe printed ``run_in_fresh_thread``'s caller ident, which
+    macOS recycles, so two different callers looked like one shared worker and
+    a silent CPU fallback still exited 0.
+    """
+    probe = _load_probe_module()
+    stub_worker = 987_654_321  # fixed, so threading.get_ident() can never match
+    monkeypatch.setattr(transcriber_module, "_mlx_worker_ident", stub_worker)
+    caller_ident = threading.get_ident()
+
+    worker_ident = probe.read_mlx_worker_ident()
+    assert worker_ident == stub_worker
+    assert worker_ident != caller_ident
+
+    takes = [("B", caller_ident, worker_ident), ("C", caller_ident, worker_ident)]
+    assert probe.check_confinement(takes, []) == (stub_worker, 0, None)
+
+    # The caller's own ident in the worker slot is exactly bug B1.
+    wrong = [("B", caller_ident, caller_ident), ("C", caller_ident, caller_ident)]
+    _worker, _degraded, failure = probe.check_confinement(wrong, [])
+    assert failure is not None
+    assert "caller thread" in failure
+
+    # The guard firing during a take fails the check even with clean idents.
+    guard = [
+        (
+            "transcription",
+            "GPU transcription hit a stream owned by another thread; "
+            "finishing this take on the CPU backend",
+        )
+    ]
+    worker, degraded, failure = probe.check_confinement(takes, guard)
+    assert (worker, degraded) == (stub_worker, 1)
+    assert failure is not None
+
+    # A worker that never ran (the base commit) fails too, and the reader
+    # degrades to None rather than raising against base's module.
+    monkeypatch.delattr(transcriber_module, "_mlx_worker_ident")
+    assert probe.read_mlx_worker_ident() is None
+    _worker, _degraded, failure = probe.check_confinement(
+        [("B", caller_ident, None), ("C", caller_ident, None)], []
+    )
+    assert failure is not None
+

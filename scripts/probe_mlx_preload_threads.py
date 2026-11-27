@@ -15,8 +15,15 @@ defect cannot hide.
 
 ``scripts/bench_dictation.py`` cannot see the defect: it preloads and
 transcribes on one thread. Exit code 0 with transcript text means the shape
-works; a printed error and a non-zero exit mean it does not -- on the base
-commit this script fails with the production error string.
+works *and* that confinement held: every take prints the caller thread it ran
+on and ``svara.transcriber._mlx_worker_ident`` (the thread MLX actually ran
+on), and afterwards the worker ident must be recorded, identical after both
+takes and different from both caller idents, with no CPU-fallback guard
+record ("GPU transcription hit a stream owned by another thread") logged
+while the takes ran. Any of those failing prints ``FAIL confinement ...`` and
+exits non-zero; a printed error and a non-zero exit mean the shape itself did
+not work -- on the base commit this script fails with the production error
+string.
 
     python3 scripts/probe_mlx_preload_threads.py --shape preload-then-transcribe
     python3 scripts/probe_mlx_preload_threads.py --shape preload-then-transcribe-twice
@@ -40,6 +47,12 @@ if str(REPO_ROOT) not in sys.path:
 
 DEFAULT_AUDIO = Path("/Volumes/personal/meetings/recordings")
 SHAPES = ("preload-then-transcribe", "preload-then-transcribe-twice")
+
+#: Scope and message of the CPU-fallback guard in ``transcribe_result``. A
+#: record like this during a take means the GPU work silently ran somewhere
+#: else and was finished on the CPU -- the defect this probe exists for.
+DEGRADATION_SCOPE = "transcription"
+DEGRADATION_MESSAGE = "GPU transcription hit a stream owned by another thread"
 
 
 def newest_recording(directory: Path) -> Path:
@@ -80,6 +93,88 @@ def run_in_fresh_thread(work: Callable[[], Any]) -> tuple[Any, int]:
     if "error" in box:
         raise box["error"]
     return box["value"], box["thread"]
+
+
+class _RecordingLogger:
+    """Wraps svara's logger and keeps every ``(scope, message)`` record."""
+
+    def __init__(self, wrapped: Any) -> None:
+        self._wrapped = wrapped
+        self.records: list[tuple[str, str]] = []
+
+    def error(self, scope: str, message: str, error: Any = None) -> None:
+        self.records.append((scope, message))
+        self._wrapped.error(scope, message, error)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+
+def capture_log_records() -> _RecordingLogger | None:
+    """Route ``svara.transcriber``'s log calls through a recorder.
+
+    ``transcriber`` binds ``get_logger`` into its own namespace, so the hook
+    has to be replaced there rather than on ``logging_setup``. Returns
+    ``None`` on the base commit, which has no guard and no logger hook.
+    """
+    import svara.transcriber as transcriber
+
+    getter = getattr(transcriber, "get_logger", None)
+    if getter is None:
+        return None
+    recorder = _RecordingLogger(getter())
+    transcriber.get_logger = lambda: recorder
+    return recorder
+
+
+def read_mlx_worker_ident() -> int | None:
+    """``svara.transcriber._mlx_worker_ident``, or ``None`` if it never ran.
+
+    Read with ``getattr`` so this probe still runs against the base commit,
+    where the dedicated MLX worker does not exist yet.
+    """
+    import svara.transcriber as transcriber
+
+    return getattr(transcriber, "_mlx_worker_ident", None)
+
+
+def check_confinement(
+    takes: list[tuple[str, int, int | None]],
+    records: list[tuple[str, str]],
+) -> tuple[int | None, int, str | None]:
+    """Verify the MLX work really ran on the dedicated worker thread.
+
+    ``takes`` carries ``(label, caller_ident, worker_ident)`` per dictation:
+    ``caller_ident`` is the thread ``run_in_fresh_thread`` spawned, while
+    ``worker_ident`` is ``_mlx_worker_ident`` read *after* the take -- the
+    thread MLX actually ran on. ``records`` are the log records captured
+    while the takes ran.
+
+    Returns ``(worker_ident, degradation_count, failure)``: the worker thread,
+    how many scope-``transcription`` guard records were logged, and the
+    failure reason (``None`` when confinement held).
+    """
+    problems: list[str] = []
+    workers = [worker for _label, _caller, worker in takes]
+    worker_ident = workers[0] if workers else None
+    if any(worker is None for worker in workers):
+        problems.append(f"_mlx_worker_ident not recorded: {workers}")
+    elif len(set(workers)) != 1:
+        problems.append(f"MLX worker thread changed between takes: {workers}")
+    else:
+        for label, caller_ident, _worker in takes:
+            if caller_ident == worker_ident:
+                problems.append(
+                    f"{label} caller thread {caller_ident} is the MLX worker thread"
+                )
+    degraded = [
+        (scope, message)
+        for scope, message in records
+        if scope == DEGRADATION_SCOPE and DEGRADATION_MESSAGE in message
+    ]
+    if degraded:
+        problems.append(f"CPU-fallback guard logged {len(degraded)} time(s)")
+    return worker_ident, len(degraded), "; ".join(problems) or None
 
 
 def build_transcriber():
@@ -164,19 +259,44 @@ def main() -> int:
         print(f"OK   preload on thread {threading.get_ident()}{timing}")
 
         # Phases B and C: transcribe on two *fresh* threads, the way every
-        # _TranscribeWorker does after the preload thread has run.
+        # _TranscribeWorker does after the preload thread has run. Each take
+        # records the caller thread (what run_in_fresh_thread spawned) and
+        # _mlx_worker_ident read afterwards (the thread MLX ran on), plus any
+        # log record the CPU-fallback guard emits while it runs.
+        recorder = capture_log_records()
+        takes: list[tuple[str, int, int | None]] = []
+        transcripts: dict[str, str] = {}
         for label in ("B", "C"):
             started = time.perf_counter()
             try:
-                result, worker_ident = run_in_fresh_thread(
+                result, caller_ident = run_in_fresh_thread(
                     lambda: transcriber.transcribe_result(clip)
                 )
             except Exception as error:  # noqa: BLE001 - probe reports it verbatim
                 print(f"FAIL transcribe {label}: {error}", file=sys.stderr)
                 return 1
+            worker_ident = read_mlx_worker_ident()
+            takes.append((label, caller_ident, worker_ident))
+            transcripts[label] = result.text
             elapsed = time.perf_counter() - started
             timing = f" ({elapsed:.2f}s)" if with_timing else ""
-            print(f"OK   transcribe {label} on thread {worker_ident}{timing} {result.text!r}")
+            print(
+                f"OK   transcribe {label} on caller thread {caller_ident}, "
+                f"MLX worker thread {worker_ident}{timing} {result.text!r}"
+            )
+
+        worker_ident, degraded, failure = check_confinement(
+            takes, recorder.records if recorder is not None else []
+        )
+        if failure is not None:
+            print(f"FAIL confinement {failure}", file=sys.stderr)
+            return 1
+        print(
+            f"OK   confinement: MLX worker thread {worker_ident} ran takes B and C; "
+            f"caller threads {takes[0][1]} / {takes[1][1]} both differ from it; "
+            f"degradation records {degraded}; transcripts identical "
+            f"{transcripts['B'] == transcripts['C']}"
+        )
 
         if with_timing:
             completed = subprocess.run(

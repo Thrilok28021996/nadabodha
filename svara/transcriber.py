@@ -275,11 +275,16 @@ def _is_mlx_stream_affinity_error(error: BaseException) -> bool:
     """True for MLX's ``There is no Stream(gpu, N) in current thread`` failure.
 
     The index ``N`` is MLX's process-global stream counter, so it varies; the
-    two ends of the sentence do not. The chain is walked because the
-    ``RuntimeError`` raised inside ``mlx_whisper`` is wrapped as
-    ``TranscriptionError(f"Transcription failed: {error}") from error`` on its
-    way out of ``_transcribe_mlx``, and ``Future.result()`` re-raises that
-    wrapper unchanged.
+    two ends of the sentence do not. Two chains count: the exception's own
+    message -- ``_transcribe_mlx`` wraps as
+    ``TranscriptionError(f"Transcription failed: {error}") from error``, so the
+    wrapper's text already carries it -- and the ``__cause__`` chain that
+    ``raise ... from`` builds, which ``Future.result()`` re-raises unchanged.
+
+    ``__context__`` is deliberately *not* walked. It is set on any exception
+    raised while another was being handled, so an unrelated GPU failure that
+    merely happened during a stream error would classify as an affinity
+    failure and be silently finished on the CPU instead of surfacing.
     """
     pending: list[BaseException | None] = [error]
     seen: set[int] = set()
@@ -291,7 +296,7 @@ def _is_mlx_stream_affinity_error(error: BaseException) -> bool:
         text = str(current)
         if "There is no Stream(" in text and "in current thread" in text:
             return True
-        pending.extend((current.__cause__, current.__context__))
+        pending.append(current.__cause__)
     return False
 
 

@@ -261,8 +261,10 @@ Measured at the candidate with
 | no-preload single call (cold, one thread) | 5.28s |
 
 Both transcriptions returned identical text (`Hello can you hear me? Hello my
-question is 123 Hello can you hear me?`) and both ran on the same dedicated
-worker thread. The no-preload line is measured in a subprocess, because
+question is 123 Hello can you hear me?`). Which thread ran them was not
+measured correctly at that point: the probe printed the fresh *caller* thread
+it spawned, not the thread MLX ran on (fixed with B1, measured below). The
+no-preload line is measured in a subprocess, because
 `ModelHolder` is process-global and an in-process run would time only the
 decode. Gates at that commit: `pytest tests -q` 150 passed (148 + 2 new),
 `--self-test` 6/6, both probe shapes exit 0; the probe exits non-zero with the
@@ -279,14 +281,32 @@ still propagates unchanged. Pinned by
 `test_unrelated_gpu_errors_still_propagate` and
 `test_stream_affinity_error_is_detected_through_the_wrapper_chain`.
 
-Re-measured at this candidate (2026-11-27), same probe and same 5s clip, both
-shapes exit 0: `preload-then-transcribe-twice` -> preload 1.15s, dictation B
-3.08s, dictation C 2.03s, no-preload single call 4.33s, all three transcripts
-identical (`Hello, Hello my testing hunter.`), B and C on the same dedicated
-worker thread. The same script run against base `be5ba11` in a scratch
-worktree still exits 1 with `FAIL transcribe B: Transcription failed: There is
-no Stream(gpu, 1) in current thread.` Candidate gates here: `pytest tests -q`
-153 passed (148 + 5 new), `--self-test` 6/6.
+Re-measured at this candidate (2026-11-27, B1 fix card) with the
+B1-corrected probe, both shapes exit 0, on
+`recording-2026-11-27T05-56-34-896696.wav` sliced to 5s -- not the same clip
+as the first table above, whose transcript differs.
+`preload-then-transcribe-twice` -> preload 0.54s, dictation B 3.98s,
+dictation C 5.41s, no-preload single call 5.53s; all three transcripts
+identical (`Hello, Hello my testing hunter.`). The probe now prints the
+caller thread each take was driven from *and*
+`svara.transcriber._mlx_worker_ident` read after the take, then asserts on
+them:
+
+```
+OK   transcribe B on caller thread 481905111040, MLX worker thread 6140194816 (3.98s) 'Hello, Hello my testing hunter.'
+OK   transcribe C on caller thread 481905111040, MLX worker thread 6140194816 (5.41s) 'Hello, Hello my testing hunter.'
+OK   confinement: MLX worker thread 6140194816 ran takes B and C; caller threads 481905111040 / 481905111040 both differ from it; degradation records 0; transcripts identical True
+```
+
+Both takes ran on the one recorded MLX worker thread (6140194816), distinct
+from the caller thread of each take, and the CPU-fallback guard logged
+nothing. The caller idents are equal because macOS recycles them across the
+two fresh threads -- which is exactly why the old probe's line looked like
+proof of a shared worker. The same script run against base `be5ba11` in a
+scratch worktree (script copied in, base `svara/` left untouched) exits 1
+with `FAIL transcribe B: Transcription failed: There is no Stream(gpu, 1) in
+current thread.` Candidate gates here: `pytest tests -q` 156 passed
+(154 at `17c384f` + 2 new), `--self-test` 6/6.
 
 ### Still outstanding
 
