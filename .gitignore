@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+# Scratch git worktrees created inside the repo by the factory runner.
+# Staging them made git record each one as a gitlink.
+.worktrees/
 build/
 dist/
 *.log
