@@ -484,6 +484,14 @@ def test_stream_affinity_failure_is_logged_and_finished_on_the_cpu(tmp_path, mon
     monkeypatch.setattr(transcriber_module, "get_logger", lambda: logger)
 
     transcriber = Transcriber(backend="mlx")
+    # Degrading needs the CTranslate2 weights on disk; pin that, and require the
+    # query to name the CPU repo (a gate that asked about the MLX one would
+    # answer the wrong question), so the test does not depend on this machine.
+    def cpu_weights_cached(repo, cache_dir, filename="model.bin"):
+        assert repo == transcriber.model_repo, repo
+        return True
+
+    monkeypatch.setattr(transcriber_module, "is_model_cached", cpu_weights_cached)
     monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())
     monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
     cpu_model = FakeModel([Segment(" cpu fallback ")])
@@ -500,6 +508,46 @@ def test_stream_affinity_failure_is_logged_and_finished_on_the_cpu(tmp_path, mon
     assert scope == "transcription"
     assert "another thread" in message
     assert "There is no Stream(gpu, 1) in current thread" in str(error)
+
+
+def test_affinity_fallback_is_refused_when_the_cpu_model_is_not_cached(
+    tmp_path, monkeypatch
+):
+    """A fallback must never turn a failed dictation into a 1.5 GB download.
+
+    ``_auto_prefers_mlx`` picks the GPU precisely when the CTranslate2 weights
+    are absent, so degrading unconditionally would hand the take to
+    ``WhisperModel(..., download_root=...)`` and fetch the CPU model inside the
+    dictation. With nothing on disk the take has to fail instead.
+    """
+    import sys
+
+    wav = make_wav(tmp_path / "audio.wav")
+    fake = RaisingMLX(RuntimeError("There is no Stream(gpu, 1) in current thread."))
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
+    logger = RecordingLogger()
+    monkeypatch.setattr(transcriber_module, "get_logger", lambda: logger)
+
+    transcriber = Transcriber(backend="mlx")
+
+    def cpu_weights_missing(repo, cache_dir, filename="model.bin"):
+        assert repo == transcriber.model_repo, repo
+        return False
+
+    monkeypatch.setattr(transcriber_module, "is_model_cached", cpu_weights_missing)
+    monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())
+    monkeypatch.setattr(transcriber, "_mlx_model_path", lambda: "/tmp/fake-model")
+    cpu_calls: list[bool] = []
+    monkeypatch.setattr(
+        transcriber, "_load_model", lambda: cpu_calls.append(True) or FakeModel([])
+    )
+
+    with pytest.raises(TranscriptionError) as captured:
+        transcriber.transcribe_result(wav, allow_gpu=True)
+
+    assert "no Stream(gpu, 1) in current thread" in str(captured.value)
+    assert cpu_calls == [], "an uncached CPU model must not be downloaded mid-take"
+    assert logger.records == [], "a refused fallback must not claim a degradation"
 
 
 def test_unrelated_gpu_errors_still_propagate(tmp_path, monkeypatch):

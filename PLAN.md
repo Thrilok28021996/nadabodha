@@ -281,6 +281,13 @@ still propagates unchanged. Pinned by
 `test_unrelated_gpu_errors_still_propagate` and
 `test_stream_affinity_error_is_detected_through_the_wrapper_chain`.
 
+The fallback is gated on the CTranslate2 weights already being cached.
+`_auto_prefers_mlx` prefers the GPU exactly when they are *absent*, so an
+ungated fallback would hand the take to `WhisperModel(..., download_root=...)`
+and fetch ~1.5 GB inside a dictation. With nothing on disk the take re-raises
+the original error instead. Pinned by
+`test_affinity_fallback_is_refused_when_the_cpu_model_is_not_cached`.
+
 Re-measured at this candidate (2026-11-27, B1 fix card) with the
 B1-corrected probe, both shapes exit 0, on
 `recording-2026-11-27T05-56-34-896696.wav` sliced to 5s -- not the same clip
@@ -306,7 +313,10 @@ proof of a shared worker. The same script run against base `be5ba11` in a
 scratch worktree (script copied in, base `svara/` left untouched) exits 1
 with `FAIL transcribe B: Transcription failed: There is no Stream(gpu, 1) in
 current thread.` Candidate gates here: `pytest tests -q` 156 passed
-(154 at `17c384f` + 2 new), `--self-test` 6/6.
+(154 at `17c384f` + 2 new), `--self-test` 6/6. With the cache-gated fallback
+added on top, 157 passed, `--self-test` 6/6, and the probe re-run on
+`recording-2026-11-27T09-25-27-150619.wav` exits 0 (worker 6107344896 for
+both takes, 2.21s / 2.06s, identical transcripts).
 
 ### Still outstanding
 

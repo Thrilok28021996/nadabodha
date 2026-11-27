@@ -25,6 +25,7 @@ import wave
 from pathlib import Path
 
 from svara import logging_setup
+from svara import transcriber as transcriber_module
 from svara.transcriber import Transcriber, TranscriptionResult
 
 #: The production failure string, index included: MLX's process-global stream
@@ -58,6 +59,11 @@ def test_stream_affinity_failure_reaches_the_real_app_log(tmp_path, monkeypatch)
     logging_setup.init_logging(path=log_file)
 
     monkeypatch.setitem(sys.modules, "mlx_whisper", RaisingMLX())
+    # The degradation is gated on the CTranslate2 weights already being cached;
+    # pin that so the test does not depend on this machine's cache.
+    monkeypatch.setattr(
+        transcriber_module, "is_model_cached", lambda *args, **kwargs: True
+    )
 
     transcriber = Transcriber("Systran/faster-whisper-base", backend="mlx")
     monkeypatch.setattr(transcriber, "_load_mlx_model", lambda: object())

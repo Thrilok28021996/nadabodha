@@ -587,7 +587,9 @@ class Transcriber:
         If the GPU path fails with MLX's thread-affinity error
         (``There is no Stream(gpu, N) in current thread``) the failure is
         logged in full and the take is finished on the CPU backend rather than
-        raised; every other GPU error still propagates.
+        raised -- but only when the CTranslate2 weights are already cached, so
+        the fallback never turns into a download. Every other GPU error still
+        propagates.
         """
         path = Path(path)
         if not path.is_file():
@@ -609,6 +611,13 @@ class Transcriber:
                     collected = self._transcribe_mlx(audio, language, without_timestamps)
                 except TranscriptionError as error:
                     if not _is_mlx_stream_affinity_error(error):
+                        raise
+                    if not self.is_cached(allow_gpu=False):
+                        # Degrading needs the CTranslate2 weights already on
+                        # disk. Auto picks the GPU precisely when they are
+                        # absent, so "finish this take on the CPU" would turn a
+                        # failed dictation into a surprise ~1.5 GB download
+                        # inside the take: re-raise instead.
                         raise
                     # Defence in depth: the dedicated MLX thread above is what
                     # removes the cause, so reaching here means some other lazy
