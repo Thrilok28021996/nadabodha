@@ -14,6 +14,7 @@ with ``open() got an unexpected keyword argument 'metadata_errors'``.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .logging_setup import get_logger
 from .models import DEFAULT_MODEL_REPO
 
 #: MLX (Apple GPU) build of the same large-v3-turbo weights. Same architecture
@@ -222,6 +224,82 @@ def cache_bytes(repo: str, cache_dir: str) -> int:
     return total
 
 
+# -- the one MLX thread ----------------------------------------------------
+#
+# mlx_whisper caches its model in a process-global ModelHolder, and the model's
+# compute state belongs to the thread that first materialised it: loading on
+# one thread and evaluating on another raises
+# ``RuntimeError: There is no Stream(gpu, 1) in current thread`` from
+# ``mx.async_eval`` inside mlx_whisper's decoding. Exactly one thread in the
+# process may therefore both load and evaluate the model. The executor is
+# module level (not per Transcriber instance) for the same reason: a second
+# instance would otherwise evaluate the process-global cached model on a fresh
+# thread and recreate the defect. It is created lazily on first MLX use, so a
+# CPU-only run never starts the thread.
+
+_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_mlx_worker_ident: int | None = None
+_mlx_executor_lock = threading.Lock()
+
+
+def _run_on_mlx_worker(work):
+    """Run *work* on the dedicated MLX thread and return its result.
+
+    Exceptions propagate unchanged (``Future.result`` re-raises what the call
+    raised), so callers keep wrapping them in their own error types. When the
+    caller already *is* the MLX thread the callable runs inline: a nested
+    submit would queue behind the running task and deadlock a single-worker
+    pool.
+    """
+    if threading.get_ident() == _mlx_worker_ident:
+        return work()
+    global _mlx_executor
+    with _mlx_executor_lock:
+        if _mlx_executor is None:
+            _mlx_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="svara-mlx"
+            )
+        executor = _mlx_executor
+
+    def record_ident_and_run():
+        # First use records the pool thread's ident for the re-entrancy check
+        # above; max_workers=1 keeps that ident stable for the pool's lifetime.
+        global _mlx_worker_ident
+        _mlx_worker_ident = threading.get_ident()
+        return work()
+
+    return executor.submit(record_ident_and_run).result()
+
+
+def _is_mlx_stream_affinity_error(error: BaseException) -> bool:
+    """True for MLX's ``There is no Stream(gpu, N) in current thread`` failure.
+
+    The index ``N`` is MLX's process-global stream counter, so it varies; the
+    two ends of the sentence do not. Two chains count: the exception's own
+    message -- ``_transcribe_mlx`` wraps as
+    ``TranscriptionError(f"Transcription failed: {error}") from error``, so the
+    wrapper's text already carries it -- and the ``__cause__`` chain that
+    ``raise ... from`` builds, which ``Future.result()`` re-raises unchanged.
+
+    ``__context__`` is deliberately *not* walked. It is set on any exception
+    raised while another was being handled, so an unrelated GPU failure that
+    merely happened during a stream error would classify as an affinity
+    failure and be silently finished on the CPU instead of surfacing.
+    """
+    pending: list[BaseException | None] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        text = str(current)
+        if "There is no Stream(" in text and "in current thread" in text:
+            return True
+        pending.append(current.__cause__)
+    return False
+
+
 class Transcriber:
     """Transcribe audio, on the GPU (MLX) for dictation and the CPU otherwise.
 
@@ -373,10 +451,13 @@ class Transcriber:
         """Load the model now so the first transcription does not pay for it.
 
         Dictation is short and the model load is several seconds, so loading it
-        up front in a worker thread removes that wait from the first take.
+        up front in a worker thread removes that wait from the first take. The
+        GPU plan loads on the dedicated MLX thread so the model is
+        materialised on the same thread that will later evaluate it; the CPU
+        plan loads directly on the caller thread.
         """
         if self.plan(allow_gpu)[0]:
-            self._load_mlx_model()
+            _run_on_mlx_worker(self._load_mlx_model)
             return
         self._load_model()
 
@@ -443,21 +524,31 @@ class Transcriber:
                 "The GPU backend needs mlx-whisper. Run: pip install mlx-whisper "
                 "(or set the speech backend to CPU in Settings)."
             ) from error
-        self._load_mlx_model()
-        # One MLX call at a time: mlx_whisper's model cache is process-global and
-        # unlocked, so a concurrent load/transcribe would double-load the model.
-        with self._lock:
-            path = self._mlx_model_path()
-            try:
-                result = mlx_whisper.transcribe(
-                    audio,
-                    path_or_hf_repo=path,
-                    language=language or None,
-                    without_timestamps=without_timestamps,
-                    verbose=None,
-                )
-            except Exception as error:  # noqa: BLE001 - surfaced to the UI verbatim
-                raise TranscriptionError(f"Transcription failed: {error}") from error
+
+        def load_and_transcribe():
+            # Load and decode in one callable on the dedicated MLX thread: the
+            # model's compute state belongs to the thread that materialised it,
+            # so splitting the two across threads raises
+            # "There is no Stream(gpu, 1) in current thread" from mx.async_eval.
+            self._load_mlx_model()
+            # One MLX call at a time: mlx_whisper's model cache is process-global and
+            # unlocked, so a concurrent load/transcribe would double-load the model.
+            # Held only inside this callable -- never around the submit, which
+            # would deadlock the single-worker pool once a second caller arrives.
+            with self._lock:
+                path = self._mlx_model_path()
+                try:
+                    return mlx_whisper.transcribe(
+                        audio,
+                        path_or_hf_repo=path,
+                        language=language or None,
+                        without_timestamps=without_timestamps,
+                        verbose=None,
+                    )
+                except Exception as error:  # noqa: BLE001 - surfaced to the UI verbatim
+                    raise TranscriptionError(f"Transcription failed: {error}") from error
+
+        result = _run_on_mlx_worker(load_and_transcribe)
         collected: list[Segment] = []
         for segment in result.get("segments") or []:
             text = str(segment.get("text") or "").strip()
@@ -492,6 +583,13 @@ class Transcriber:
         ``allow_gpu`` gates the GPU backend for this call alone. Pass ``False``
         for recordings and imports so they keep the CPU path's beam search and
         VAD, neither of which mlx_whisper implements.
+
+        If the GPU path fails with MLX's thread-affinity error
+        (``There is no Stream(gpu, N) in current thread``) the failure is
+        logged in full and the take is finished on the CPU backend rather than
+        raised -- but only when the CTranslate2 weights are already cached, so
+        the fallback never turns into a download. Every other GPU error still
+        propagates.
         """
         path = Path(path)
         if not path.is_file():
@@ -509,11 +607,36 @@ class Transcriber:
                     temporary = normalized if normalized != path else None
                     audio = load_wav_float32(normalized)
             if self.plan(allow_gpu)[0]:
-                collected = self._transcribe_mlx(audio, language, without_timestamps)
-                return TranscriptionResult(
-                    text=" ".join(segment.text for segment in collected).strip(),
-                    segments=collected,
-                )
+                try:
+                    collected = self._transcribe_mlx(audio, language, without_timestamps)
+                except TranscriptionError as error:
+                    if not _is_mlx_stream_affinity_error(error):
+                        raise
+                    if not self.is_cached(allow_gpu=False):
+                        # Degrading needs the CTranslate2 weights already on
+                        # disk. Auto picks the GPU precisely when they are
+                        # absent, so "finish this take on the CPU" would turn a
+                        # failed dictation into a surprise ~1.5 GB download
+                        # inside the take: re-raise instead.
+                        raise
+                    # Defence in depth: the dedicated MLX thread above is what
+                    # removes the cause, so reaching here means some other lazy
+                    # buffer still belongs to another thread's stream. Log the
+                    # whole failure (message plus traceback) and finish the take
+                    # on the CPU backend instead of failing it; that backend
+                    # decodes with beam search and VAD, exactly what recordings
+                    # and imports already use.
+                    get_logger().error(
+                        "transcription",
+                        "GPU transcription hit a stream owned by another thread; "
+                        "finishing this take on the CPU backend",
+                        error,
+                    )
+                else:
+                    return TranscriptionResult(
+                        text=" ".join(segment.text for segment in collected).strip(),
+                        segments=collected,
+                    )
             model = self._load_model()
             try:
                 segments, _info = model.transcribe(
